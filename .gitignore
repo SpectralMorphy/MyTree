@@ -1,0 +1,23 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Generated platform files that can contain local settings
+android/.gradle/
+android/local.properties
+
+# Local debugging credentials
+/yandex_token.txt
+
+# Local crash logs
+*.log

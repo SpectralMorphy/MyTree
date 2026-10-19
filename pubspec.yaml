@@ -1,0 +1,31 @@
+name: mytree_webrtc_demo
+description: A collaborative family tree with persistent rooms and WebRTC synchronization.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  crypto: ^3.0.7
+  http: ^1.6.0
+  flutter_webrtc: ^1.6.2
+  mobile_scanner: ^7.4.2
+  peer_rtc: ^1.1.0+1
+  mqtt_client: ^10.12.0
+  qr_flutter: ^4.1.0
+  path_provider: ^2.1.6
+  web: ^1.1.1
+  file_selector: ^1.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/tree-mark.png

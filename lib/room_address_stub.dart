@@ -1,0 +1,1 @@
+Uri consumeRoomAddress() => Uri.base;
