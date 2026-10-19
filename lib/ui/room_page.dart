@@ -421,7 +421,11 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
             : const Text('MyTree'),
         actions: [
           if (inRoom)
-            RoomDiskStatusButton(session: session!, enabled: !_leaving),
+            RoomDiskStatusButton(
+              session: session!,
+              enabled: !_leaving,
+              onConnect: () => _roomMenu('settings'),
+            ),
           if (inRoom)
             RoomParticipantsButton(
               otherOnlineCount: session!.otherOnlineCount,

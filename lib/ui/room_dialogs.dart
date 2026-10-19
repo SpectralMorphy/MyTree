@@ -524,10 +524,12 @@ class RoomDiskStatusButton extends StatefulWidget {
     super.key,
     required this.session,
     this.enabled = true,
+    this.onConnect,
   });
 
   final RoomSession session;
   final bool enabled;
+  final VoidCallback? onConnect;
 
   @override
   State<RoomDiskStatusButton> createState() => _RoomDiskStatusButtonState();
@@ -552,6 +554,10 @@ class _RoomDiskStatusButtonState extends State<RoomDiskStatusButton> {
         _pending ||
         session.diskSyncBusy ||
         !session.canEdit) {
+      return;
+    }
+    if (session.diskBinding == null && !session.diskUnlinkPending) {
+      widget.onConnect?.call();
       return;
     }
     setState(() {
@@ -580,12 +586,9 @@ class _RoomDiskStatusButtonState extends State<RoomDiskStatusButton> {
       final error =
           session.diskSyncError ??
           (session.diskSyncAcknowledged ? null : _error);
-      if (!session.canEdit ||
-          (session.diskBinding == null &&
-              !session.diskUnlinkPending &&
-              error == null)) {
-        return const SizedBox.shrink();
-      }
+      if (!session.canEdit) return const SizedBox.shrink();
+      final disconnected =
+          session.diskBinding == null && !session.diskUnlinkPending;
       final colors = Theme.of(context).colorScheme;
       final busy = _pending || session.diskSyncBusy;
       final confirmed =
@@ -615,7 +618,8 @@ class _RoomDiskStatusButtonState extends State<RoomDiskStatusButton> {
           'Отвязка прежнего Диска ещё не подтверждена.',
         if (error != null) error,
       ].join('\n');
-      final onPressed = widget.enabled && !busy
+      final onPressed =
+          widget.enabled && !busy && (!disconnected || widget.onConnect != null)
           ? () => unawaited(_sync())
           : null;
       return Semantics(
@@ -642,26 +646,27 @@ class _RoomDiskStatusButtonState extends State<RoomDiskStatusButton> {
                       size: 26,
                     ),
                   ),
-                  Positioned(
-                    right: 0,
-                    bottom: 0,
-                    child: DecoratedBox(
-                      key: const Key('disk-sync-badge'),
-                      decoration: BoxDecoration(
-                        color: colors.surface,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Padding(
-                        padding: const EdgeInsets.all(1),
-                        child: Icon(
-                          symbol,
-                          key: const Key('disk-sync-symbol'),
-                          color: symbolColor,
-                          size: 16,
+                  if (!disconnected || busy || error != null)
+                    Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: DecoratedBox(
+                        key: const Key('disk-sync-badge'),
+                        decoration: BoxDecoration(
+                          color: colors.surface,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.all(1),
+                          child: Icon(
+                            symbol,
+                            key: const Key('disk-sync-symbol'),
+                            color: symbolColor,
+                            size: 16,
+                          ),
                         ),
                       ),
                     ),
-                  ),
                 ],
               ),
             ),

@@ -212,6 +212,7 @@ Future<void> _showDiskButton(
   Brightness brightness = Brightness.light,
   bool enabled = true,
   bool includeParticipants = false,
+  VoidCallback? onConnect,
 }) => tester.pumpWidget(
   MaterialApp(
     theme: ThemeData(brightness: brightness),
@@ -223,7 +224,11 @@ Future<void> _showDiskButton(
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
-          RoomDiskStatusButton(session: session, enabled: enabled),
+          RoomDiskStatusButton(
+            session: session,
+            enabled: enabled,
+            onConnect: onConnect,
+          ),
           if (includeParticipants)
             RoomParticipantsButton(
               otherOnlineCount: 2,
@@ -324,7 +329,7 @@ void main() {
     }
 
     testWidgets(
-      'guest and normally unbound editor are hidden on live updates',
+      'guest is hidden but an unbound editor keeps a neutral cloud on live updates',
       (tester) async {
         final session = _DialogSession(role: RoomRole.guest)
           ..binding = _diskBinding()
@@ -338,9 +343,13 @@ void main() {
         session.binding = null;
         session.diskRetiring = false;
         session.diskError = null;
+        session.diskStatus = 'Не подключён';
         session.updateRoster(session.roster);
         await tester.pump();
-        expect(button, findsNothing);
+        expect(button, findsOneWidget);
+        expect(find.byKey(const Key('disk-sync-cloud')), findsOneWidget);
+        expect(find.byKey(const Key('disk-sync-symbol')), findsNothing);
+        expect(_diskTooltipMessage(tester), 'Яндекс Диск: Не подключён');
         session.binding = _diskBinding();
         session.updateRoster(session.roster);
         await tester.pump();
@@ -354,6 +363,36 @@ void main() {
         await tester.pumpWidget(const SizedBox.shrink());
       },
     );
+
+    testWidgets('unbound cloud opens setup instead of an impossible sync', (
+      tester,
+    ) async {
+      final session = _DialogSession()..diskStatus = 'Не подключён';
+      addTearDown(session.dispose);
+      var opens = 0;
+      await _showDiskButton(tester, session, onConnect: () => opens++);
+      final button = find.byKey(const Key('disk-sync-button'));
+      expect(button, findsOneWidget);
+      expect(find.byKey(const Key('disk-sync-symbol')), findsNothing);
+      await tester.tap(button);
+      await tester.pump();
+      expect(opens, 1);
+      expect(session.syncCalls, 0);
+      expect(_diskTooltipMessage(tester), 'Яндекс Диск: Не подключён');
+      await _showDiskButton(
+        tester,
+        session,
+        enabled: false,
+        onConnect: () => opens++,
+      );
+      expect(tester.widget<IconButton>(button).onPressed, isNull);
+      await tester.tap(button);
+      await tester.pump();
+      expect(opens, 1);
+      expect(session.syncCalls, 0);
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    });
 
     testWidgets(
       'pending retirement stays visible and outranks active acknowledgement',
@@ -407,7 +446,7 @@ void main() {
           ..diskError = error;
         addTearDown(session.dispose);
         final semantics = tester.ensureSemantics();
-        await _showDiskButton(tester, session);
+        await _showDiskButton(tester, session, onConnect: () {});
         final button = find.byKey(const Key('disk-sync-button'));
         final colors = Theme.of(tester.element(button)).colorScheme;
         _expectDiskSymbol(tester, Icons.close, colors.error);

@@ -7,7 +7,7 @@ MyTree can keep an additional private copy on the owner's Yandex Disk. Editors w
 ## Connect
 
 1. Use the owner's Yandex account and obtain an OAuth token **outside MyTree**, with the application-folder permission `cloud_api:disk.app_folder`. There is no configured OAuth client ID or built-in Yandex login/token-issuance flow in this repository. A suitable OAuth application/grant must be arranged separately; MyTree cannot generate the token for you. Do not substitute an unnecessarily broad full-Disk token.
-2. As a room editor, open the room-title menu → **Настройки комнаты** → **Подключить Яндекс Диск**.
+2. As a room editor, press the unconnected cloud icon immediately left of participants (or open the room-title menu → **Настройки комнаты**), then **Подключить Яндекс Диск**.
 3. Paste the token into **OAuth-токен**, press **Подключить**, and confirm that application-folder access will be shared with the room's editors, not guests.
 4. Keep the room open until the cloud icon immediately left of the participants shows a **green check**. Neutral arrows mean synchronization is pending/in progress or access is awaited; a red cross means an error. Hover the cloud (or long-press on touch) for the full status/error; press it to request another exchange without opening settings. The settings' **Синхронизировать** action remains available. Local saving or an online-participant count alone does not confirm a cloud copy.
 

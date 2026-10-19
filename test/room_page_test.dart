@@ -2232,6 +2232,35 @@ void main() {
     },
   );
 
+  testWidgets('new room shows an unconnected cloud that opens Disk settings', (
+    tester,
+  ) async {
+    await mount(tester, seedName: false, answerName: false);
+    await tester.tap(find.text('Создать комнату'));
+    await answerNamePrompt(tester);
+    final action = find.byKey(const Key('disk-sync-button'));
+    expect(action, findsOneWidget);
+    expect(find.byTooltip('Яндекс Диск: Не подключён'), findsOneWidget);
+    expect(find.byKey(const Key('disk-sync-symbol')), findsNothing);
+    expect(
+      tester.getRect(action).right,
+      lessThanOrEqualTo(
+        tester.getRect(find.byKey(const Key('participants-button'))).left,
+      ),
+    );
+    final created = (await store.loadLastRoom())!;
+    final before = await store.loadHistory(created);
+    await tester.tap(action);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.byType(RoomSettingsDialog), findsOneWidget);
+    expect(find.text('Подключить Яндекс Диск'), findsOneWidget);
+    expect(await store.loadHistory(created), before);
+    expect(await store.loadDiskCredentials(created), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    expect(tester.takeException(), isNull);
+  });
+
   for (final role in [RoomRole.editor, RoomRole.guest]) {
     testWidgets('Disk header action replaces the status row for ${role.name}', (
       tester,
