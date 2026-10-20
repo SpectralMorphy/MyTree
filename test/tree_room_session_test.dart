@@ -1547,9 +1547,13 @@ void main() {
       network.autoRegister = false;
       final storages = {'alice': aliceStore, 'bob': bobStore, ...guestStores};
       for (final entry in storages.entries) {
-        final reopened = session(actor: entry.key, storage: entry.value);
-        await reopened.start();
         final isGuest = guestStores.containsKey(entry.key);
+        final reopened = session(
+          actor: entry.key,
+          storage: entry.value,
+          role: RoomRole.guest,
+        );
+        await reopened.start();
         expect(reopened.ownRole, isGuest ? RoomRole.guest : RoomRole.editor);
         expect(reopened.canEdit, !isGuest);
         expect(reopened.boundPersonId, isGuest ? null : rootTreePersonId);

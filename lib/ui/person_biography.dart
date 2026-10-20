@@ -1045,7 +1045,7 @@ class _SurnameEditorState extends State<_SurnameEditor> {
             setState(() => _decline = checked ?? false);
             if (_surname.text.trim().isNotEmpty) unawaited(_save());
           },
-          title: const Text('склонять'),
+          title: const Text('склонять фамилию'),
           controlAffinity: ListTileControlAffinity.leading,
           contentPadding: EdgeInsets.zero,
           dense: true,
@@ -1296,7 +1296,6 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
   String? _createdId;
   TreeSex _sex = TreeSex.male;
   DateTime? _birthDate;
-  bool _asMother = false;
   bool _busy = false;
   bool _pickingFromTree = false;
   String? _error;
@@ -1307,7 +1306,6 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
   void initState() {
     super.initState();
     final tree = widget.session.tree;
-    _asMother = tree.person(widget.personId)?.sex == TreeSex.female;
     _kind =
         const [
           _RelativeKind.father,
@@ -1341,12 +1339,6 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
       person.sex == TreeSex.unknown ||
       person.sex == _fixedSex;
 
-  bool _childParentIsMother(TreeSex sex) => switch (sex) {
-    TreeSex.male => false,
-    TreeSex.female => true,
-    TreeSex.unknown => _asMother,
-  };
-
   bool _kindAvailable(TreeDocument tree, _RelativeKind kind) {
     final person = tree.person(widget.personId);
     if (person == null) return false;
@@ -1359,7 +1351,7 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
 
   bool _targetIsMother(TreePerson focus) =>
       _kind == _RelativeKind.mother ||
-      (_kind == _RelativeKind.child && _childParentIsMother(focus.sex));
+      (_kind == _RelativeKind.child && focus.sex == TreeSex.female);
 
   bool _submittedLinkIsCurrent(TreeDocument tree) {
     final link = _submittedLink;
@@ -1622,7 +1614,6 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
     listenable: widget.session,
     builder: (context, _) {
       final tree = widget.session.tree;
-      final focusSex = tree.person(widget.personId)?.sex ?? TreeSex.unknown;
       final hasCandidates = tree.people.values.any(_canPick);
       final selected = tree.person(_existingId ?? '');
       final kindAvailable = _kindAvailable(tree, _kind);
@@ -1708,43 +1699,6 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
                         },
                 ),
                 const SizedBox(height: 12),
-                if (_kind == _RelativeKind.child) ...[
-                  DropdownButtonFormField<bool>(
-                    key: ValueKey('relative-parent-role-${focusSex.name}'),
-                    initialValue: _childParentIsMother(focusSex),
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                      labelText: 'Роль выбранного человека',
-                      border: OutlineInputBorder(),
-                    ),
-                    items: const [
-                      DropdownMenuItem(
-                        value: false,
-                        child: Text(
-                          'Отец ребёнка',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      DropdownMenuItem(
-                        value: true,
-                        child: Text(
-                          'Мать ребёнка',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ],
-                    onChanged:
-                        _busy ||
-                            _submittedLink != null ||
-                            !widget.session.canEdit ||
-                            focusSex != TreeSex.unknown
-                        ? null
-                        : (value) => setState(() => _asMother = value ?? false),
-                  ),
-                  const SizedBox(height: 12),
-                ],
                 if (!_isSibling) ...[
                   Wrap(
                     spacing: 8,

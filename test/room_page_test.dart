@@ -745,7 +745,7 @@ void main() {
   );
 
   testWidgets(
-    'saved guest stays read-only, may rename self and only invites guests',
+    'saved guest stays read-only until explicitly entering through an editor link',
     (tester) async {
       final actor = await seedGuestRoom();
       await mount(tester);
@@ -853,10 +853,11 @@ void main() {
         tester,
         uri: Uri.parse('https://current.example/#room=$roomId&role=editor'),
       );
-      expect(tester.widget<TextField>(text).readOnly, isTrue);
+      expect(tester.widget<TextField>(text).readOnly, isFalse);
       document = RoomDocument()
         ..merge(decodeRoomHistory(await store.loadHistory(roomId)));
-      expect(document.participantRoles[actor], RoomRole.guest);
+      expect(document.participantRoles[actor], RoomRole.editor);
+      expect(document.participantRoles['other-guest'], RoomRole.guest);
       expect(document.participantNames[actor], 'Мария Новая');
       expect(
         document.history.where(
@@ -864,12 +865,63 @@ void main() {
               edit.kind == RoomEditKind.participantRole &&
               edit.targetActor == actor,
         ),
-        hasLength(1),
+        hasLength(2),
       );
+      final promotedHistory = await store.loadHistory(roomId);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await mount(tester);
+      expect(tester.widget<TextField>(text).readOnly, isFalse);
+      expect(await store.loadHistory(roomId), promotedHistory);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
     },
   );
+
+  for (final input in [
+    roomId,
+    'https://current.example/#room=$roomId&role=guest',
+    'https://current.example/#room=$roomId&role=editor',
+  ]) {
+    testWidgets('saved guest enters pasted invitation $input', (tester) async {
+      final actor = await seedGuestRoom();
+      await mount(tester);
+      await settings(tester, 'Выход в меню');
+      await tester.tap(find.text('Присоединиться'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.descendant(
+          of: find.byType(JoinRoomDialog),
+          matching: find.byType(TextField),
+        ),
+        input,
+      );
+      await tester.tap(find.text('Подключиться'));
+      await tester.pump();
+      await tester.pump();
+      await finishSoloDiscovery(tester);
+      final editor = input.endsWith('role=editor');
+      expect(
+        tester.widget<TextField>(find.byKey(const Key('room-text'))).readOnly,
+        !editor,
+      );
+      final document = RoomDocument()
+        ..merge(decodeRoomHistory(await store.loadHistory(roomId)));
+      expect(
+        document.participantRoles[actor],
+        editor ? RoomRole.editor : RoomRole.guest,
+      );
+      expect(document.participantRoles['other-guest'], RoomRole.guest);
+      expect(
+        document.history.where(
+          (e) =>
+              e.kind == RoomEditKind.participantRole && e.targetActor == actor,
+        ),
+        hasLength(editor ? 2 : 1),
+      );
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+  }
 
   testWidgets(
     'guest menu name cancel is harmless and failed save retries durably before broadcast',

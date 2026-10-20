@@ -451,7 +451,7 @@ void main() {
     );
     expect(tester.widget<CheckboxListTile>(decline).title, isA<Text>());
     expect(
-      find.descendant(of: decline, matching: find.text('склонять')),
+      find.descendant(of: decline, matching: find.text('склонять фамилию')),
       findsOneWidget,
     );
     expect(find.byType(CheckboxListTile), findsOneWidget);
@@ -2273,12 +2273,8 @@ void main() {
         find.textContaining('Новый человек остался в дереве'),
         findsOneWidget,
       );
-      final role = dropdown<bool>(
-        tester,
-        find.byType(DropdownButtonFormField<bool>),
-      );
-      expect(role.value, isFalse);
-      expect(role.onChanged, isNull);
+      expect(find.text('Роль выбранного человека'), findsNothing);
+      expect(find.byType(DropdownButtonFormField<bool>), findsNothing);
       expect(relativeKindOption(tester, 'Ребёнка').enabled, isTrue);
       expect(tester.takeException(), isNull);
     },
@@ -2698,102 +2694,73 @@ void main() {
   for (final (sex, asMother) in const [
     (TreeSex.male, false),
     (TreeSex.female, true),
+    (TreeSex.unknown, false),
   ]) {
-    testWidgets('known ${sex.name} adding a child has a locked parent role', (
-      tester,
-    ) async {
-      session.seed(session.tree.setValue(rootTreePersonId, 'sex', sex.name));
-      session.seed(session.tree.createPerson('child', name: 'Ребёнок'));
-      await mount(tester);
-      await openRelative(tester);
-      await chooseRelativeKind(tester, 'Ребёнка');
-      final role = dropdown<bool>(
-        tester,
-        find.byType(DropdownButtonFormField<bool>),
+    for (final newPerson in [false, true]) {
+      testWidgets(
+        '${sex.name} adds a child without a parent-role field, new=$newPerson',
+        (tester) async {
+          session.seed(
+            session.tree.setValue(rootTreePersonId, 'sex', sex.name),
+          );
+          if (!newPerson) {
+            session.seed(session.tree.createPerson('child', name: 'Ребёнок'));
+          }
+          await mount(tester);
+          await openRelative(tester);
+          await chooseRelativeKind(tester, 'Ребёнка');
+          expect(find.text('Роль выбранного человека'), findsNothing);
+          expect(find.text('Отец ребёнка'), findsNothing);
+          expect(find.text('Мать ребёнка'), findsNothing);
+          expect(find.byType(DropdownButtonFormField<bool>), findsNothing);
+          if (newPerson) {
+            await tester.tap(find.text('Новый человек'));
+            await tester.pumpAndSettle();
+            await tester.enterText(
+              find.byKey(const Key('relative-new-name')),
+              'Ребёнок',
+            );
+          } else {
+            await chooseExisting(tester, 'Ребёнок');
+          }
+          await tester.tap(find.byKey(const Key('confirm-add-relative')));
+          await tester.pumpAndSettle();
+          final child = session.durableTree.people.values.singleWhere(
+            (person) => person.name == 'Ребёнок',
+          );
+          expect(child.fatherId, asMother ? isNull : rootTreePersonId);
+          expect(child.motherId, asMother ? rootTreePersonId : isNull);
+          expect(session.durableTree.person(rootTreePersonId)!.sex, sex);
+          expect(find.byType(AlertDialog), findsNothing);
+          expect(tester.takeException(), isNull);
+        },
       );
-      expect(role.value, asMother);
-      expect(role.onChanged, isNull);
-      await chooseExisting(tester, 'Ребёнок');
-      await tester.tap(find.byKey(const Key('confirm-add-relative')));
-      await tester.pumpAndSettle();
-      final child = session.durableTree.person('child')!;
-      expect(child.fatherId, asMother ? isNull : rootTreePersonId);
-      expect(child.motherId, asMother ? rootTreePersonId : isNull);
-      expect(session.durableTree.person(rootTreePersonId)!.sex, sex);
-      expect(tester.takeException(), isNull);
-    });
+    }
   }
 
-  for (final asMother in [false, true]) {
-    testWidgets('unknown sex can choose child parent role mother=$asMother', (
-      tester,
-    ) async {
-      session.seed(session.tree.createPerson('child', name: 'Ребёнок'));
-      await mount(tester);
-      await openRelative(tester);
-      await chooseRelativeKind(tester, 'Ребёнка');
-      final roleField = find.byType(DropdownButtonFormField<bool>);
-      expect(dropdown<bool>(tester, roleField).onChanged, isNotNull);
-      expect(
-        dropdown<bool>(tester, roleField).items!.map((item) => item.value),
-        [false, true],
-      );
-      await tester.tap(roleField);
+  testWidgets('child submission uses live sex without a parent-role field', (
+    tester,
+  ) async {
+    session.seed(session.tree.createPerson('child', name: 'Ребёнок'));
+    await mount(tester);
+    await openRelative(tester);
+    await chooseRelativeKind(tester, 'Ребёнка');
+    for (final sex in ['male', 'female', 'unknown', 'female']) {
+      session.remote(session.tree.setValue(rootTreePersonId, 'sex', sex));
       await tester.pumpAndSettle();
-      await tester.tap(
-        find.text(asMother ? 'Мать ребёнка' : 'Отец ребёнка').last,
-      );
-      await tester.pumpAndSettle();
-      await chooseExisting(tester, 'Ребёнок');
-      await tester.tap(find.byKey(const Key('confirm-add-relative')));
-      await tester.pumpAndSettle();
-      final child = session.durableTree.person('child')!;
-      expect(child.fatherId, asMother ? isNull : rootTreePersonId);
-      expect(child.motherId, asMother ? rootTreePersonId : isNull);
-      expect(
-        session.durableTree.person(rootTreePersonId)!.sex,
-        TreeSex.unknown,
-      );
-      expect(tester.takeException(), isNull);
-    });
-  }
-
-  testWidgets(
-    'remote sex changes update child role and submission uses live sex',
-    (tester) async {
-      session.seed(session.tree.createPerson('child', name: 'Ребёнок'));
-      await mount(tester);
-      await openRelative(tester);
-      await chooseRelativeKind(tester, 'Ребёнка');
-      final roleField = find.byType(DropdownButtonFormField<bool>);
-      await tester.tap(roleField);
-      await tester.pumpAndSettle();
-      await tester.tap(find.text('Мать ребёнка').last);
-      await tester.pumpAndSettle();
-      expect(dropdown<bool>(tester, roleField).value, isTrue);
-      session.remote(session.tree.setValue(rootTreePersonId, 'sex', 'male'));
-      await tester.pumpAndSettle();
-      expect(dropdown<bool>(tester, roleField).value, isFalse);
-      expect(dropdown<bool>(tester, roleField).onChanged, isNull);
-      session.remote(session.tree.setValue(rootTreePersonId, 'sex', 'female'));
-      await tester.pumpAndSettle();
-      expect(dropdown<bool>(tester, roleField).value, isTrue);
-      expect(dropdown<bool>(tester, roleField).onChanged, isNull);
-      session.remote(session.tree.setValue(rootTreePersonId, 'sex', 'unknown'));
-      await tester.pumpAndSettle();
-      expect(dropdown<bool>(tester, roleField).onChanged, isNotNull);
-      expect(dropdown<bool>(tester, roleField).value, isTrue);
-      await chooseExisting(tester, 'Ребёнок');
-      session.remote(session.tree.setValue(rootTreePersonId, 'sex', 'male'));
-      // Submit before rendering the remote update: the old visible selection is
-      // mother, but the operation must use the live person's now-known sex.
-      await tester.tap(find.byKey(const Key('confirm-add-relative')));
-      await tester.pumpAndSettle();
-      expect(session.durableTree.person('child')!.fatherId, rootTreePersonId);
-      expect(session.durableTree.person('child')!.motherId, isNull);
-      expect(tester.takeException(), isNull);
-    },
-  );
+      expect(find.text('Роль выбранного человека'), findsNothing);
+      expect(find.byType(DropdownButtonFormField<bool>), findsNothing);
+    }
+    await chooseExisting(tester, 'Ребёнок');
+    session.remote(session.tree.setValue(rootTreePersonId, 'sex', 'male'));
+    // Submit before rendering the remote update: the operation must use the
+    // live person's sex rather than the female snapshot from the last build.
+    await tester.tap(find.byKey(const Key('confirm-add-relative')));
+    await tester.pumpAndSettle();
+    expect(session.durableTree.person('child')!.fatherId, rootTreePersonId);
+    expect(session.durableTree.person('child')!.motherId, isNull);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets(
     'child parent role is revalidated after awaiting new person save',

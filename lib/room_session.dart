@@ -153,8 +153,8 @@ class RoomSession extends ChangeNotifier {
   // storage closes the snapshot/subscribe gap as for an ordinary history load.
   List<RoomEdit>? _entryHistory;
 
-  /// Null preserves direct legacy callers. Named UI entry always supplies the
-  /// invitation role, including for a saved member whose durable role wins.
+  /// Null preserves direct legacy callers. The UI supplies guest for ordinary
+  /// restore; an explicit editor invitation can durably promote a saved guest.
   final RoomRole? invitationRole;
 
   /// Optional binding-scoped entry snapshot. Never a welcome or a peer ACK.
@@ -1475,9 +1475,9 @@ class RoomSession extends ChangeNotifier {
         if (!await _ensureEntryProfile(stillAdmissible: current)) return false;
         if (!current()) return false;
 
-        // Durable roles, including roles saved by an earlier failed admission,
-        // always win over a newly opened invitation. Never retain its editor
-        // token for an actor whose existing role is guest.
+        // Profile preparation must durably promote an accepted invited guest
+        // before retaining editor access. Unaccepted guest residue stays guest
+        // and must never retain the invitation's editor token.
         final retainsToken =
             ownRole == RoomRole.editor &&
             _durableRoleDocument.participantRoles[actorId] == RoomRole.editor;
@@ -1547,7 +1547,8 @@ class RoomSession extends ChangeNotifier {
   bool get _needsEntryProfile =>
       !_entryProfileSaved &&
       (_entryParticipantName != null ||
-          (invitationRole != null && (!_joined || newlyCreated)));
+          (invitationRole != null &&
+              (!_joined || newlyCreated || invitationRole == RoomRole.editor)));
 
   Future<bool> _ensureEntryProfile({bool Function()? stillAdmissible}) async {
     if (!_needsEntryProfile) return true;
@@ -1555,16 +1556,22 @@ class RoomSession extends ChangeNotifier {
     try {
       // Profiles are authored operations too: only the journal's allocator can
       // finalize their shared-tab sequence and immutable predecessor proof.
-      // Existing explicit roles still beat a newly opened invitation.
+      // Only accepted guests can upgrade an existing role through an editor
+      // invitation. Unaccepted profile residue keeps its original entry role.
       final saved = <RoomEdit>[];
       final name = _entryParticipantName;
       if (name != null) {
         final edit = await _history.setParticipantName(name);
         if (edit != null) saved.add(edit);
       }
+      final promoteGuest =
+          _joined &&
+          invitationRole == RoomRole.editor &&
+          _durableRoleDocument.participantRoles[actorId] == RoomRole.guest;
       if (invitationRole != null &&
-          (!_joined || newlyCreated) &&
-          !_history.participantRoles.containsKey(actorId)) {
+          (promoteGuest ||
+              ((!_joined || newlyCreated) &&
+                  !_history.participantRoles.containsKey(actorId)))) {
         final edit = await _history.setParticipantRole(
           actorId,
           newlyCreated ? RoomRole.editor : invitationRole!,

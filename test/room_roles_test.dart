@@ -559,11 +559,7 @@ void main() {
         host.dispose();
         await _settle(tester);
         network.autoRegister = false;
-        final reopened = session(
-          actor: 'bob',
-          storage: storage,
-          role: RoomRole.editor,
-        );
+        final reopened = session(actor: 'bob', storage: storage);
         await reopened.start();
         expect(reopened.ownRole, RoomRole.guest);
         expect(reopened.canEdit, isFalse);
@@ -978,7 +974,7 @@ void main() {
   );
 
   rolesTest(
-    'legacy saved members remain editors and explicit guests cannot enter via editor invite',
+    'legacy saved members remain editors and a saved guest accepts an editor invite',
     (tester) async {
       network.autoRegister = false;
       final legacyStore = store();
@@ -1009,11 +1005,159 @@ void main() {
         storage: storage,
       );
       await guest.start();
+      expect(guest.ownRole, RoomRole.editor);
+      expect(guest.canEdit, isTrue);
+      final promoted = guest.changes.singleWhere(
+        (edit) =>
+            edit.kind == RoomEditKind.participantRole && edit.text == 'editor',
+      );
+      expect(promoted.author, 'bob');
+      expect(promoted.targetActor, 'bob');
+      await guest.retry();
+      expect(guest.changes, hasLength(2));
+      expect(guest.ownRole, RoomRole.editor);
+      guest.dispose();
+      final restored = session(actor: 'bob', storage: storage);
+      await restored.start();
+      expect(restored.canEdit, isTrue);
+      expect(
+        restored.changes.map((edit) => edit.toJson()),
+        guest.changes.map((edit) => edit.toJson()),
+      );
+      restored.dispose();
+      final guestInvite = session(
+        actor: 'bob',
+        storage: storage,
+        role: RoomRole.guest,
+      );
+      await guestInvite.start();
+      expect(guestInvite.canEdit, isTrue);
+      expect(
+        guestInvite.changes.map((edit) => edit.toJson()),
+        guest.changes.map((edit) => edit.toJson()),
+      );
+    },
+  );
+
+  for (final invitation in [null, RoomRole.guest]) {
+    rolesTest('saved guest restore does not promote for $invitation', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      final storage = store();
+      final initial = _role('guest-role', 'bob', RoomRole.guest);
+      await storage.appendHistory(_roomId, [initial.toJson()]);
+      final guest = session(actor: 'bob', storage: storage, role: invitation);
+      await guest.start();
+      await guest.retry();
       expect(guest.ownRole, RoomRole.guest);
       expect(guest.canEdit, isFalse);
-      await guest.retry();
-      expect(guest.changes, hasLength(1));
+      expect(guest.changes.map((edit) => edit.toJson()), [initial.toJson()]);
+      expect(storage.authoredBatches, isEmpty);
+    });
+  }
+
+  rolesTest(
+    'editor invitation waits for durable guest promotion before granting commands or sync',
+    (tester) async {
+      final hostStore = store();
+      final guestStore = store();
+      final seed = [
+        _role('alice-role', 'alice', RoomRole.editor),
+        _role('bob-role', 'bob', RoomRole.guest),
+        _role('eve-role', 'eve', RoomRole.guest),
+      ];
+      for (final storage in [hostStore, guestStore]) {
+        await storage.appendHistory(
+          _roomId,
+          seed.map((e) => e.toJson()).toList(),
+        );
+      }
+      final host = session(actor: 'alice', storage: hostStore, creator: true);
+      await host.start();
+      await _settle(tester);
+      guestStore.appendGate = Completer<void>();
+      final guest = session(
+        actor: 'bob',
+        storage: guestStore,
+        role: RoomRole.editor,
+        follower: true,
+      );
+      var started = false;
+      final starting = guest.start().then((_) => started = true);
+      await _settle(tester);
+      expect(started, isFalse);
       expect(guest.ownRole, RoomRole.guest);
+      expect(guest.canEdit, isFalse);
+      expect(guestStore.authoredBatches, hasLength(1));
+      final draft = guestStore.authoredBatches.single.single;
+      expect(draft['targetActor'], 'bob');
+      expect(draft['text'], 'editor');
+      expect(_sentRoles(network).where((e) => e.id == draft['id']), isEmpty);
+      expect(
+        host.participants.singleWhere((p) => p.actorId == 'bob').role,
+        RoomRole.guest,
+      );
+      await expectLater(guest.edit('Not saved yet'), throwsStateError);
+      guestStore.appendGate!.complete();
+      await starting;
+      await _settleRoom(tester);
+      expect(guest.initialSyncComplete, isTrue);
+      expect(guest.canEdit, isTrue);
+      expect(
+        host.participants.singleWhere((p) => p.actorId == 'bob').role,
+        RoomRole.editor,
+      );
+      expect(
+        host.participants.singleWhere((p) => p.actorId == 'eve').role,
+        RoomRole.guest,
+      );
+      expect(
+        roomHistoryInventory(host.changes),
+        roomHistoryInventory(guest.changes),
+      );
+      await guest.edit('Editor invitation accepted');
+      await _settle(tester);
+      expect(host.text, 'Editor invitation accepted');
+    },
+  );
+
+  rolesTest(
+    'failed editor invitation keeps guest rights and retries the same promotion',
+    (tester) async {
+      network.autoRegister = false;
+      final storage = store();
+      await storage.appendHistory(_roomId, [
+        _role('bob-role', 'bob', RoomRole.guest).toJson(),
+      ]);
+      storage.failAppend = true;
+      final guest = session(
+        actor: 'bob',
+        role: RoomRole.editor,
+        storage: storage,
+      );
+      await guest.start();
+      expect(guest.ownRole, RoomRole.guest);
+      expect(guest.canEdit, isFalse);
+      expect(guest.storageError, contains('Disk full'));
+      expect(guest.initialSyncError, isNotNull);
+      final pending = guest.changes.singleWhere((e) => e.text == 'editor');
+      await expectLater(guest.edit('Forbidden'), throwsStateError);
+      await guest.retry();
+      expect(guest.canEdit, isFalse);
+      expect(guest.changes.where((e) => e.text == 'editor').single, pending);
+      storage.failAppend = false;
+      await guest.retry();
+      expect(guest.canEdit, isTrue);
+      expect(guest.storageError, isNull);
+      final saved = decodeRoomHistory(await storage.loadHistory(_roomId));
+      expect(saved.singleWhere((e) => e.text == 'editor').id, pending.id);
+      expect(saved, hasLength(2));
+      await guest.retry();
+      expect(
+        guest.changes.map((edit) => edit.toJson()),
+        saved.map((edit) => edit.toJson()),
+      );
     },
   );
 
@@ -1213,7 +1357,7 @@ void main() {
       );
       final room = session(
         actor: 'alice',
-        role: RoomRole.editor,
+        role: RoomRole.guest,
         storage: storage,
         follower: true,
       );

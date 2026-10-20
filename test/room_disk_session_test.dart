@@ -1085,7 +1085,7 @@ void main() {
   });
 
   diskTest(
-    'an existing guest is never promoted or given a retained editor token',
+    'an unaccepted guest profile keeps its original role and retains no editor token',
     (tester) async {
       network.autoRegister = false;
       seedCloud();
@@ -1117,6 +1117,115 @@ void main() {
       await tester.pump(const Duration(seconds: 31));
       await _settle(tester);
       expect(cloud.written, isEmpty);
+    },
+  );
+
+  diskTest(
+    'accepted guest editor invitation saves promotion before retaining Disk token',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      await store.saveMembership(_roomId);
+      await store.appendHistory(_roomId, [
+        _role('returning', RoomRole.guest).toJson(),
+      ]);
+      final release = Completer<void>();
+      store.beforeAppend = (edits) async {
+        if (edits.any(
+          (e) => e['author'] == 'returning' && e['text'] == 'editor',
+        )) {
+          await release.future;
+        }
+      };
+      final room = session(
+        actor: 'returning',
+        store: store,
+        role: RoomRole.editor,
+        access: _entryAccess(RoomRole.editor),
+      );
+      var credentialChecked = false;
+      store.beforeCredentials = () async {
+        final saved = RoomDocument()
+          ..merge(decodeRoomHistory(await store.loadHistory(_roomId)));
+        expect(saved.participantRoles['returning'], RoomRole.editor);
+        credentialChecked = true;
+      };
+      var started = false;
+      final starting = room.start().then((_) => started = true);
+      await _settle(tester);
+      expect(started, isFalse);
+      expect(room.joined, isTrue);
+      expect(room.canEdit, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(store.credentialSaveAttempts, 0);
+      expect(await store.loadDiskCredentials(_roomId), isNull);
+      release.complete();
+      await starting;
+      expect(credentialChecked, isTrue);
+      expect(room.canEdit, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(
+        (await store.loadDiskCredentials(_roomId))?['bindingId'],
+        _invitationBinding,
+      );
+      expect(
+        room.changes.where(
+          (e) => e.targetActor == 'returning' && e.text == 'editor',
+        ),
+        hasLength(1),
+      );
+      await room.retry();
+      expect(
+        room.changes.where(
+          (e) => e.targetActor == 'returning' && e.text == 'editor',
+        ),
+        hasLength(1),
+      );
+    },
+  );
+
+  diskTest(
+    'failed invited guest promotion cannot retain token and retry reuses its role edit',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      await store.saveMembership(_roomId);
+      await store.appendHistory(_roomId, [
+        _role('returning', RoomRole.guest).toJson(),
+      ]);
+      store.failAuthor = 'returning';
+      final room = session(
+        actor: 'returning',
+        store: store,
+        role: RoomRole.editor,
+        access: _entryAccess(RoomRole.editor),
+      );
+      await room.start();
+      expect(room.canEdit, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.storageError, isNotNull);
+      expect(store.credentialSaveAttempts, 0);
+      expect(await store.loadDiskCredentials(_roomId), isNull);
+      final pending = room.changes.singleWhere(
+        (e) => e.targetActor == 'returning' && e.text == 'editor',
+      );
+      store.failAuthor = null;
+      await room.retry();
+      expect(room.canEdit, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(
+        (await store.loadDiskCredentials(_roomId))?['bindingId'],
+        _invitationBinding,
+      );
+      expect(
+        room.changes
+            .where((e) => e.targetActor == 'returning' && e.text == 'editor')
+            .single
+            .id,
+        pending.id,
+      );
     },
   );
 
