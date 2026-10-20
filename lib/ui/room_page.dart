@@ -22,6 +22,42 @@ const _buildVersion = String.fromEnvironment(
   defaultValue: 'dev',
 );
 
+class _RoomVersionMenuEntry extends PopupMenuEntry<String> {
+  const _RoomVersionMenuEntry();
+
+  @override
+  double get height => kMinInteractiveDimension;
+
+  @override
+  bool represents(String? value) => false;
+
+  @override
+  State<_RoomVersionMenuEntry> createState() => _RoomVersionMenuEntryState();
+}
+
+class _RoomVersionMenuEntryState extends State<_RoomVersionMenuEntry> {
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    height: widget.height,
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Align(
+        alignment: AlignmentDirectional.centerStart,
+        child: Semantics(
+          enabled: true,
+          child: SelectableText(
+            'Версия: $_buildVersion',
+            key: const Key('room-build-version'),
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 class RoomPage extends StatefulWidget {
   const RoomPage({
     super.key,
@@ -416,15 +452,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
                     ),
                     PopupMenuItem(value: 'menu', child: Text('Выход в меню')),
                     PopupMenuDivider(),
-                    PopupMenuItem(
-                      value: 'version',
-                      enabled: false,
-                      child: SelectableText(
-                        'Версия: $_buildVersion',
-                        key: Key('room-build-version'),
-                        style: TextStyle(fontSize: 12),
-                      ),
-                    ),
+                    _RoomVersionMenuEntry(),
                   ],
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 12),

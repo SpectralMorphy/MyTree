@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' show Tristate;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
@@ -2497,9 +2498,21 @@ void main() {
               find.byType(PopupMenuItem<String>),
             )
             .toList();
-        expect(items.last.value, 'version');
-        expect(items.last.enabled, isFalse);
+        expect(items.last.value, 'menu');
+        final menu = tester.widget<PopupMenuButton<String>>(
+          find.byKey(const Key('room-menu')),
+        );
+        final entries = menu.itemBuilder(
+          tester.element(find.byKey(const Key('room-menu'))),
+        );
+        expect(entries.last.represents('version'), isFalse);
+        final semantics = tester.ensureSemantics();
+        await tester.pump();
         final version = find.byKey(const Key('room-build-version'));
+        final data = tester.getSemantics(version).getSemanticsData();
+        expect(data.flagsCollection.isTextField, isTrue);
+        expect(data.flagsCollection.isEnabled, Tristate.isTrue);
+        semantics.dispose();
         const stamp = String.fromEnvironment(
           'MYTREE_BUILD_VERSION',
           defaultValue: 'dev',
@@ -2523,9 +2536,10 @@ void main() {
               .isCollapsed,
           isFalse,
         );
-        final state = tester.state<EditableTextState>(editable);
-        state.selectAll(SelectionChangedCause.keyboard);
-        state.copySelection(SelectionChangedCause.keyboard);
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+        await tester.sendKeyEvent(LogicalKeyboardKey.keyC);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
         await tester.pumpAndSettle();
         expect(clipboard.last, 'Версия: $stamp');
         expect(find.byKey(const Key('room-build-version')), findsOneWidget);
@@ -2562,12 +2576,12 @@ void main() {
       semantics.dispose();
       await tester.pumpAndSettle();
       final menuItems = find.byType(PopupMenuItem<String>);
-      expect(menuItems, findsNWidgets(5));
+      expect(menuItems, findsNWidgets(4));
       expect(
         tester
             .widgetList<PopupMenuItem<String>>(menuItems)
             .map((item) => item.value),
-        ['settings', 'history', 'name', 'menu', 'version'],
+        ['settings', 'history', 'name', 'menu'],
       );
       expect(
         tester

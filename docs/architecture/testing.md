@@ -47,7 +47,7 @@ in [verification records](../verification.md). A compiled browser suite or an un
 
 ## Standard Checks
 
-The Pages workflow injects `MYTREE_BUILD_VERSION` as a UTC date/time compile-time value. To stamp a local verification release, pass `--dart-define="MYTREE_BUILD_VERSION=yyyy.MM.dd-HHmmss UTC"`; without it, the room menu honestly shows `dev`. The version row supports text selection/copy and must remain the final non-action menu item.
+The Pages workflow injects `MYTREE_BUILD_VERSION` as a UTC date/time compile-time value. To stamp a local verification release, pass `--dart-define="MYTREE_BUILD_VERSION=yyyy.MM.dd-HHmmss UTC"`; without it, the room menu honestly shows `dev`. The version row supports text selection/copy and must remain the final non-action menu entry, without disabled button/menu-item semantics around its read-only text field.
 
 From the project root:
 
