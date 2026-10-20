@@ -73,6 +73,14 @@ File _credentialsArchiveFile(Directory directory, String bindingId) => File(
   '${directory.path}/disk-credentials-${_key(_credentialRoom)}.binding.${sha256.convert(utf8.encode(bindingId))}.json',
 );
 
+const _publicUrl = 'https://disk.yandex.ru/d/public-access-marker';
+Map<String, dynamic> _publicAccess({
+  String bindingId = 'binding',
+  String publicUrl = _publicUrl,
+}) => {'v': 1, 'bindingId': bindingId, 'publicUrl': publicUrl};
+File _publicAccessFile(Directory directory, [String room = _credentialRoom]) =>
+    File('${directory.path}/disk-public-access-${_key(room)}.json');
+
 class _HistoryOnlyStore extends RoomStore {
   @override
   dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError();
@@ -665,6 +673,183 @@ void _contractTests(String name, RoomStore Function() create) {
       },
     );
 
+    test(
+      'Disk public access is a detached room-local read-only snapshot',
+      () async {
+        expect(await store.loadDiskPublicAccess(_credentialRoom), isNull);
+        final input = _publicAccess();
+        final saving = store.saveDiskPublicAccess(_credentialRoom, input);
+        input['bindingId'] = 'mutated';
+        input['publicUrl'] = 'https://yadi.sk/d/mutated';
+        input['token'] = 'must-not-persist';
+        await saving;
+        expect(
+          await store.loadDiskPublicAccess(_credentialRoom),
+          _publicAccess(),
+        );
+        final loaded = (await store.loadDiskPublicAccess(_credentialRoom))!;
+        loaded['publicUrl'] = 'https://yadi.sk/d/mutated-return';
+        loaded['token'] = 'must-not-persist';
+        expect(
+          await store.loadDiskPublicAccess(_credentialRoom),
+          _publicAccess(),
+        );
+        expect(await store.loadDiskPublicAccess(_otherCredentialRoom), isNull);
+        expect(await store.loadDiskCredentials(_credentialRoom), isNull);
+        expect(
+          await store.loadDiskCredentials(
+            _credentialRoom,
+            bindingId: 'binding',
+          ),
+          isNull,
+        );
+        expect(await store.loadHistory(_credentialRoom), isEmpty);
+        expect(await store.hasMembership(_credentialRoom), isFalse);
+        expect(await store.loadLastRoom(), isNull);
+        await store.appendHistory(_credentialRoom, [_operation('tree')]);
+        final history = await store.loadHistory(_credentialRoom);
+        expect(history, [_operation('tree')]);
+        expect(jsonEncode(history), isNot(contains(_publicUrl)));
+        expect(jsonEncode(history), isNot(contains('publicUrl')));
+        expect(jsonEncode(history), isNot(contains('token')));
+      },
+    );
+
+    test(
+      'replacing or removing public access preserves history and credentials',
+      () async {
+        final history = [_operation('tree')];
+        await store.saveMembership(_credentialRoom);
+        await store.appendHistory(_credentialRoom, history);
+        await store.saveDiskCredentials(_credentialRoom, _credentials());
+        final staged = _credentials(bindingId: 'staged', token: 'staged-token');
+        await store.saveDiskCredentials(_credentialRoom, staged);
+        await store.saveDiskPublicAccess(_credentialRoom, _publicAccess());
+        await store.saveDiskPublicAccess(_otherCredentialRoom, _publicAccess());
+        final replacement = _publicAccess(
+          bindingId: 'next',
+          publicUrl: 'https://yadi.sk/d/replacement',
+        );
+        final writing = store.saveDiskPublicAccess(
+          _credentialRoom,
+          replacement,
+        );
+        final reading = store.loadDiskPublicAccess(_credentialRoom);
+        await writing;
+        expect(await reading, replacement);
+        await store.saveDiskPublicAccess(_credentialRoom, null);
+        await store.saveDiskPublicAccess(_credentialRoom, null);
+        expect(await store.loadDiskPublicAccess(_credentialRoom), isNull);
+        expect(
+          await store.loadDiskPublicAccess(_otherCredentialRoom),
+          _publicAccess(),
+        );
+        expect(await store.loadDiskCredentials(_credentialRoom), staged);
+        expect(
+          await store.loadDiskCredentials(
+            _credentialRoom,
+            bindingId: 'binding',
+          ),
+          _credentials(),
+        );
+        expect(await store.loadHistory(_credentialRoom), history);
+        expect(await store.hasMembership(_credentialRoom), isTrue);
+        expect(await store.loadLastRoom(), _credentialRoom);
+        await store.saveDiskPublicAccess(_credentialRoom, replacement);
+        await store.saveDiskCredentials(_credentialRoom, null);
+        expect(await store.loadDiskPublicAccess(_credentialRoom), replacement);
+      },
+    );
+
+    test(
+      'public-access schema and room IDs are strict without echoing URLs',
+      () async {
+        final valid = _publicAccess();
+        await store.saveDiskPublicAccess(_credentialRoom, valid);
+        final invalid = <Map<String, dynamic>>[
+          {},
+          {...valid}..remove('v'),
+          {...valid}..remove('bindingId'),
+          {...valid}..remove('publicUrl'),
+          {...valid, 'extra': _publicUrl},
+          {...valid, 'token': 'must-not-persist'},
+          _credentials(),
+          for (final v in <Object?>[null, 0, 2, 1.0, '1', true])
+            {...valid, 'v': v},
+          for (final id in <Object?>[null, '', 'x' * 129, 1, true, [], {}])
+            {...valid, 'bindingId': id},
+          for (final url in <Object?>[
+            null,
+            '',
+            ' $_publicUrl',
+            '$_publicUrl ',
+            '$_publicUrl\n',
+            'http://disk.yandex.ru/d/public-access-marker',
+            'https://example.com/d/public-access-marker',
+            'https://disk.yandex.ru.example.com/d/public-access-marker',
+            'https://user@disk.yandex.ru/d/public-access-marker',
+            'https://disk.yandex.ru:444/d/public-access-marker',
+            '$_publicUrl#fragment',
+            'https://disk.yandex.ru/d/',
+            'https://disk.yandex.ru/d/${'x' * (32 * 1024)}',
+            1,
+            true,
+            [],
+            {},
+            Object(),
+          ])
+            {...valid, 'publicUrl': url},
+        ];
+        for (var index = 0; index < invalid.length; index++) {
+          await expectLater(
+            store.saveDiskPublicAccess(_credentialRoom, invalid[index]),
+            throwsA(
+              isA<FormatException>().having(
+                (error) => error.toString(),
+                'redacted diagnostic',
+                isNot(contains('public-access-marker')),
+              ),
+            ),
+            reason: 'case $index',
+          );
+        }
+        for (final room in [
+          '',
+          ' ',
+          'room',
+          '../room',
+          'A' * 32,
+          'a' * 33,
+          _publicUrl,
+        ]) {
+          final redactedArgumentError = throwsA(
+            isA<ArgumentError>().having(
+              (error) => error.toString(),
+              'redacted diagnostic',
+              isNot(contains('public-access-marker')),
+            ),
+          );
+          await expectLater(
+            store.loadDiskPublicAccess(room),
+            redactedArgumentError,
+          );
+          await expectLater(
+            store.saveDiskPublicAccess(room, valid),
+            redactedArgumentError,
+          );
+          await expectLater(
+            store.saveDiskPublicAccess(room, null),
+            redactedArgumentError,
+          );
+        }
+        expect(await store.loadDiskPublicAccess(_credentialRoom), valid);
+        final unicode = _publicAccess(bindingId: '雪' * 128);
+        await store.saveDiskPublicAccess(_credentialRoom, unicode);
+        expect(await store.loadDiskPublicAccess(_credentialRoom), unicode);
+        expect(await store.loadDiskCredentials(_credentialRoom), isNull);
+      },
+    );
+
     test('native/memory history watching is an empty stream', () async {
       await store.appendHistory('room', [_operation('first')]);
       expect(await store.watchHistory('room').toList(), isEmpty);
@@ -695,6 +880,22 @@ void main() {
     );
     await expectLater(
       store.saveDiskCredentials(_credentialRoom, null),
+      throwsUnsupportedError,
+    );
+  });
+
+  test('base RoomStore refuses ephemeral Disk public access', () async {
+    final store = _HistoryOnlyStore();
+    await expectLater(
+      store.loadDiskPublicAccess(_credentialRoom),
+      throwsUnsupportedError,
+    );
+    await expectLater(
+      store.saveDiskPublicAccess(_credentialRoom, _publicAccess()),
+      throwsUnsupportedError,
+    );
+    await expectLater(
+      store.saveDiskPublicAccess(_credentialRoom, null),
       throwsUnsupportedError,
     );
   });
@@ -889,6 +1090,181 @@ void main() {
         );
         expect(await reopened.hasMembership(_credentialRoom), isTrue);
         expect(await reopened.loadLastRoom(), _credentialRoom);
+      },
+    );
+
+    test(
+      'public access survives reopen and atomic replacement without an archive',
+      () async {
+        final store = FileRoomStore.withDirectory(directory);
+        await store.saveMembership(_credentialRoom);
+        await store.appendHistory(_credentialRoom, [_operation('tree')]);
+        await store.saveDiskCredentials(_credentialRoom, _credentials());
+        final historyFile = _historyFile(directory, _credentialRoom);
+        final historyBytes = await historyFile.readAsBytes();
+        final credentialBytes = await _credentialsFile(directory).readAsBytes();
+        final archiveBytes = await _credentialsArchiveFile(
+          directory,
+          'binding',
+        ).readAsBytes();
+        final saving = store.saveDiskPublicAccess(
+          _credentialRoom,
+          _publicAccess(),
+        );
+        await store.flush();
+        await saving;
+        final file = _publicAccessFile(directory);
+        expect(jsonDecode(await file.readAsString()), _publicAccess());
+        final reopened = FileRoomStore.withDirectory(directory);
+        expect(
+          await reopened.loadDiskPublicAccess(_credentialRoom),
+          _publicAccess(),
+        );
+        final temporary = File('${file.path}.tmp');
+        await temporary.writeAsString('interrupted $_publicUrl');
+        expect(
+          await reopened.loadDiskPublicAccess(_credentialRoom),
+          _publicAccess(),
+        );
+        final replacement = _publicAccess(
+          bindingId: 'next',
+          publicUrl: 'https://yadi.sk/d/replacement',
+        );
+        await reopened.saveDiskPublicAccess(_credentialRoom, replacement);
+        expect(await temporary.exists(), isFalse);
+        expect(
+          await FileRoomStore.withDirectory(
+            directory,
+          ).loadDiskPublicAccess(_credentialRoom),
+          replacement,
+        );
+        final publicFiles = await directory
+            .list()
+            .where(
+              (entity) => entity.uri.pathSegments.last.startsWith(
+                'disk-public-access-',
+              ),
+            )
+            .toList();
+        expect(publicFiles.map((entity) => entity.uri.pathSegments.last), [
+          file.uri.pathSegments.last,
+        ]);
+        await temporary.writeAsString('interrupted $_publicUrl');
+        await reopened.saveDiskPublicAccess(_credentialRoom, null);
+        expect(await temporary.exists(), isFalse);
+        expect(await file.exists(), isFalse);
+        expect(
+          await FileRoomStore.withDirectory(
+            directory,
+          ).loadDiskPublicAccess(_credentialRoom),
+          isNull,
+        );
+        expect(await historyFile.readAsBytes(), historyBytes);
+        expect(
+          await _credentialsFile(directory).readAsBytes(),
+          credentialBytes,
+        );
+        expect(
+          await _credentialsArchiveFile(directory, 'binding').readAsBytes(),
+          archiveBytes,
+        );
+        expect(await reopened.hasMembership(_credentialRoom), isTrue);
+        expect(await reopened.loadLastRoom(), _credentialRoom);
+      },
+    );
+
+    test(
+      'malformed public-access files throw without echoing URLs or changing data',
+      () async {
+        final store = FileRoomStore.withDirectory(directory);
+        await store.appendHistory(_credentialRoom, [_operation('intact')]);
+        await store.saveDiskCredentials(_credentialRoom, _credentials());
+        final file = _publicAccessFile(directory);
+        final redactedError = throwsA(
+          isA<FormatException>().having(
+            (error) => error.toString(),
+            'redacted diagnostic',
+            isNot(contains('public-access-marker')),
+          ),
+        );
+        for (final encoded in [
+          '$_publicUrl not JSON',
+          'null',
+          '[]',
+          '"$_publicUrl"',
+          '{}',
+          '{"v":1,"bindingId":"binding","publicUrl":null}',
+          '{"v":1,"bindingId":"binding","publicUrl":"$_publicUrl","token":"hidden"}',
+          '{"v":1,"bindingId":"binding","publicUrl":"$_publicUrl","publicUrl":"$_publicUrl"}',
+          '{"v":2,"v":1,"bindingId":"binding","publicUrl":"$_publicUrl"}',
+        ]) {
+          await file.writeAsString(encoded);
+          await expectLater(
+            store.loadDiskPublicAccess(_credentialRoom),
+            redactedError,
+          );
+          await expectLater(
+            store.saveDiskPublicAccess(_credentialRoom, _publicAccess()),
+            redactedError,
+          );
+          expect(await file.readAsString(), encoded);
+        }
+        await file.writeAsBytes([0xff, ...utf8.encode(_publicUrl)]);
+        await expectLater(
+          store.loadDiskPublicAccess(_credentialRoom),
+          redactedError,
+        );
+        await store.saveDiskPublicAccess(_credentialRoom, null);
+        expect(await store.loadDiskPublicAccess(_credentialRoom), isNull);
+        expect(
+          await store.loadDiskCredentials(_credentialRoom),
+          _credentials(),
+        );
+        expect(await store.loadHistory(_credentialRoom), [
+          _operation('intact'),
+        ]);
+      },
+    );
+
+    test(
+      'failed atomic public-access writes preserve the pointer and recover',
+      () async {
+        final store = FileRoomStore.withDirectory(directory);
+        await store.saveDiskPublicAccess(_credentialRoom, _publicAccess());
+        final file = _publicAccessFile(directory);
+        final original = await file.readAsString();
+        final blocked = Directory('${file.path}.tmp');
+        await blocked.create();
+        final replacement = _publicAccess(
+          bindingId: 'next',
+          publicUrl: 'https://yadi.sk/d/replacement',
+        );
+        await expectLater(
+          store.saveDiskPublicAccess(_credentialRoom, replacement),
+          throwsA(isA<FileSystemException>()),
+        );
+        expect(await file.readAsString(), original);
+        expect(
+          await store.loadDiskPublicAccess(_credentialRoom),
+          _publicAccess(),
+        );
+        await blocked.delete();
+        await store.saveDiskPublicAccess(_credentialRoom, replacement);
+        expect(await store.loadDiskPublicAccess(_credentialRoom), replacement);
+        await file.delete();
+        final invalidFile = Directory(file.path);
+        await invalidFile.create();
+        await expectLater(
+          store.loadDiskPublicAccess(_credentialRoom),
+          throwsA(isA<FileSystemException>()),
+        );
+        await expectLater(
+          store.saveDiskPublicAccess(_credentialRoom, null),
+          throwsA(isA<FileSystemException>()),
+        );
+        await invalidFile.delete();
+        await store.saveDiskPublicAccess(_credentialRoom, replacement);
+        expect(await store.loadDiskPublicAccess(_credentialRoom), replacement);
       },
     );
 

@@ -256,6 +256,57 @@ class FileRoomStore extends RoomStore {
     });
   }
 
+  Future<File> _publicAccessFile(String roomId) =>
+      _file('disk-public-access-${encodeStoreKey(roomId)}.json');
+
+  Future<Map<String, dynamic>?> _readDiskPublicAccess(File file) async {
+    if (!await _exists(file)) return null;
+    try {
+      return decodeDiskPublicAccess(utf8.decode(await file.readAsBytes()));
+    } on FormatException {
+      // Both UTF-8 and JSON diagnostics can expose the source URL.
+      throw const FormatException('Invalid stored Disk public access');
+    }
+  }
+
+  @override
+  Future<Map<String, dynamic>?> loadDiskPublicAccess(String roomId) =>
+      _enqueue(() async {
+        requireDiskPublicAccessRoomId(roomId);
+        return _readDiskPublicAccess(await _publicAccessFile(roomId));
+      });
+
+  @override
+  Future<void> saveDiskPublicAccess(
+    String roomId,
+    Map<String, dynamic>? value,
+  ) {
+    late Map<String, dynamic>? snapshot;
+    try {
+      requireDiskPublicAccessRoomId(roomId);
+      snapshot = value == null ? null : snapshotDiskPublicAccess(value);
+    } catch (error, stackTrace) {
+      return Future<void>.error(error, stackTrace);
+    }
+    return _enqueue(() async {
+      final file = await _publicAccessFile(roomId);
+      final temporary = File('${file.path}.tmp');
+      if (snapshot == null) {
+        // Explicit removal also clears interrupted writes or malformed data.
+        if (await _exists(temporary)) await temporary.delete();
+        if (await _exists(file)) await file.delete();
+        return;
+      }
+      final previous = await _readDiskPublicAccess(file);
+      final encoded = jsonEncode(snapshot);
+      if (previous != null && jsonEncode(previous) == encoded) return;
+      // One current pointer only. Flush and rename without touching the journal
+      // or credential sidecars, retaining the old value if a write fails.
+      await temporary.writeAsString(encoded, flush: true);
+      await temporary.rename(file.path);
+    });
+  }
+
   Future<Map<String, HistoryRecord>> _readHistory(String roomId) async {
     final cached = _histories[roomId];
     if (cached != null) {

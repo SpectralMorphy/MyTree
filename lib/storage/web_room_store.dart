@@ -225,6 +225,40 @@ class WebRoomStore extends RoomStore {
     }
   });
 
+  String _publicAccessKey(String roomId) =>
+      '${_roomPrefix(roomId)}disk-public-access';
+
+  Map<String, dynamic>? _readDiskPublicAccess(String key) {
+    final encoded = _storage.getItem(key);
+    return encoded == null ? null : decodeDiskPublicAccess(encoded);
+  }
+
+  @override
+  Future<Map<String, dynamic>?> loadDiskPublicAccess(String roomId) =>
+      Future.sync(() {
+        requireDiskPublicAccessRoomId(roomId);
+        return _readDiskPublicAccess(_publicAccessKey(roomId));
+      });
+
+  @override
+  Future<void> saveDiskPublicAccess(
+    String roomId,
+    Map<String, dynamic>? value,
+  ) => Future.sync(() {
+    requireDiskPublicAccessRoomId(roomId);
+    final snapshot = value == null ? null : snapshotDiskPublicAccess(value);
+    final key = _publicAccessKey(roomId);
+    if (snapshot == null) {
+      _storage.removeItem(key);
+      return;
+    }
+    final previous = _readDiskPublicAccess(key);
+    final encoded = jsonEncode(snapshot);
+    if (previous == null || jsonEncode(previous) != encoded) {
+      _storage.setItem(key, encoded);
+    }
+  });
+
   HistoryRecord _readOperation(String key, String operationPrefix) {
     final encoded = _storage.getItem(key);
     if (encoded == null) {
@@ -315,6 +349,7 @@ class WebRoomStore extends RoomStore {
     requireRoomId(roomId);
     final prefix = '${_roomPrefix(roomId)}operation.';
     final credentialsKey = _credentialsKey(roomId);
+    final publicAccessKey = _publicAccessKey(roomId);
     late StreamController<void> controller;
     JSFunction? listener;
     controller = StreamController<void>(
@@ -326,6 +361,7 @@ class WebRoomStore extends RoomStore {
             if (change.storageArea == storage &&
                 ((change.key?.startsWith(prefix) ?? false) ||
                     change.key == credentialsKey ||
+                    change.key == publicAccessKey ||
                     (change.key?.startsWith('$credentialsKey.binding.') ??
                         false))) {
               controller.add(null);

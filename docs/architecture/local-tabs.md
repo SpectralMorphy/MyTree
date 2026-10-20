@@ -102,7 +102,7 @@ Local drafts, failed appends, and flush errors cannot be masked by a successful 
 
 ### Membership is a separate prerequisite
 
-An unaccepted fresh session does not enter local election or watch/admit itself from a sibling beacon. It first uses the normal live-channel welcome path: validate the welcome, persist its history/profile, and save membership under the session's admission guard. Full initial readiness additionally requires the durable checkpoint/ACK exchange described in [Synchronization](synchronization.md).
+An unaccepted fresh session does not enter local election or watch/admit itself from a sibling beacon. Ordinary online entry first validates the live-channel welcome, persists its history/profile, and saves membership under the session's admission guard; its full initial readiness additionally requires the durable checkpoint/ACK exchange described in [Synchronization](synchronization.md). A [Disk-enabled invitation](yandex-disk.md#offline-capable-invitations-publication-and-admission) is a separate source: bounded validated history/profile/access must be durable before membership and local coordination can start. A Disk-read readiness flag is not a peer checkpoint or a beacon's authority to admit a sibling.
 
 When that fresh session completes normal entry, it can activate local coordination while retaining its verified network if it wins; if it loses, it retires that network. An accepted session can also explicitly open a local copy, which activates coordination without claiming verified synchronization. Neither path lets a beacon create membership.
 

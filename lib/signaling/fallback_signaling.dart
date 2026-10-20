@@ -116,18 +116,23 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
     backend.failed = false;
     backend.ready = false;
     if (backend.retries > 0) _discoveryChanges.add(null);
-    backend.deadline = Timer(Duration(seconds: backend.index == 0 ? 3 : 7), () {
-      if (!backend.ready) {
-        _failed(
-          backend,
-          epoch,
-          const SignalingFailure(
-            SignalingFailureKind.unavailable,
-            'Signaling registration timed out',
-          ),
-        );
-      }
-    });
+    // MQTT startup includes connect (8s), parallel SUBACKs (4s), then
+    // probe/claim (up to 1.5s). Do not abort its valid stages at 7 seconds.
+    backend.deadline = Timer(
+      Duration(seconds: backend.index == 0 ? 3 : 14),
+      () {
+        if (!backend.ready) {
+          _failed(
+            backend,
+            epoch,
+            const SignalingFailure(
+              SignalingFailureKind.unavailable,
+              'Signaling registration timed out',
+            ),
+          );
+        }
+      },
+    );
     runZonedGuarded(
       () {
         final peer = _factories[backend.index](id, configuration);
@@ -386,7 +391,8 @@ class _FallbackChannel implements RoomChannel {
   @override
   final String peer;
   final _attempts = <_Backend, RoomChannel>{};
-  final _failedAttempts = <_Backend>{};
+  // A cold registration retry reuses its backend, but not its failed epoch.
+  final _failedAttempts = <_Backend, int>{};
   bool _failureEmitted = false;
   final _subscriptions = <StreamSubscription<dynamic>>[];
   final _openEvents = StreamController<void>.broadcast(sync: true);
@@ -420,7 +426,11 @@ class _FallbackChannel implements RoomChannel {
   Stream<ChannelConnectivity> get onConnectivity => _health.stream;
 
   void providerReady() {
-    if (_disposed || _winner != null || owner._disposed || owner._conflict) {
+    if (_disposed ||
+        _failureEmitted ||
+        _winner != null ||
+        owner._disposed ||
+        owner._conflict) {
       return;
     }
     final available = owner._backends
@@ -442,7 +452,7 @@ class _FallbackChannel implements RoomChannel {
 
   void _attempt(_Backend backend) {
     if (_attempts.containsKey(backend) ||
-        _failedAttempts.contains(backend) ||
+        _failedAttempts[backend] == backend.epoch ||
         _disposed ||
         _winner != null) {
       return;
@@ -484,7 +494,7 @@ class _FallbackChannel implements RoomChannel {
       ]);
       if (channel.open) scheduleMicrotask(() => _opened(channel));
     } catch (error) {
-      _failedAttempts.add(backend);
+      _failedAttempts[backend] = backend.epoch;
       _race = true;
       providerReady();
       _reportExhausted(error);
@@ -493,14 +503,14 @@ class _FallbackChannel implements RoomChannel {
 
   void _opened(RoomChannel channel) {
     if (_disposed) return;
-    if (owner._conflict && _winner == null) {
+    if (_failureEmitted || (owner._conflict && _winner == null)) {
       scheduleMicrotask(channel.dispose);
       return;
     }
     final valid = _attempts.entries.any(
       (entry) =>
           identical(entry.value, channel) &&
-          !_failedAttempts.contains(entry.key),
+          _failedAttempts[entry.key] != entry.key.epoch,
     );
     if (!valid || channel.disposed) {
       scheduleMicrotask(channel.dispose);
@@ -525,7 +535,8 @@ class _FallbackChannel implements RoomChannel {
       _errors.add(error);
       return;
     }
-    if (_winner != null || !_failedAttempts.add(backend)) return;
+    if (_winner != null || _failedAttempts[backend] == backend.epoch) return;
+    _failedAttempts[backend] = backend.epoch;
     scheduleMicrotask(channel.dispose);
     _race = true;
     providerReady();
@@ -534,7 +545,9 @@ class _FallbackChannel implements RoomChannel {
 
   void _reportExhausted(Object error) {
     if (_disposed || _winner != null || _failureEmitted) return;
-    if (owner._backends.every((b) => b.failed || _failedAttempts.contains(b))) {
+    if (owner._backends.every(
+      (b) => b.failed || _failedAttempts[b] == b.epoch,
+    )) {
       _failureEmitted = true;
       _errors.add(error);
     }
@@ -545,7 +558,7 @@ class _FallbackChannel implements RoomChannel {
     if (channel != null) {
       _attemptFailed(backend, channel, error);
     } else {
-      _failedAttempts.add(backend);
+      _failedAttempts[backend] = backend.epoch;
       _race = true;
       providerReady();
       _reportExhausted(error);

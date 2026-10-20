@@ -70,6 +70,14 @@ Map<String, dynamic> _credentials({
   String token = 'local-only-token',
 }) => {'v': 1, 'bindingId': bindingId, 'token': token};
 
+String _publicAccessKey(String room) =>
+    'mytree.room-store.v1.room.${_key(room)}.disk-public-access';
+const _publicUrl = 'https://disk.yandex.ru/d/public-access-marker';
+Map<String, dynamic> _publicAccess({
+  String bindingId = 'binding',
+  String publicUrl = _publicUrl,
+}) => {'v': 1, 'bindingId': bindingId, 'publicUrl': publicUrl};
+
 String _newRoom() {
   final room = createRoomId();
   addTearDown(() {
@@ -283,6 +291,139 @@ void main() {
       expect(await store.loadHistory(room), history);
       expect(await store.hasMembership(room), isTrue);
       expect(await store.loadLastRoom(), room);
+    },
+  );
+
+  test(
+    'browser public access is detached and independent of credentials and history',
+    () async {
+      final room = _newRoom();
+      final other = _newRoom();
+      final store = WebRoomStore();
+      expect(await store.loadDiskPublicAccess(room), isNull);
+      final input = _publicAccess();
+      final saving = store.saveDiskPublicAccess(room, input);
+      input['publicUrl'] = 'https://yadi.sk/d/mutated';
+      input['token'] = 'must-not-persist';
+      await saving;
+      expect(await WebRoomStore().loadDiskPublicAccess(room), _publicAccess());
+      final loaded = (await store.loadDiskPublicAccess(room))!;
+      loaded['bindingId'] = 'mutated-return';
+      expect(await store.loadDiskPublicAccess(room), _publicAccess());
+      expect(await store.loadDiskPublicAccess(other), isNull);
+      expect(await store.loadDiskCredentials(room), isNull);
+      expect(await store.loadHistory(room), isEmpty);
+      expect(await store.hasMembership(room), isFalse);
+      expect(await store.loadLastRoom(), isNull);
+      final storage = web.window.localStorage;
+      expect(
+        jsonDecode(storage.getItem(_publicAccessKey(room))!),
+        _publicAccess(),
+      );
+      await store.saveMembership(room);
+      await store.appendHistory(room, [
+        {'id': 'intact'},
+      ]);
+      await store.saveDiskCredentials(room, _credentials());
+      final credentials = storage.getItem(_credentialsKey(room));
+      final archive = storage.getItem(_credentialsKey(room, 'binding'));
+      final operation = storage.getItem(_operationKey(room, 'intact'));
+      final replacement = _publicAccess(
+        bindingId: 'next',
+        publicUrl: 'https://yadi.sk/d/replacement',
+      );
+      await store.saveDiskPublicAccess(room, replacement);
+      expect(await WebRoomStore().loadDiskPublicAccess(room), replacement);
+      await store.saveDiskPublicAccess(room, null);
+      await store.saveDiskPublicAccess(room, null);
+      expect(await WebRoomStore().loadDiskPublicAccess(room), isNull);
+      expect(storage.getItem(_publicAccessKey(room)), isNull);
+      expect(storage.getItem(_credentialsKey(room)), credentials);
+      expect(storage.getItem(_credentialsKey(room, 'binding')), archive);
+      expect(storage.getItem(_operationKey(room, 'intact')), operation);
+      expect(await store.hasMembership(room), isTrue);
+      expect(await store.loadLastRoom(), room);
+      await store.saveDiskPublicAccess(room, replacement);
+      await store.saveDiskCredentials(room, null);
+      expect(await store.loadDiskPublicAccess(room), replacement);
+    },
+  );
+
+  test(
+    'browser public-access validation redacts URLs and preserves malformed data',
+    () async {
+      final room = _newRoom();
+      final store = WebRoomStore();
+      final valid = _publicAccess();
+      await store.saveDiskPublicAccess(room, valid);
+      final redactedError = throwsA(
+        isA<FormatException>().having(
+          (error) => error.toString(),
+          'redacted diagnostic',
+          isNot(contains('public-access-marker')),
+        ),
+      );
+      for (final invalid in <Map<String, dynamic>>[
+        {},
+        _credentials(),
+        {...valid, 'token': 'must-not-persist'},
+        {...valid, 'v': 2},
+        {...valid, 'bindingId': ''},
+        {...valid, 'bindingId': 'x' * 129},
+        {...valid, 'publicUrl': Object()},
+        {...valid, 'publicUrl': 'http://disk.yandex.ru/d/public-access-marker'},
+        {...valid, 'publicUrl': 'https://example.com/d/public-access-marker'},
+        {...valid, 'publicUrl': '$_publicUrl#fragment'},
+      ]) {
+        await expectLater(
+          store.saveDiskPublicAccess(room, invalid),
+          redactedError,
+        );
+        expect(await store.loadDiskPublicAccess(room), valid);
+      }
+      for (final invalidRoom in ['', 'room', '../room', 'A' * 32]) {
+        await expectLater(
+          store.loadDiskPublicAccess(invalidRoom),
+          throwsArgumentError,
+        );
+        await expectLater(
+          store.saveDiskPublicAccess(invalidRoom, valid),
+          throwsArgumentError,
+        );
+        await expectLater(
+          store.saveDiskPublicAccess(invalidRoom, null),
+          throwsArgumentError,
+        );
+      }
+      await store.saveDiskCredentials(room, _credentials());
+      await store.appendHistory(room, [
+        {'id': 'intact'},
+      ]);
+      final key = _publicAccessKey(room);
+      for (final encoded in [
+        '$_publicUrl not JSON',
+        'null',
+        '[]',
+        '"$_publicUrl"',
+        '{}',
+        '{"v":1,"bindingId":"binding","publicUrl":null}',
+        '{"v":1,"bindingId":"binding","publicUrl":"$_publicUrl","token":"hidden"}',
+        '{"v":1,"bindingId":"binding","publicUrl":"$_publicUrl","publicUrl":"$_publicUrl"}',
+      ]) {
+        web.window.localStorage.setItem(key, encoded);
+        await expectLater(store.loadDiskPublicAccess(room), redactedError);
+        await expectLater(
+          store.saveDiskPublicAccess(room, valid),
+          redactedError,
+        );
+        expect(web.window.localStorage.getItem(key), encoded);
+      }
+      await store.saveDiskPublicAccess(room, null);
+      expect(await store.loadDiskPublicAccess(room), isNull);
+      expect(await store.loadDiskCredentials(room), _credentials());
+      expect(await store.loadHistory(room), [
+        {'id': 'intact'},
+      ]);
     },
   );
 
@@ -522,7 +663,7 @@ void main() {
   );
 
   test(
-    'history watcher signals credential changes without exposing values',
+    'history watcher signals credential and public-access changes without values',
     () async {
       final room = _newRoom();
       final store = WebRoomStore();
@@ -564,6 +705,20 @@ void main() {
         await store.loadDiskCredentials(room, bindingId: 'second'),
         staged,
       );
+      otherStorage.setItem(_publicAccessKey(room), jsonEncode(_publicAccess()));
+      await _until(() => signals.length == 4);
+      expect(await store.loadDiskPublicAccess(room), _publicAccess());
+      expect(signals, [null, null, null, null]);
+      otherStorage.setItem(
+        _publicAccessKey(_newRoom()),
+        jsonEncode(_publicAccess()),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(signals, hasLength(4));
+      otherStorage.removeItem(_publicAccessKey(room));
+      await _until(() => signals.length == 5);
+      expect(await store.loadDiskPublicAccess(room), isNull);
+      expect(await store.loadHistory(room), isEmpty);
     },
   );
 

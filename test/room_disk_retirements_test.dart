@@ -15,7 +15,12 @@ class _Disk extends YandexDiskClient {
   bool closed = false;
 
   @override
-  Future<List<String>> listFiles(String token, String path) async => [];
+  Future<List<String>> listFiles(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async => [];
 
   @override
   Future<void> writeFile(String token, String path, Uint8List bytes) async {

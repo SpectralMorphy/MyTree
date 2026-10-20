@@ -38,44 +38,29 @@ class _YandexBrowserClient extends http.BaseClient {
             ),
           )
           .toDart;
+      if (controller.signal.aborted) {
+        throw http.ClientException('Yandex Disk HTTP request aborted.');
+      }
       final headers = <String, String>{};
       for (final name in ['content-type', 'content-length']) {
         final value = response.headers.get(name);
         if (value != null) headers[name] = value;
       }
-      final stream = StreamController<List<int>>();
-      var cancelled = false;
-      stream.onListen = () {
-        scheduleMicrotask(() async {
-          if (cancelled) return;
-          try {
-            final buffer = await response.arrayBuffer().toDart;
-            if (!cancelled) stream.add(buffer.toDart.asUint8List());
-          } catch (_) {
-            if (!cancelled) {
-              stream.addError(
-                http.ClientException('Yandex Disk HTTP response failed.'),
-              );
-            }
-          } finally {
-            _pending.remove(controller);
-            unawaited(stream.close());
-          }
-        });
-      };
-      stream.onCancel = () {
-        cancelled = true;
-        _pending.remove(controller);
-        controller.abort();
-      };
+      final lengthHeader = headers['content-length'];
+      final length = lengthHeader == null ? null : int.tryParse(lengthHeader);
+      if (lengthHeader != null && (length == null || length < 0)) {
+        throw http.ClientException('Yandex Disk HTTP response failed.');
+      }
+      final url = Uri.parse(response.url);
       // Expose the final address before reading bytes so the Disk boundary can
       // reject an unexpected redirect destination without consuming its body.
       return _YandexBrowserResponse(
-        stream.stream,
+        _bodyStream(response, controller),
         response.status,
-        url: Uri.parse(response.url),
+        url: url,
         request: request,
         headers: headers,
+        contentLength: length,
       );
     } catch (_) {
       // Fetch errors may include a signed URL. The domain client supplies the
@@ -86,11 +71,112 @@ class _YandexBrowserClient extends http.BaseClient {
     }
   }
 
+  Stream<List<int>> _bodyStream(
+    web.Response response,
+    web.AbortController controller,
+  ) {
+    // Synchronous delivery propagates pause/cancel before another JS read.
+    // Reader acquisition is still deferred: listen().cancel() must not disturb
+    // the body before the caller has checked the response's final URL/length.
+    final stream = StreamController<List<int>>(sync: true);
+    web.ReadableStreamDefaultReader? reader;
+    Completer<void>? resumeSignal;
+    var finished = false;
+    late final JSFunction onAbort;
+
+    void resume() {
+      final signal = resumeSignal;
+      resumeSignal = null;
+      signal?.complete();
+    }
+
+    void finish({bool abort = false, bool error = false}) {
+      if (finished) return;
+      finished = true;
+      controller.signal.removeEventListener('abort', onAbort);
+      _pending.remove(controller);
+      resume();
+      if (abort) controller.abort();
+      final current = reader;
+      reader = null;
+      if (current != null) {
+        if (abort) {
+          try {
+            // Do not let a failing or stalled JS cancel promise prevent abort
+            // or leak a platform exception containing a signed URL.
+            unawaited(
+              current.cancel().toDart.then<void>(
+                (_) {},
+                onError: (Object _) {},
+              ),
+            );
+          } catch (_) {
+            // Cleanup errors must not replace the safe response failure.
+          }
+        }
+        try {
+          current.releaseLock();
+        } catch (_) {
+          // A reader may already have been detached by an abort.
+        }
+      }
+      // Cancellation may occur inside a synchronous data callback. Deliver
+      // terminal events later, never re-enter the controller's current event.
+      scheduleMicrotask(() {
+        if (error) {
+          stream.addError(
+            http.ClientException('Yandex Disk HTTP response failed.'),
+          );
+        }
+        unawaited(stream.close());
+      });
+    }
+
+    Future<void> read() async {
+      if (finished) return;
+      try {
+        final body = response.body;
+        if (body == null) {
+          finish();
+          return;
+        }
+        reader = body.getReader() as web.ReadableStreamDefaultReader;
+        while (!finished) {
+          if (stream.isPaused) {
+            await (resumeSignal ??= Completer<void>()).future;
+          }
+          if (finished) return;
+          final chunk = await reader!.read().toDart;
+          if (finished) return;
+          if (chunk.done) {
+            finish();
+            return;
+          }
+          stream.add((chunk.value! as JSUint8Array).toDart);
+        }
+      } catch (_) {
+        finish(abort: true, error: true);
+      }
+    }
+
+    onAbort = ((web.Event _) => finish(abort: true, error: true)).toJS;
+    controller.signal.addEventListener('abort', onAbort);
+    stream
+      ..onListen = () {
+        scheduleMicrotask(() => unawaited(read()));
+      }
+      ..onResume = resume
+      ..onCancel = () => finish(abort: true);
+    if (controller.signal.aborted) finish(abort: true, error: true);
+    return stream.stream;
+  }
+
   @override
   void close() {
     if (_closed) return;
     _closed = true;
-    for (final controller in _pending) {
+    // Abort listeners remove their controller from _pending synchronously.
+    for (final controller in _pending.toList()) {
       controller.abort();
     }
     _pending.clear();
@@ -106,6 +192,7 @@ class _YandexBrowserResponse extends http.StreamedResponse
     required this.url,
     required super.request,
     required super.headers,
+    super.contentLength,
   });
 
   @override

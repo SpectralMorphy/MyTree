@@ -39,7 +39,7 @@ class _JoinRoomDialogState extends State<JoinRoomDialog> {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const Text(
-          'Для первого подключения хотя бы один участник комнаты должен быть онлайн.',
+          'Для входа по ID нужен онлайн-участник. Приглашение с доступом к Диску позволяет войти без него.',
         ),
         const SizedBox(height: 16),
         TextField(
@@ -1191,6 +1191,12 @@ class RoomChangesDialog extends StatelessWidget {
   );
 }
 
+typedef PrepareRoomDiskAccess =
+    Future<RoomDiskAccess?> Function(
+      RoomRole role, {
+      required bool allowPublication,
+    });
+
 class InviteParticipantsDialog extends StatefulWidget {
   const InviteParticipantsDialog({
     super.key,
@@ -1198,12 +1204,16 @@ class InviteParticipantsDialog extends StatefulWidget {
     required this.applicationUri,
     required this.onMessage,
     this.canInviteEditors = false,
+    this.prepareDiskAccess,
+    this.canPublishDiskAccess = false,
   });
 
   final String roomId;
   final Uri applicationUri;
   final ValueChanged<String> onMessage;
   final bool canInviteEditors;
+  final PrepareRoomDiskAccess? prepareDiskAccess;
+  final bool canPublishDiskAccess;
 
   @override
   State<InviteParticipantsDialog> createState() =>
@@ -1212,6 +1222,133 @@ class InviteParticipantsDialog extends StatefulWidget {
 
 class _InviteParticipantsDialogState extends State<InviteParticipantsDialog> {
   RoomRole _role = RoomRole.guest;
+  bool _preparing = false;
+  bool _editorSharingAccepted = false;
+  bool _publicSharingAccepted = false;
+  String? _error;
+
+  Future<bool> _confirmAccess({required bool public}) async {
+    if ((public && _publicSharingAccepted) ||
+        (!public && _editorSharingAccepted)) {
+      return true;
+    }
+    final accepted =
+        await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            scrollable: true,
+            title: Text(
+              public
+                  ? 'Разрешить гостям доступ к Диску?'
+                  : 'Передать доступ редактору?',
+            ),
+            content: Text(
+              public
+                  ? 'По ссылке будет доступна история этого дерева, включая удалённые записи. Другие деревья не публикуются.'
+                  : 'Приглашение будет содержать ключ папки приложения на Диске. Передавайте его только доверенным редакторам.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Отмена'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: Text(public ? 'Разрешить' : 'Передать'),
+              ),
+            ],
+          ),
+        ) ==
+        true;
+    if (accepted) {
+      if (public) {
+        _publicSharingAccepted = true;
+      } else {
+        _editorSharingAccepted = true;
+      }
+    }
+    return accepted;
+  }
+
+  Future<RoomInvitation?> _prepareInvitation() async {
+    if (_preparing) return null;
+    final role = _role;
+    setState(() {
+      _preparing = true;
+      _error = null;
+    });
+    try {
+      RoomDiskAccess? access;
+      final prepare = widget.prepareDiskAccess;
+      if (prepare != null) {
+        if (role == RoomRole.editor && !await _confirmAccess(public: false)) {
+          return null;
+        }
+        if (!mounted) return null;
+        access = await prepare(role, allowPublication: false);
+        if (!mounted) return null;
+        if (access == null &&
+            role == RoomRole.guest &&
+            widget.canPublishDiskAccess) {
+          if (!await _confirmAccess(public: true) || !mounted) return null;
+          access = await prepare(role, allowPublication: true);
+          if (!mounted) return null;
+        }
+        if (access == null) {
+          throw StateError('Доступ к Диску недоступен');
+        }
+      }
+      if (role != _role ||
+          (role == RoomRole.editor && !widget.canInviteEditors)) {
+        return null;
+      }
+      if (access != null && access.isEditor != (role == RoomRole.editor)) {
+        throw const FormatException(
+          'Роль приглашения не соответствует доступу к Диску',
+        );
+      }
+      return RoomInvitation(widget.roomId, role: role, diskAccess: access);
+    } catch (_) {
+      if (mounted) {
+        setState(
+          () => _error =
+              'Не удалось подготовить приглашение через Диск. Проверьте доступ и повторите.',
+        );
+      }
+      return null;
+    } finally {
+      if (mounted) setState(() => _preparing = false);
+    }
+  }
+
+  Future<void> _copyInvitation({required bool code}) async {
+    final invitation = await _prepareInvitation();
+    if (!mounted || invitation == null) return;
+    final value = code
+        ? (invitation.diskAccess == null
+              ? widget.roomId
+              : jsonEncode({
+                  'v': 1,
+                  'peerId': widget.roomId,
+                  'role': invitation.role.name,
+                  'disk': invitation.diskAccess!.toJson(),
+                }))
+        : createRoomLink(
+            widget.applicationUri,
+            widget.roomId,
+            role: invitation.role,
+            diskAccess: invitation.diskAccess,
+          );
+    if (value == null) return;
+    await _copy(
+      value,
+      code
+          ? invitation.diskAccess == null
+                ? 'ID комнаты скопирован. Вход по ID — как гость.'
+                : 'Код приглашения скопирован'
+          : 'Ссылка на комнату скопирована',
+    );
+  }
 
   Future<void> _copy(String value, String message) async {
     try {
@@ -1219,40 +1356,69 @@ class _InviteParticipantsDialogState extends State<InviteParticipantsDialog> {
       widget.onMessage(message);
     } catch (_) {
       widget.onMessage(
-        'Не удалось скопировать. Выделите и скопируйте значение вручную.',
+        widget.prepareDiskAccess == null
+            ? 'Не удалось скопировать. Выделите и скопируйте значение вручную.'
+            : 'Не удалось скопировать. Повторите или используйте QR.',
       );
     }
   }
 
-  void _showQr(BuildContext context) {
+  Future<void> _showQr(BuildContext context) async {
+    final invitation = await _prepareInvitation();
+    if (!mounted || invitation == null || !context.mounted) return;
+    QrCode? qr;
+    try {
+      final candidate = QrCode.fromData(
+        data: createRoomQrData(
+          widget.applicationUri,
+          widget.roomId,
+          role: invitation.role,
+          diskAccess: invitation.diskAccess,
+        ),
+        errorCorrectLevel: QrErrorCorrectLevel.L,
+      );
+      // Capacity errors can be deferred until the image is constructed.
+      QrImage(candidate);
+      qr = candidate;
+    } catch (_) {
+      // Do not expose the payload in a library exception or error widget.
+    }
     showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
-        title: Text(_role == RoomRole.editor ? 'QR · Редактор' : 'QR · Гость'),
+        scrollable: true,
+        title: Text(
+          invitation.role == RoomRole.editor ? 'QR · Редактор' : 'QR · Гость',
+        ),
         content: SizedBox(
           width: 280,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               Container(
+                width: 264,
+                height: 264,
                 color: Colors.white,
                 padding: const EdgeInsets.all(12),
-                child: QrImageView(
-                  data: createRoomQrData(
-                    widget.applicationUri,
-                    widget.roomId,
-                    role: _role,
-                  ),
-                  size: 240,
-                  eyeStyle: const QrEyeStyle(
-                    eyeShape: QrEyeShape.square,
-                    color: Colors.black,
-                  ),
-                  dataModuleStyle: const QrDataModuleStyle(
-                    dataModuleShape: QrDataModuleShape.square,
-                    color: Colors.black,
-                  ),
-                ),
+                child: qr == null
+                    ? const Text(
+                        'Приглашение слишком длинное для QR. Скопируйте URL.',
+                      )
+                    : QrImageView.withQr(
+                        qr: qr,
+                        size: 240,
+                        errorStateBuilder: (_, _) => const Text(
+                          'Приглашение слишком длинное для QR. Скопируйте URL.',
+                        ),
+                        eyeStyle: const QrEyeStyle(
+                          eyeShape: QrEyeShape.square,
+                          color: Colors.black,
+                        ),
+                        dataModuleStyle: const QrDataModuleStyle(
+                          dataModuleShape: QrDataModuleShape.square,
+                          color: Colors.black,
+                        ),
+                      ),
               ),
               const SizedBox(height: 12),
               Text(
@@ -1285,86 +1451,113 @@ class _InviteParticipantsDialogState extends State<InviteParticipantsDialog> {
       widget.roomId,
       role: _role,
     );
-    return AlertDialog(
-      title: const Text('Пригласить участников'),
-      scrollable: true,
-      content: SizedBox(
-        width: 360,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Text(
-              'При первом входе кто-то из комнаты должен быть онлайн.',
-            ),
-            const SizedBox(height: 16),
-            SegmentedButton<RoomRole>(
-              key: const Key('invitation-role'),
-              segments: [
-                const ButtonSegment(
-                  value: RoomRole.guest,
-                  label: Text('Гость'),
-                  icon: Icon(Icons.visibility_outlined),
+    return PopScope(
+      canPop: !_preparing,
+      child: AlertDialog(
+        title: const Text('Пригласить участников'),
+        scrollable: true,
+        content: SizedBox(
+          width: 360,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                widget.prepareDiskAccess == null
+                    ? 'При первом входе кто-то из комнаты должен быть онлайн.'
+                    : 'Приглашение с доступом к Диску позволяет войти без онлайн-участников.',
+              ),
+              const SizedBox(height: 16),
+              SegmentedButton<RoomRole>(
+                key: const Key('invitation-role'),
+                segments: [
+                  const ButtonSegment(
+                    value: RoomRole.guest,
+                    label: Text('Гость'),
+                    icon: Icon(Icons.visibility_outlined),
+                  ),
+                  ButtonSegment(
+                    value: RoomRole.editor,
+                    label: const Text('Редактор'),
+                    icon: const Icon(Icons.edit_outlined),
+                    enabled: widget.canInviteEditors,
+                  ),
+                ],
+                selected: {_role},
+                onSelectionChanged: _preparing
+                    ? null
+                    : (roles) => setState(() {
+                        _role = roles.single;
+                        _error = null;
+                      }),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _role == RoomRole.guest
+                    ? 'Только просмотр. Редактор сможет повысить участника позже.'
+                    : 'Редактирование дерева и приглашение новых редакторов.',
+              ),
+              if (!widget.canInviteEditors)
+                const Text('Гость может приглашать только гостей.'),
+              const SizedBox(height: 16),
+              SelectableText(
+                widget.roomId,
+                key: const Key('room-id'),
+                style: const TextStyle(fontFamily: 'monospace'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _preparing
+                    ? null
+                    : () => unawaited(_copyInvitation(code: true)),
+                icon: const Icon(Icons.copy),
+                label: Text(
+                  widget.prepareDiskAccess == null
+                      ? 'Скопировать ID'
+                      : 'Скопировать код',
                 ),
-                ButtonSegment(
-                  value: RoomRole.editor,
-                  label: const Text('Редактор'),
-                  icon: const Icon(Icons.edit_outlined),
-                  enabled: widget.canInviteEditors,
+              ),
+              Text(
+                widget.prepareDiskAccess == null
+                    ? 'Вход по одному ID — как гость. Для редактора отправьте URL или QR.'
+                    : 'Один ID не содержит доступа к Диску.',
+              ),
+              if (link != null) ...[
+                const SizedBox(height: 12),
+                if (widget.prepareDiskAccess == null)
+                  SelectableText(link, key: const Key('room-link'))
+                else
+                  const Text('Доступ к Диску включается в код, URL и QR.'),
+                OutlinedButton.icon(
+                  onPressed: _preparing
+                      ? null
+                      : () => unawaited(_copyInvitation(code: false)),
+                  icon: const Icon(Icons.link),
+                  label: const Text('Скопировать URL'),
                 ),
               ],
-              selected: {_role},
-              onSelectionChanged: (roles) =>
-                  setState(() => _role = roles.single),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              _role == RoomRole.guest
-                  ? 'Только просмотр. Редактор сможет повысить участника позже.'
-                  : 'Редактирование дерева и приглашение новых редакторов.',
-            ),
-            if (!widget.canInviteEditors)
-              const Text('Гость может приглашать только гостей.'),
-            const SizedBox(height: 16),
-            SelectableText(
-              widget.roomId,
-              key: const Key('room-id'),
-              style: const TextStyle(fontFamily: 'monospace'),
-            ),
-            OutlinedButton.icon(
-              onPressed: () => _copy(
-                widget.roomId,
-                'ID комнаты скопирован. Вход по ID — как гость.',
-              ),
-              icon: const Icon(Icons.copy),
-              label: const Text('Скопировать ID'),
-            ),
-            const Text(
-              'Вход по одному ID — как гость. Для редактора отправьте URL или QR.',
-            ),
-            if (link != null) ...[
-              const SizedBox(height: 12),
-              SelectableText(link, key: const Key('room-link')),
               OutlinedButton.icon(
-                onPressed: () => _copy(link, 'Ссылка на комнату скопирована'),
-                icon: const Icon(Icons.link),
-                label: const Text('Скопировать URL'),
+                onPressed: _preparing
+                    ? null
+                    : () => unawaited(_showQr(context)),
+                icon: const Icon(Icons.qr_code),
+                label: const Text('Показать QR'),
               ),
+              if (_preparing) const LinearProgressIndicator(),
+              if (_error != null)
+                Text(
+                  _error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
             ],
-            OutlinedButton.icon(
-              onPressed: () => _showQr(context),
-              icon: const Icon(Icons.qr_code),
-              label: const Text('Показать QR'),
-            ),
-          ],
+          ),
         ),
+        actions: [
+          TextButton(
+            onPressed: _preparing ? null : () => Navigator.pop(context),
+            child: const Text('Закрыть'),
+          ),
+        ],
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Закрыть'),
-        ),
-      ],
     );
   }
 }

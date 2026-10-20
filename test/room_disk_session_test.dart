@@ -16,6 +16,9 @@ import 'room_disk_sync_test.dart' show MemoryDiskBackend, MemoryDiskClient;
 
 const _roomId = '0123456789abcdef0123456789abcdef';
 const _token = 'session-private-oauth-token';
+const _invitationBinding = 'invitation-binding';
+const _publicUrl = 'https://disk.yandex.ru/d/invitation-binding';
+const _bindingPath = 'app:/mytree/$_roomId/$_invitationBinding';
 
 mixin _Events {
   final _events = <String, StreamController<dynamic>>{};
@@ -218,14 +221,57 @@ class _Store extends MemoryRoomStore {
   bool failCredentials = false;
   int failCredentialWrites = 0;
   int credentialSaveAttempts = 0;
+  bool failMembership = false;
+  bool failPublicAccess = false;
+  bool failFlush = false;
+  String? failAuthor;
+  int membershipSaveAttempts = 0;
+  final actions = <String>[];
+  Future<void> Function(List<Map<String, dynamic>> operations)? beforeAppend;
+  Future<void> Function()? beforeMembership;
+  Future<void> Function()? beforeCredentials;
+  Future<void> Function()? beforePublicAccess;
+  Future<void> Function()? beforeFlush;
 
   @override
   Future<void> appendHistory(
     String roomId,
     List<Map<String, dynamic>> operations,
-  ) {
-    if (failAppend) return Future.error(StateError('Local write failed'));
-    return super.appendHistory(roomId, operations);
+  ) async {
+    actions.add('history');
+    await beforeAppend?.call(operations);
+    if (failAppend || operations.any((edit) => edit['author'] == failAuthor)) {
+      throw StateError('Local write failed');
+    }
+    await super.appendHistory(roomId, operations);
+  }
+
+  @override
+  Future<void> saveMembership(String roomId) async {
+    actions.add('membership');
+    membershipSaveAttempts++;
+    await beforeMembership?.call();
+    if (failMembership) throw StateError('Membership write failed');
+    await super.saveMembership(roomId);
+  }
+
+  @override
+  Future<void> saveDiskPublicAccess(
+    String roomId,
+    Map<String, dynamic>? value,
+  ) async {
+    actions.add('public');
+    await beforePublicAccess?.call();
+    if (failPublicAccess) throw StateError('Public access write failed');
+    await super.saveDiskPublicAccess(roomId, value);
+  }
+
+  @override
+  Future<void> flush() async {
+    actions.add('flush');
+    await beforeFlush?.call();
+    if (failFlush) throw StateError('Flush failed');
+    await super.flush();
   }
 
   @override
@@ -233,8 +279,10 @@ class _Store extends MemoryRoomStore {
     String roomId,
     Map<String, dynamic>? value, {
     String? bindingId,
-  }) {
+  }) async {
+    actions.add('credentials');
     credentialSaveAttempts++;
+    await beforeCredentials?.call();
     if (failCredentials || failCredentialWrites > 0) {
       if (failCredentialWrites > 0) failCredentialWrites--;
       return Future.error(StateError('Credential write failed'));
@@ -310,9 +358,19 @@ class _RecordingDiskClient extends MemoryDiskClient {
   final usedTokens = <String>[];
 
   @override
-  Future<List<String>> listFiles(String token, String path) {
+  Future<List<String>> listFiles(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) {
     usedTokens.add(token);
-    return super.listFiles(token, path);
+    return super.listFiles(
+      token,
+      path,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
   }
 }
 
@@ -333,15 +391,35 @@ class _TokenDiskClient extends MemoryDiskClient {
   }
 
   @override
-  Future<List<String>> listFiles(String token, String path) async {
+  Future<List<String>> listFiles(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
     _request('list', token, path);
-    return super.listFiles(token, path);
+    return super.listFiles(
+      token,
+      path,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
   }
 
   @override
-  Future<Uint8List> readFile(String token, String path) async {
+  Future<Uint8List> readFile(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
     _request('read', token, path);
-    return super.readFile(token, path);
+    return super.readFile(
+      token,
+      path,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
   }
 
   @override
@@ -371,6 +449,63 @@ RoomEdit _role(String actor, RoomRole role, {int clock = 1}) => RoomEdit(
   kind: RoomEditKind.participantRole,
   targetActor: actor,
 );
+
+List<RoomEdit> _diskEntryHistory({RoomRole ownerRole = RoomRole.editor}) {
+  final history = <RoomEdit>[];
+  void append(String id, RoomEditKind kind, String text) {
+    history.add(
+      sequenceAuthoredEdit(
+        RoomEdit(
+          id: id,
+          author: 'owner',
+          clock: history.length + 1,
+          createdAt: history.length + 1,
+          text: text,
+          kind: kind,
+          targetActor: kind == RoomEditKind.participantRole ? 'owner' : null,
+        ),
+        history,
+      ),
+    );
+  }
+
+  append('owner-role', RoomEditKind.participantRole, ownerRole.name);
+  append('cloud-name', RoomEditKind.roomName, 'Cloud family');
+  append('cloud-alias', RoomEditKind.participantName, 'Owner');
+  append(
+    'cloud-person',
+    RoomEditKind.tree,
+    jsonEncode(TreeDocument().createPerson('cloud-person').toJson()),
+  );
+  append(
+    _invitationBinding,
+    RoomEditKind.diskConnection,
+    '{"action":"connect"}',
+  );
+  append('cloud-tail', RoomEditKind.text, 'The complete cloud journal');
+  return history;
+}
+
+RoomDiskAccess _entryAccess(RoomRole role) => role == RoomRole.editor
+    ? RoomDiskAccess.editor(bindingId: _invitationBinding, token: _token)
+    : RoomDiskAccess.guest(
+        bindingId: _invitationBinding,
+        publicUrl: _publicUrl,
+      );
+
+class _PublishingDiskClient extends MemoryDiskClient {
+  _PublishingDiskClient(super.backend);
+
+  Future<void> Function()? beforePublish;
+  final publicationAttempts = <String>[];
+
+  @override
+  Future<String> publishDirectory(String token, String path) async {
+    publicationAttempts.add(path);
+    await beforePublish?.call();
+    return super.publishDirectory(token, path);
+  }
+}
 
 List<RoomMessage> _messages(_Channel channel) {
   final decoder = RoomMessageDecoder(roomId: _roomId);
@@ -412,6 +547,8 @@ void main() {
     bool creator = false,
     bool follower = false,
     MemoryDiskClient? diskClient,
+    RoomDiskAccess? access,
+    String? name,
   }) {
     final result = RoomSession(
       roomId: _roomId,
@@ -419,6 +556,8 @@ void main() {
       store: store ?? _Store(),
       existingMember: member,
       invitationRole: role,
+      invitationDiskAccess: access,
+      participantName: name,
       newlyCreated: creator,
       preferExistingHost: follower,
       peerFactory: (id, configuration) =>
@@ -448,6 +587,1150 @@ void main() {
     }
     await network.close();
   });
+
+  void seedCloud({List<RoomEdit>? history}) {
+    cloud.publicRoots[_publicUrl] = _bindingPath;
+    cloud.addBatch(
+      history ?? _diskEntryHistory(),
+      bindingId: _invitationBinding,
+      directory: '$_bindingPath/batches',
+    );
+  }
+
+  for (final role in RoomRole.values) {
+    diskTest(
+      'first-time ${role.name} enters from Disk without an online peer',
+      (tester) async {
+        network.autoRegister = false;
+        seedCloud();
+        final store = _Store();
+        final room = session(
+          actor: 'new-${role.name}',
+          store: store,
+          member: false,
+          role: role,
+          access: _entryAccess(role),
+          name: 'New participant',
+        );
+        await room.start();
+        await _settle(tester);
+        expect(room.joined, isTrue);
+        expect(room.initialSyncComplete, isTrue);
+        expect(room.initialSyncStatus, contains('загружена с Диска'));
+        expect(room.initialSyncStatus, contains('онлайн-сверка'));
+        expect(room.initialSyncError, isNull);
+        expect(room.hasValidatedOnlinePeer, isFalse);
+        expect(room.connectedToRemoteHost, isFalse);
+        expect(room.networkAvailable, isFalse);
+        expect(room.onlineCount, 1);
+        expect(room.ownRole, role);
+        expect(room.canEdit, role == RoomRole.editor);
+        expect(room.roomName, 'Cloud family');
+        expect(room.text, 'The complete cloud journal');
+        expect(room.tree.person('cloud-person'), isNotNull);
+        expect(room.participantName, 'New participant');
+        expect(room.diskBinding!.id, _invitationBinding);
+        expect(await store.hasMembership(_roomId), isTrue);
+        final durable = validateAuthorHistory(
+          decodeRoomHistory(await store.loadHistory(_roomId)),
+        );
+        expect(
+          roomHistoryInventory(durable),
+          roomHistoryInventory(room.changes),
+        );
+        expect(
+          _diskEntryHistory().every(
+            (edit) => durable.any((saved) => saved.sameContentAs(edit)),
+          ),
+          isTrue,
+        );
+        expect(
+          durable.any((edit) => edit.author == 'new-${role.name}'),
+          isTrue,
+        );
+        expect(store.actions.last, 'membership');
+        expect(cloud.created, isEmpty);
+        expect(cloud.written, isEmpty);
+        expect(cloud.published, isEmpty);
+        expect(network.peers, isNotEmpty, reason: 'RTC starts after admission');
+        expect(network.channels, isEmpty);
+        if (role == RoomRole.editor) {
+          expect(
+            await store.loadDiskCredentials(_roomId),
+            _entryAccess(role).toJson(),
+          );
+          expect(await store.loadDiskPublicAccess(_roomId), isNull);
+          expect(cloud.publicUrls, isEmpty);
+        } else {
+          expect(await store.loadDiskCredentials(_roomId), isNull);
+          expect(
+            await store.loadDiskPublicAccess(_roomId),
+            _entryAccess(role).toJson(),
+          );
+          expect(store.credentialSaveAttempts, 0);
+          expect(cloud.listed, isEmpty);
+          expect(cloud.read, isEmpty);
+          expect(cloud.publicUrls, everyElement(_publicUrl));
+          expect(room.diskSyncAcknowledged, isFalse);
+        }
+        expect(
+          jsonEncode(durable.map((edit) => edit.toJson()).toList()),
+          isNot(contains(_token)),
+        );
+        expect(room.log.join('\n'), isNot(contains(_token)));
+      },
+    );
+
+    diskTest('stored ${role.name} access verifies cloud again after reload', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      final first = session(
+        actor: 'reader',
+        store: store,
+        member: false,
+        role: role,
+        access: _entryAccess(role),
+      );
+      await first.start();
+      first.dispose();
+      await _settle(tester);
+      final history = _diskEntryHistory();
+      final later = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'cloud-later',
+          author: 'owner',
+          clock: 20,
+          createdAt: 20,
+          text: 'A later cloud-only change',
+        ),
+        history,
+      );
+      seedCloud(history: [...history, later]);
+      final reopened = session(actor: 'reader', store: store, role: role);
+      await reopened.start();
+      expect(reopened.joined, isTrue);
+      expect(reopened.initialSyncComplete, isTrue);
+      expect(reopened.initialSyncStatus, contains('с Диска'));
+      expect(reopened.text, 'A later cloud-only change');
+      expect(reopened.hasValidatedOnlinePeer, isFalse);
+      expect(cloud.written, isEmpty);
+      expect(cloud.published, isEmpty);
+      expect(
+        decodeRoomHistory(
+          await store.loadHistory(_roomId),
+        ).any((edit) => edit.sameContentAs(later)),
+        isTrue,
+      );
+    });
+  }
+
+  for (final stage in [
+    'history',
+    'profile',
+    'credentials',
+    'public',
+    'flush',
+    'membership',
+  ]) {
+    diskTest('Disk admission waits for durable $stage before reporting ready', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      final release = Completer<void>();
+      if (stage == 'history' || stage == 'profile') {
+        store.beforeAppend = (edits) async {
+          if (stage == 'history' ||
+              edits.any((edit) => edit['author'] == 'newcomer')) {
+            await release.future;
+          }
+        };
+      } else if (stage == 'credentials') {
+        store.beforeCredentials = () => release.future;
+      } else if (stage == 'public') {
+        store.beforePublicAccess = () => release.future;
+      } else if (stage == 'flush') {
+        store.beforeFlush = () => release.future;
+      } else {
+        store.beforeMembership = () => release.future;
+      }
+      final role = stage == 'public' ? RoomRole.guest : RoomRole.editor;
+      final room = session(
+        actor: 'newcomer',
+        store: store,
+        member: false,
+        role: role,
+        access: _entryAccess(role),
+        name: 'Newcomer',
+      );
+      final starting = room.start();
+      await _settle(tester);
+      expect(room.joined, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.editable, isFalse);
+      expect(network.peers, isEmpty);
+      expect(await store.hasMembership(_roomId), isFalse);
+      expect(cloud.written, isEmpty);
+      expect(cloud.created, isEmpty);
+      release.complete();
+      await starting;
+      expect(room.joined, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(await store.hasMembership(_roomId), isTrue);
+      expect(store.actions.last, 'membership');
+    });
+  }
+
+  for (final failure in [
+    'history',
+    'profile',
+    'credentials',
+    'public',
+    'flush',
+    'membership',
+  ]) {
+    diskTest('failed $failure never admits a Disk invitation and can retry', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store()
+        ..failAppend = failure == 'history'
+        ..failAuthor = failure == 'profile' ? 'newcomer' : null
+        ..failCredentials = failure == 'credentials'
+        ..failPublicAccess = failure == 'public'
+        ..failFlush = failure == 'flush'
+        ..failMembership = failure == 'membership';
+      final role = failure == 'public' ? RoomRole.guest : RoomRole.editor;
+      final room = session(
+        actor: 'newcomer',
+        store: store,
+        member: false,
+        role: role,
+        access: _entryAccess(role),
+        name: 'Newcomer',
+      );
+      await room.start();
+      expect(room.joined, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(await store.hasMembership(_roomId), isFalse);
+      expect(room.initialSyncError, isNotNull);
+      expect(room.diskSyncError ?? room.storageError, isNotNull);
+      expect(cloud.written, isEmpty);
+      expect(cloud.published, isEmpty);
+      if (failure == 'history' || failure == 'profile' || failure == 'flush') {
+        expect(room.storageError, isNotNull);
+      }
+      store
+        ..failAppend = false
+        ..failAuthor = null
+        ..failCredentials = false
+        ..failPublicAccess = false
+        ..failFlush = false
+        ..failMembership = false;
+      await room.retry();
+      await _settle(tester);
+      expect(room.joined, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(room.initialSyncStatus, contains('с Диска'));
+      expect(await store.hasMembership(_roomId), isTrue);
+      expect(room.initialSyncError, isNull);
+    });
+  }
+
+  for (final invalid in [
+    'detached',
+    'implicit-owner',
+    'guest-owner',
+    'broken-proof',
+    'wrong-envelope',
+    'empty',
+  ]) {
+    diskTest('invalid $invalid cloud snapshot cannot grant membership', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      var history = _diskEntryHistory(
+        ownerRole: invalid == 'guest-owner' ? RoomRole.guest : RoomRole.editor,
+      );
+      if (invalid == 'detached') {
+        history = [
+          ...history,
+          sequenceAuthoredEdit(
+            const RoomEdit(
+              id: 'detach',
+              author: 'owner',
+              clock: 30,
+              createdAt: 30,
+              kind: RoomEditKind.diskConnection,
+              text: '{"action":"disconnect","bindingId":"invitation-binding"}',
+            ),
+            history,
+          ),
+        ];
+      } else if (invalid == 'implicit-owner') {
+        history = [
+          for (final edit in history)
+            if (edit.kind != RoomEditKind.participantRole)
+              RoomEdit(
+                id: edit.id,
+                author: edit.author,
+                clock: edit.clock,
+                createdAt: edit.createdAt,
+                kind: edit.kind,
+                text: edit.text,
+              ),
+        ];
+      } else if (invalid == 'broken-proof') {
+        history = [
+          ...history.take(history.length - 1),
+          history.last.withAuthorProof(
+            authorSequence: history.last.authorSequence!,
+            authorPrevious: 'missing-predecessor',
+          ),
+        ];
+      }
+      if (invalid == 'wrong-envelope') {
+        cloud.addBatch(
+          history,
+          roomId: 'ffffffffffffffffffffffffffffffff',
+          bindingId: _invitationBinding,
+          directory: '$_bindingPath/batches',
+        );
+      } else if (invalid != 'empty') {
+        seedCloud(history: history);
+      }
+      final store = _Store();
+      final room = session(
+        actor: 'newcomer',
+        store: store,
+        member: false,
+        access: _entryAccess(RoomRole.editor),
+      );
+      await room.start();
+      expect(room.joined, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.initialSyncError, isNotNull);
+      expect(await store.hasMembership(_roomId), isFalse);
+      expect(await store.loadDiskCredentials(_roomId), isNull);
+      expect(store.membershipSaveAttempts, 0);
+      expect(await store.loadHistory(_roomId), isEmpty);
+      expect(cloud.created, isEmpty);
+      expect(cloud.written, isEmpty);
+      expect(cloud.published, isEmpty);
+    });
+  }
+
+  diskTest('a locally known detach invalidates an older invitation snapshot', (
+    tester,
+  ) async {
+    network.autoRegister = false;
+    final history = _diskEntryHistory();
+    seedCloud(history: history);
+    final detached = sequenceAuthoredEdit(
+      const RoomEdit(
+        id: 'locally-detached',
+        author: 'owner',
+        clock: 50,
+        createdAt: 50,
+        kind: RoomEditKind.diskConnection,
+        text: '{"action":"disconnect","bindingId":"invitation-binding"}',
+      ),
+      history,
+    );
+    final store = _Store();
+    await store.appendHistory(_roomId, [
+      for (final edit in [...history, detached]) edit.toJson(),
+    ]);
+    final room = session(
+      actor: 'newcomer',
+      store: store,
+      member: false,
+      access: _entryAccess(RoomRole.editor),
+    );
+    await room.start();
+    expect(room.joined, isFalse);
+    expect(room.diskBinding, isNull);
+    expect(room.initialSyncComplete, isFalse);
+    expect(await store.hasMembership(_roomId), isFalse);
+    expect(store.credentialSaveAttempts, 0);
+    expect(cloud.written, isEmpty);
+  });
+
+  diskTest(
+    'cancelling an in-flight cloud read cannot save a profile or membership',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final release = Completer<void>();
+      cloud.beforeRead = (_) => release.future;
+      final store = _Store();
+      final room = session(
+        actor: 'cancelled',
+        store: store,
+        member: false,
+        access: _entryAccess(RoomRole.editor),
+        name: 'Cancelled',
+      );
+      final starting = room.start();
+      await _settle(tester);
+      expect(cloud.read, isNotEmpty);
+      room.dispose();
+      release.complete();
+      await starting;
+      expect(room.joined, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(await store.loadHistory(_roomId), isEmpty);
+      expect(await store.hasMembership(_roomId), isFalse);
+      expect(store.credentialSaveAttempts, 0);
+      expect(network.peers, isEmpty);
+    },
+  );
+
+  diskTest(
+    'retry supersedes a pending cloud attempt without duplicate membership',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final release = Completer<void>();
+      cloud.beforeList = (_) => release.future;
+      final store = _Store();
+      final room = session(
+        actor: 'newcomer',
+        store: store,
+        member: false,
+        access: _entryAccess(RoomRole.editor),
+      );
+      final starting = room.start();
+      await _settle(tester);
+      final retrying = room.retry();
+      await _settle(tester);
+      expect(store.membershipSaveAttempts, 0);
+      cloud.beforeList = null;
+      release.complete();
+      await Future.wait([starting, retrying]);
+      expect(room.joined, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(store.membershipSaveAttempts, 1);
+      expect(cloud.read, hasLength(1));
+    },
+  );
+
+  diskTest('the original 30-second watchdog cannot admit a late cloud result', (
+    tester,
+  ) async {
+    network.autoRegister = false;
+    seedCloud();
+    final release = Completer<void>();
+    cloud.beforeRead = (_) => release.future;
+    final store = _Store();
+    final room = session(
+      actor: 'late',
+      store: store,
+      member: false,
+      access: _entryAccess(RoomRole.editor),
+    );
+    final starting = room.start();
+    await _settle(tester);
+    await tester.pump(const Duration(seconds: 31));
+    expect(room.initialSyncComplete, isFalse);
+    expect(room.initialSyncError, contains('30 секунд'));
+    release.complete();
+    await starting;
+    expect(room.joined, isFalse);
+    expect(await store.hasMembership(_roomId), isFalse);
+    expect(store.membershipSaveAttempts, 0);
+    expect(await store.loadHistory(_roomId), isEmpty);
+  });
+
+  diskTest('cloud errors are safe, leave RTC available, and retry cloud', (
+    tester,
+  ) async {
+    network.autoRegister = false;
+    seedCloud();
+    cloud.beforeList = (_) =>
+        Future.error(StateError('$_token $_publicUrl raw response'));
+    final store = _Store();
+    final room = session(
+      actor: 'newcomer',
+      store: store,
+      member: false,
+      access: _entryAccess(RoomRole.editor),
+    );
+    await room.start();
+    expect(room.joined, isFalse);
+    expect(room.initialSyncComplete, isFalse);
+    expect(room.initialSyncError, contains('Диска'));
+    expect(network.peers, isNotEmpty);
+    expect(room.diskSyncError, isNotNull);
+    expect(
+      '${room.initialSyncError} ${room.diskSyncError} ${room.log}',
+      isNot(contains(_token)),
+    );
+    expect(
+      '${room.initialSyncError} ${room.diskSyncError} ${room.log}',
+      isNot(contains(_publicUrl)),
+    );
+    cloud.beforeList = null;
+    await room.retry();
+    expect(room.joined, isTrue);
+    expect(room.initialSyncComplete, isTrue);
+    expect(room.initialSyncError, isNull);
+    expect(room.diskSyncError, isNull);
+    expect(cloud.listed.length, greaterThanOrEqualTo(2));
+  });
+
+  diskTest(
+    'an existing guest is never promoted or given a retained editor token',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      await store.appendHistory(_roomId, [
+        _role('returning', RoomRole.guest).toJson(),
+      ]);
+      final room = session(
+        actor: 'returning',
+        store: store,
+        member: false,
+        role: RoomRole.editor,
+        access: _entryAccess(RoomRole.editor),
+      );
+      await room.start();
+      expect(room.joined, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(room.ownRole, RoomRole.guest);
+      expect(room.canEdit, isFalse);
+      expect(room.canPublishDiskInvitation, isFalse);
+      expect(await store.loadDiskCredentials(_roomId), isNull);
+      expect(store.credentialSaveAttempts, 0);
+      expect(
+        room.changes
+            .where((edit) => edit.targetActor == 'returning')
+            .map((edit) => edit.text),
+        ['guest'],
+      );
+      await tester.pump(const Duration(seconds: 31));
+      await _settle(tester);
+      expect(cloud.written, isEmpty);
+    },
+  );
+
+  diskTest(
+    'public guest polling and resume read updates without uploads or private requests',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      final room = session(
+        actor: 'guest',
+        store: store,
+        member: false,
+        role: RoomRole.guest,
+        access: _entryAccess(RoomRole.guest),
+      );
+      await room.start();
+      final history = _diskEntryHistory();
+      final update = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'guest-update',
+          author: 'owner',
+          clock: 40,
+          createdAt: 40,
+          text: 'Public update',
+        ),
+        history,
+      );
+      seedCloud(history: [...history, update]);
+      await tester.pump(const Duration(seconds: 1));
+      await _settle(tester);
+      expect(room.text, 'Public update');
+      expect(room.diskSyncStatus, contains('прочитана'));
+      expect(room.diskSyncAcknowledged, isFalse);
+      final reads = cloud.publicRead.length;
+      room.resume();
+      await tester.pump(const Duration(seconds: 1));
+      await _settle(tester);
+      expect(cloud.publicRead.length, greaterThan(reads));
+      expect(cloud.listed, isEmpty);
+      expect(cloud.read, isEmpty);
+      expect(cloud.created, isEmpty);
+      expect(cloud.written, isEmpty);
+      expect(cloud.published, isEmpty);
+      expect(await store.loadDiskCredentials(_roomId), isNull);
+    },
+  );
+
+  diskTest(
+    'public guest imports final edits and disconnect, then stops polling',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      final guest = session(
+        actor: 'guest',
+        store: store,
+        member: false,
+        role: RoomRole.guest,
+        access: _entryAccess(RoomRole.guest),
+      );
+      await guest.start();
+      expect(guest.diskBinding!.id, _invitationBinding);
+      final history = _diskEntryHistory();
+      final lastEdit = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'final-public-edit',
+          author: 'owner',
+          clock: 40,
+          createdAt: 40,
+          text: 'Last change before disconnect',
+        ),
+        history,
+      );
+      final disconnect = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'final-public-disconnect',
+          author: 'owner',
+          clock: 41,
+          createdAt: 41,
+          kind: RoomEditKind.diskConnection,
+          text: '{"action":"disconnect","bindingId":"invitation-binding"}',
+        ),
+        [...history, lastEdit],
+      );
+      seedCloud(history: [...history, lastEdit, disconnect]);
+      await tester.pump(const Duration(seconds: 1));
+      await _settle(tester);
+      expect(guest.joined, isTrue);
+      expect(guest.ownRole, RoomRole.guest);
+      expect(guest.canEdit, isFalse);
+      expect(guest.text, 'Last change before disconnect');
+      expect(guest.diskBinding, isNull);
+      expect(guest.diskInvitationsAvailable, isFalse);
+      expect(guest.diskSyncStatus, 'Не подключён');
+      expect(guest.diskSyncError, isNull);
+      final durable = validateAuthorHistory(
+        decodeRoomHistory(await store.loadHistory(_roomId)),
+      );
+      expect(durable.any((edit) => edit.sameContentAs(lastEdit)), isTrue);
+      expect(durable.any((edit) => edit.sameContentAs(disconnect)), isTrue);
+      final listings = cloud.publicListed.length;
+      final reads = cloud.publicRead.length;
+      guest.resume();
+      await tester.pump(const Duration(seconds: 61));
+      await _settle(tester);
+      expect(cloud.publicListed, hasLength(listings));
+      expect(cloud.publicRead, hasLength(reads));
+      expect(await store.loadDiskCredentials(_roomId), isNull);
+      expect(store.credentialSaveAttempts, 0);
+      expect(cloud.listed, isEmpty);
+      expect(cloud.read, isEmpty);
+      expect(cloud.created, isEmpty);
+      expect(cloud.written, isEmpty);
+      expect(cloud.published, isEmpty);
+
+      // A terminal snapshot is usable only by an already accepted reader, not
+      // as proof of admission for a new guest opening the old public link.
+      final newcomerStore = _Store();
+      final newcomer = session(
+        actor: 'newcomer',
+        store: newcomerStore,
+        member: false,
+        role: RoomRole.guest,
+        access: _entryAccess(RoomRole.guest),
+      );
+      await newcomer.start();
+      expect(newcomer.joined, isFalse);
+      expect(newcomer.initialSyncComplete, isFalse);
+      expect(await newcomerStore.hasMembership(_roomId), isFalse);
+      expect(await newcomerStore.loadHistory(_roomId), isEmpty);
+      expect(await newcomerStore.loadDiskCredentials(_roomId), isNull);
+      expect(cloud.written, isEmpty);
+    },
+  );
+
+  for (final invitationOnReload in [false, true]) {
+    diskTest(
+      'accepted guest reload imports terminal public copy: invitation=$invitationOnReload',
+      (tester) async {
+        network.autoRegister = false;
+        seedCloud();
+        final store = _Store();
+        final first = session(
+          actor: 'guest',
+          store: store,
+          member: false,
+          role: RoomRole.guest,
+          access: _entryAccess(RoomRole.guest),
+        );
+        await first.start();
+        expect(await store.hasMembership(_roomId), isTrue);
+        final acceptedHistory = await store.loadHistory(_roomId);
+        final membershipWrites = store.membershipSaveAttempts;
+        first.dispose();
+        await _settle(tester);
+
+        final history = _diskEntryHistory();
+        final lastEdit = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: 'terminal-reload-edit',
+            author: 'owner',
+            clock: 40,
+            createdAt: 40,
+            text: 'Final cloud copy while the guest was closed',
+          ),
+          history,
+        );
+        final disconnect = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: 'terminal-reload-disconnect',
+            author: 'owner',
+            clock: 41,
+            createdAt: 41,
+            kind: RoomEditKind.diskConnection,
+            text: '{"action":"disconnect","bindingId":"invitation-binding"}',
+          ),
+          [...history, lastEdit],
+        );
+        seedCloud(history: [...history, lastEdit, disconnect]);
+        final reopened = session(
+          actor: 'guest',
+          store: store,
+          role: RoomRole.guest,
+          access: invitationOnReload ? _entryAccess(RoomRole.guest) : null,
+        );
+        await reopened.start();
+        await _settle(tester);
+        expect(reopened.joined, isTrue);
+        expect(reopened.initialSyncComplete, isTrue);
+        expect(reopened.initialSyncStatus, contains('с Диска'));
+        expect(reopened.initialSyncError, isNull);
+        expect(reopened.localCopyOpened, isFalse);
+        expect(reopened.hasValidatedOnlinePeer, isFalse);
+        expect(reopened.ownRole, RoomRole.guest);
+        expect(reopened.diskBinding, isNull);
+        expect(reopened.text, 'Final cloud copy while the guest was closed');
+        expect(reopened.diskSyncError, isNull);
+        expect(store.membershipSaveAttempts, membershipWrites);
+        final durable = validateAuthorHistory(
+          decodeRoomHistory(await store.loadHistory(_roomId)),
+        );
+        expect(durable.any((edit) => edit.sameContentAs(lastEdit)), isTrue);
+        expect(durable.any((edit) => edit.sameContentAs(disconnect)), isTrue);
+        final listings = cloud.publicListed.length;
+        reopened.resume();
+        await tester.pump(const Duration(seconds: 61));
+        await _settle(tester);
+        expect(cloud.publicListed, hasLength(listings));
+        expect(await store.loadDiskCredentials(_roomId), isNull);
+        expect(store.credentialSaveAttempts, 0);
+        expect(cloud.listed, isEmpty);
+        expect(cloud.read, isEmpty);
+        expect(cloud.created, isEmpty);
+        expect(cloud.written, isEmpty);
+        expect(cloud.published, isEmpty);
+
+        // Staged local history/access without accepted membership does not
+        // inherit the terminal-copy allowance, even for the same guest actor.
+        final unacceptedStore = _Store();
+        await unacceptedStore.appendHistory(_roomId, acceptedHistory);
+        await unacceptedStore.saveDiskPublicAccess(
+          _roomId,
+          _entryAccess(RoomRole.guest).toJson(),
+        );
+        final unaccepted = session(
+          actor: 'guest',
+          store: unacceptedStore,
+          member: false,
+          role: RoomRole.guest,
+          access: _entryAccess(RoomRole.guest),
+        );
+        await unaccepted.start();
+        expect(unaccepted.joined, isFalse);
+        expect(unaccepted.initialSyncComplete, isFalse);
+        expect(unaccepted.initialSyncError, isNotNull);
+        expect(await unacceptedStore.hasMembership(_roomId), isFalse);
+        expect(unacceptedStore.membershipSaveAttempts, 0);
+        expect(
+          decodeRoomHistory(
+            await unacceptedStore.loadHistory(_roomId),
+          ).any((edit) => edit.id == disconnect.id || edit.id == lastEdit.id),
+          isFalse,
+        );
+        expect(cloud.written, isEmpty);
+      },
+    );
+  }
+
+  diskTest(
+    'plain invitations still require an online welcome and do not read Disk',
+    (tester) async {
+      network.autoRegister = false;
+      final store = _Store();
+      final room = session(
+        actor: 'plain',
+        store: store,
+        member: false,
+        role: RoomRole.guest,
+      );
+      await room.start();
+      expect(room.joined, isFalse);
+      expect(room.initialSyncComplete, isFalse);
+      expect(await store.hasMembership(_roomId), isFalse);
+      expect(cloud.listed, isEmpty);
+      expect(cloud.publicListed, isEmpty);
+      expect(cloud.created, isEmpty);
+      await tester.pump(const Duration(seconds: 31));
+      expect(room.joined, isFalse);
+      expect(room.initialSyncError, isNotNull);
+      expect(await store.loadHistory(_roomId), isEmpty);
+    },
+  );
+
+  test(
+    'constructor rejects mismatched invitation role and access without secrets',
+    () {
+      for (final role in RoomRole.values) {
+        expect(
+          () => session(
+            actor: 'invalid',
+            member: false,
+            role: role,
+            access: _entryAccess(
+              role == RoomRole.editor ? RoomRole.guest : RoomRole.editor,
+            ),
+          ),
+          throwsA(
+            isA<FormatException>().having(
+              (error) => error.message,
+              'safe message',
+              isNot(contains(_token)),
+            ),
+          ),
+        );
+      }
+    },
+  );
+
+  Future<({RoomSession room, _Store store})> invitationOwner({
+    MemoryDiskClient? client,
+  }) async {
+    seedCloud();
+    final store = _Store();
+    await store.appendHistory(_roomId, [
+      for (final edit in _diskEntryHistory()) edit.toJson(),
+    ]);
+    await store.saveDiskCredentials(
+      _roomId,
+      _entryAccess(RoomRole.editor).toJson(),
+    );
+    final room = session(actor: 'owner', store: store, diskClient: client);
+    await room.start();
+    return (room: room, store: store);
+  }
+
+  diskTest(
+    'preparing editor access never publishes; guest publication needs consent',
+    (tester) async {
+      network.autoRegister = false;
+      final owner = await invitationOwner();
+      expect(owner.room.diskInvitationsAvailable, isTrue);
+      expect(owner.room.canPublishDiskInvitation, isTrue);
+      expect(
+        await owner.room.prepareDiskInvitation(RoomRole.editor),
+        _entryAccess(RoomRole.editor),
+      );
+      expect(await owner.room.prepareDiskInvitation(RoomRole.guest), isNull);
+      expect(cloud.published, isEmpty);
+      expect(cloud.written, isEmpty);
+      expect(cloud.created, isEmpty);
+      expect(await owner.store.loadDiskPublicAccess(_roomId), isNull);
+    },
+  );
+
+  diskTest(
+    'consented publication uploads the current copy and publishes only its binding folder',
+    (tester) async {
+      network.autoRegister = false;
+      final client = _PublishingDiskClient(cloud);
+      final owner = await invitationOwner(client: client);
+      await owner.room.edit('Current copy must exist before publication');
+      client.beforePublish = () async {
+        expect(owner.room.diskSyncAcknowledged, isTrue);
+        expect(
+          roomHistoryInventory(cloud.uploadedHistory),
+          roomHistoryInventory(owner.room.changes),
+        );
+      };
+      final access = await owner.room.prepareDiskInvitation(
+        RoomRole.guest,
+        allowPublication: true,
+      );
+      expect(access, _entryAccess(RoomRole.guest));
+      expect(access!.token, isNull);
+      expect(cloud.published, [_bindingPath]);
+      expect(client.publicationAttempts, [_bindingPath]);
+      expect(cloud.published, isNot(contains('app:/mytree')));
+      expect(cloud.published, isNot(contains('app:/mytree/$_roomId')));
+      expect(await owner.store.loadDiskPublicAccess(_roomId), access.toJson());
+      expect(
+        await owner.store.loadDiskCredentials(_roomId),
+        _entryAccess(RoomRole.editor).toJson(),
+      );
+      final again = await owner.room.prepareDiskInvitation(RoomRole.guest);
+      expect(again, access);
+      expect(cloud.published, hasLength(1));
+      expect(
+        jsonEncode(await owner.store.loadHistory(_roomId)),
+        isNot(contains(_publicUrl)),
+      );
+      expect(owner.room.log.join('\n'), isNot(contains(_token)));
+    },
+  );
+
+  for (final publicAccess in ['none', 'stale', 'matching']) {
+    diskTest(
+      'guest Disk invitations require matching saved public access: $publicAccess',
+      (tester) async {
+        network.autoRegister = false;
+        seedCloud();
+        final store = _Store();
+        await store.appendHistory(_roomId, [
+          for (final edit in _diskEntryHistory()) edit.toJson(),
+          _role('guest', RoomRole.guest).toJson(),
+        ]);
+        if (publicAccess != 'none') {
+          await store.saveDiskPublicAccess(_roomId, {
+            'v': 1,
+            'bindingId': publicAccess == 'matching'
+                ? _invitationBinding
+                : 'old-binding',
+            'publicUrl': _publicUrl,
+          });
+        }
+        final guest = session(
+          actor: 'guest',
+          store: store,
+          role: RoomRole.guest,
+        );
+        await guest.start();
+        await _settle(tester);
+        expect(guest.joined, isTrue);
+        expect(guest.diskBinding!.id, _invitationBinding);
+        expect(guest.ownRole, RoomRole.guest);
+        expect(guest.diskInvitationsAvailable, publicAccess == 'matching');
+        expect(guest.canPublishDiskInvitation, isFalse);
+        expect(cloud.published, isEmpty);
+        expect(cloud.written, isEmpty);
+      },
+    );
+  }
+
+  diskTest(
+    'guests can reuse public access but cannot publish or request editor access',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      final guest = session(
+        actor: 'guest',
+        store: store,
+        member: false,
+        role: RoomRole.guest,
+        access: _entryAccess(RoomRole.guest),
+      );
+      await guest.start();
+      expect(guest.diskInvitationsAvailable, isTrue);
+      expect(guest.canPublishDiskInvitation, isFalse);
+      expect(
+        await guest.prepareDiskInvitation(RoomRole.guest),
+        _entryAccess(RoomRole.guest),
+      );
+      await expectLater(
+        guest.prepareDiskInvitation(RoomRole.editor),
+        throwsStateError,
+      );
+      await store.saveDiskPublicAccess(_roomId, null);
+      expect(await guest.prepareDiskInvitation(RoomRole.guest), isNull);
+      await expectLater(
+        guest.prepareDiskInvitation(RoomRole.guest, allowPublication: true),
+        throwsStateError,
+      );
+      expect(cloud.published, isEmpty);
+      expect(cloud.written, isEmpty);
+      expect(store.credentialSaveAttempts, 0);
+    },
+  );
+
+  diskTest(
+    'ordinary rooms return no Disk invitation and implicit editors cannot disclose tokens',
+    (tester) async {
+      network.autoRegister = false;
+      final plain = session(actor: 'plain', creator: true);
+      await plain.start();
+      expect(plain.diskInvitationsAvailable, isFalse);
+      expect(plain.canPublishDiskInvitation, isFalse);
+      expect(await plain.prepareDiskInvitation(RoomRole.editor), isNull);
+      expect(
+        await plain.prepareDiskInvitation(
+          RoomRole.guest,
+          allowPublication: true,
+        ),
+        isNull,
+      );
+      final store = _Store();
+      final implicit = session(actor: 'implicit', store: store);
+      await implicit.start();
+      await implicit.connectDisk(_token);
+      expect(implicit.canEdit, isTrue);
+      expect(implicit.diskInvitationsAvailable, isTrue);
+      expect(implicit.canPublishDiskInvitation, isFalse);
+      await expectLater(
+        implicit.prepareDiskInvitation(RoomRole.editor),
+        throwsStateError,
+      );
+      await expectLater(
+        implicit.prepareDiskInvitation(RoomRole.guest, allowPublication: true),
+        throwsStateError,
+      );
+      expect(cloud.published, isEmpty);
+    },
+  );
+
+  diskTest(
+    'stale public access is not returned; missing current credentials cannot publish',
+    (tester) async {
+      network.autoRegister = false;
+      final owner = await invitationOwner();
+      await owner.store.saveDiskPublicAccess(_roomId, {
+        'v': 1,
+        'bindingId': 'old-binding',
+        'publicUrl': 'https://disk.yandex.ru/d/old-binding',
+      });
+      expect(await owner.room.prepareDiskInvitation(RoomRole.guest), isNull);
+      await owner.store.saveDiskCredentials(
+        _roomId,
+        null,
+        bindingId: _invitationBinding,
+      );
+      await expectLater(
+        owner.room.prepareDiskInvitation(RoomRole.editor),
+        throwsStateError,
+      );
+      await expectLater(
+        owner.room.prepareDiskInvitation(
+          RoomRole.guest,
+          allowPublication: true,
+        ),
+        throwsStateError,
+      );
+      expect(cloud.published, isEmpty);
+    },
+  );
+
+  diskTest(
+    'unsaved current history blocks publication without hiding storage errors',
+    (tester) async {
+      network.autoRegister = false;
+      final owner = await invitationOwner();
+      owner.store.failAppend = true;
+      await owner.room.edit('Cannot save this change yet');
+      await expectLater(
+        owner.room.prepareDiskInvitation(
+          RoomRole.guest,
+          allowPublication: true,
+        ),
+        throwsStateError,
+      );
+      expect(owner.room.storageError, isNotNull);
+      expect(cloud.published, isEmpty);
+      expect(await owner.store.loadDiskPublicAccess(_roomId), isNull);
+      owner.store.failAppend = false;
+      final access = await owner.room.prepareDiskInvitation(
+        RoomRole.guest,
+        allowPublication: true,
+      );
+      expect(access, _entryAccess(RoomRole.guest));
+      expect(
+        cloud.uploadedHistory.any(
+          (edit) => edit.text == 'Cannot save this change yet',
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  diskTest(
+    'credential changes while synchronization awaits prevent publication',
+    (tester) async {
+      network.autoRegister = false;
+      final owner = await invitationOwner();
+      final release = Completer<void>();
+      cloud.beforeList = (_) => release.future;
+      final preparing = owner.room.prepareDiskInvitation(
+        RoomRole.guest,
+        allowPublication: true,
+      );
+      final failed = expectLater(preparing, throwsStateError);
+      await _settle(tester);
+      await owner.store.saveDiskCredentials(_roomId, {
+        'v': 1,
+        'bindingId': _invitationBinding,
+        'token': 'replacement-private-token',
+      });
+      release.complete();
+      await failed;
+      expect(cloud.published, isEmpty);
+      expect(await owner.store.loadDiskPublicAccess(_roomId), isNull);
+    },
+  );
+
+  for (final phase in ['synchronization', 'publication']) {
+    diskTest(
+      'a binding change during $phase cannot return or persist stale access',
+      (tester) async {
+        network.autoRegister = false;
+        final client = _PublishingDiskClient(cloud);
+        final owner = await invitationOwner(client: client);
+        final release = Completer<void>();
+        if (phase == 'synchronization') {
+          cloud.beforeList = (_) => release.future;
+        } else {
+          client.beforePublish = () => release.future;
+        }
+        final preparing = owner.room.prepareDiskInvitation(
+          RoomRole.guest,
+          allowPublication: true,
+        );
+        final failed = expectLater(preparing, throwsStateError);
+        await _settle(tester);
+        final detach = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: 'changed-while-publishing',
+            author: 'owner',
+            clock: 100,
+            createdAt: 100,
+            kind: RoomEditKind.diskConnection,
+            text: '{"action":"disconnect","bindingId":"invitation-binding"}',
+          ),
+          decodeRoomHistory(await owner.store.loadHistory(_roomId)),
+        );
+        await owner.store.appendHistory(_roomId, [detach.toJson()]);
+        // An authored append atomically catches up the full stored journal too.
+        await owner.room.setParticipantName('Binding changed');
+        await _settle(tester);
+        expect(owner.room.diskBinding, isNull);
+        release.complete();
+        await failed;
+        expect(await owner.store.loadDiskPublicAccess(_roomId), isNull);
+        if (phase == 'synchronization') expect(cloud.published, isEmpty);
+      },
+    );
+  }
 
   diskTest(
     'connect stores token separately; metadata, cloud and invitations never contain it',

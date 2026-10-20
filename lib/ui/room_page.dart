@@ -73,7 +73,11 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       if (!mounted) return;
       final invite = roomInvitationFromUri(_applicationUri);
       if (invite != null) {
-        await _openRoom(invite.roomId, invitationRole: invite.role);
+        await _openRoom(
+          invite.roomId,
+          invitationRole: invite.role,
+          invitationDiskAccess: invite.diskAccess,
+        );
       } else if (roomIdFromUri(_applicationUri) != null) {
         _menuError =
             'В приглашении указана неизвестная роль. Попросите новую ссылку.';
@@ -107,6 +111,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     String rawId, {
     bool newlyCreated = false,
     RoomRole? invitationRole,
+    RoomDiskAccess? invitationDiskAccess,
   }) async {
     final invitation = parseRoomInvitation(rawId);
     final roomId = invitation?.roomId;
@@ -169,6 +174,9 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       invitationRole: newlyCreated
           ? RoomRole.editor
           : invitationRole ?? invitation!.role,
+      invitationDiskAccess: newlyCreated
+          ? null
+          : invitationDiskAccess ?? invitation!.diskAccess,
       newlyCreated: newlyCreated,
       roomTabs: tabsFactory?.call(roomId, _actorId),
       preferExistingHost: existing && _recentlyOnlineRooms.containsKey(roomId),
@@ -347,6 +355,10 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
         roomId: session.roomId,
         applicationUri: _applicationUri,
         canInviteEditors: session.canEdit,
+        prepareDiskAccess: session.diskInvitationsAvailable
+            ? session.prepareDiskInvitation
+            : null,
+        canPublishDiskAccess: session.canPublishDiskInvitation,
         onMessage: _showMessage,
       ),
     );
@@ -492,7 +504,8 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   Widget _buildJoining(RoomSession session) => RoomLoadingView(
     status: session.initialSyncStatus,
     error: session.storageError ?? session.error ?? session.initialSyncError,
-    requiresOnlineMember: !session.joined,
+    requiresOnlineMember:
+        !session.joined && session.invitationDiskAccess == null,
     onRetry: () => unawaited(session.retry()),
     onOpenLocal: session.joined && session.editable
         ? session.openLocalCopy
@@ -500,59 +513,66 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     onExit: _leaving ? null : () => unawaited(_exitToMenu()),
   );
 
-  Widget _buildRoom(RoomSession session) => Column(
-    children: [
-      if (session.storageError != null ||
-          (session.localCopyOpened && !session.initialSyncComplete))
-        Padding(
-          padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              if (session.localCopyOpened && !session.initialSyncComplete)
-                Semantics(
-                  liveRegion: true,
-                  child: Text(
-                    'Локальная копия · синхронизация не подтверждена',
-                    key: const Key('sync-status'),
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+  Widget _buildRoom(RoomSession session) {
+    final customEditor = widget.roomEditorBuilder?.call(session);
+    // The tree toolbar is full-bleed under the AppBar. The historical text
+    // editor keeps its inset so its floating label stays clear of the header.
+    Widget editor = AbsorbPointer(
+      absorbing: _leaving,
+      child: ExcludeFocus(
+        excluding: _leaving,
+        child: customEditor ?? TreeEditor(session: session),
+      ),
+    );
+    if (customEditor != null) {
+      editor = Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+        child: editor,
+      );
+    }
+    return Column(
+      children: [
+        if (session.storageError != null ||
+            (session.localCopyOpened && !session.initialSyncComplete))
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (session.localCopyOpened && !session.initialSyncComplete)
+                  Semantics(
+                    liveRegion: true,
+                    child: Text(
+                      'Локальная копия · синхронизация не подтверждена',
+                      key: const Key('sync-status'),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ),
-                ),
-              if (session.storageError != null) ...[
-                Semantics(
-                  liveRegion: true,
-                  child: Text(
-                    'Не сохранено: ${session.storageError}',
-                    key: const Key('save-status'),
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
+                if (session.storageError != null) ...[
+                  Semantics(
+                    liveRegion: true,
+                    child: Text(
+                      'Не сохранено: ${session.storageError}',
+                      key: const Key('save-status'),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
                     ),
                   ),
-                ),
-                TextButton(
-                  onPressed: session.saving ? null : () => _retrySave(session),
-                  child: const Text('Повторить сохранение'),
-                ),
+                  TextButton(
+                    onPressed: session.saving
+                        ? null
+                        : () => _retrySave(session),
+                    child: const Text('Повторить сохранение'),
+                  ),
+                ],
               ],
-            ],
-          ),
-        ),
-      Expanded(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-          child: AbsorbPointer(
-            absorbing: _leaving,
-            child: ExcludeFocus(
-              excluding: _leaving,
-              child:
-                  widget.roomEditorBuilder?.call(session) ??
-                  TreeEditor(session: session),
             ),
           ),
-        ),
-      ),
-    ],
-  );
+        Expanded(child: editor),
+      ],
+    );
+  }
 }

@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import '../room_identity.dart';
+
 // Shared on-disk/browser encoding. Room and operation IDs are opaque, so never
 // put their raw contents in paths or delimit keys with unescaped IDs.
 String encodeStoreKey(String value) =>
@@ -8,6 +10,47 @@ String encodeStoreKey(String value) =>
 void requireRoomId(String roomId) {
   if (roomId.trim().isEmpty) {
     throw ArgumentError.value(roomId, 'roomId', 'Must not be empty');
+  }
+}
+
+/// Public access belongs to a real room, not a generic legacy history key.
+void requireDiskPublicAccessRoomId(String roomId) {
+  if (!isValidRoomId(roomId)) {
+    throw ArgumentError('Invalid room ID for Disk public access');
+  }
+}
+
+/// The only supported public-read envelope. Never accepts an editor token or
+/// repairs malformed identifiers/URLs, and always returns a detached flat map.
+Map<String, dynamic> snapshotDiskPublicAccess(Object? value) {
+  if (value is! Map<String, dynamic> ||
+      value.length != 3 ||
+      value['v'] is! int ||
+      value['v'] != 1 ||
+      !isValidRoomActor(value['bindingId'])) {
+    throw const FormatException('Invalid stored Disk public access');
+  }
+  final publicUrl = value['publicUrl'];
+  if (publicUrl is! String || !isValidDiskPublicUrl(publicUrl)) {
+    throw const FormatException('Invalid stored Disk public access');
+  }
+  return {'v': 1, 'bindingId': value['bindingId'], 'publicUrl': publicUrl};
+}
+
+/// JSON parser diagnostics can quote URLs. Keep errors independent of source
+/// text and reject duplicate keys rather than silently discarding old values.
+Map<String, dynamic> decodeDiskPublicAccess(String encoded) {
+  try {
+    final snapshot = snapshotDiskPublicAccess(jsonDecode(encoded));
+    // The valid envelope is flat; every key must occur exactly once.
+    final strings = RegExp(r'("(?:[^"\\]|\\.)*")(\s*:)?');
+    if (strings.allMatches(encoded).where((match) => match[2] != null).length !=
+        snapshot.length) {
+      throw const FormatException('Invalid stored Disk public access');
+    }
+    return snapshot;
+  } on FormatException {
+    throw const FormatException('Invalid stored Disk public access');
   }
 }
 

@@ -117,7 +117,7 @@ old text and tree records remain readable without migration. See [surname replay
 
 ## Saving before admission and acknowledgment
 
-A fresh join follows this order in `_handleMessage`:
+An ordinary fresh WebRTC join follows this order in `_handleMessage`:
 
 1. Require an actually open outbound channel to `mytree-room-<roomId>` and a valid welcome with `hosting: true`.
 2. Validate envelope, identity, capabilities, and the complete incoming history; merge it durably.
@@ -142,6 +142,10 @@ The session sets `remoteImported` only when every expected ID/digest exists in i
 `_ackCheckpoint` then acknowledges that exact token/root. Stale ACKs cannot satisfy a superseding checkpoint;
 `roomReady: false` can acknowledge saving while the hub's other initial imports are unfinished. A successful transport
 write is never an ACK.
+
+A binding-scoped [Disk invitation](yandex-disk.md) provides a separate initial-entry source. Before starting RTC or cloud writes, the session reads and validates the bounded cloud snapshot together with any durable local history, including batch hashes, exact room/binding identity, immutable records, complete author prefixes, the current binding, and its owner's explicit editor role. It durably saves history, the entry profile and matching private/public access before membership. Existing durable participant roles win over the invitation. Failure never admits an empty room; the ordinary live-member path remains available.
+
+Successful Disk entry opens the saved document with a distinct source status: history loaded from Disk, online reconciliation continuing. It creates no welcome, peer checkpoint, ACK, online participant, or discovery/solo evidence. A cloud snapshot is not proof that every offline editor has uploaded their latest changes. Subsequent RTC exchanges still use the unmodified capability, checkpoint, and cohort contracts below; guest periodic cloud reads do not acknowledge their own local metadata as cloud-saved.
 
 ## Finite initial cohort and solo evidence
 

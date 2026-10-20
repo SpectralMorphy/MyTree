@@ -12,7 +12,7 @@ This directory documents the **implemented** application for contributors. It de
 | [Tree layout](tree-layout.md) | Generation ranking, sibling blocks, trunk modes, placement, and the boundary with viewport geometry. |
 | [History and storage](history-and-storage.md) | Immutable cores and author-prefix proofs, optimistic versus canonical durable state, atomic authored storage, retries, and refresh. |
 | [Synchronization](synchronization.md) | WebRTC capability gates, predecessor-complete batches, proof-aware inventories, durable checkpoints, entry barriers, chunking, and recovery. |
-| [Yandex Disk](yandex-disk.md) | Optional local-first cloud replica, immutable batches, read-back acknowledgment, binding ownership, editor-only credentials, and detach retries. |
+| [Yandex Disk](yandex-disk.md) | Optional local-first replica, immutable batches/read-back acknowledgment, validated-history invitations, consented public guest reads, editor credentials, binding ownership, and detach retries. |
 | [Networking](networking.md) | Temporary participant hubs, signaling adapters, fallback/election, ICE/TURN, and public-service limits. |
 | [Local tabs](local-tabs.md) | Shared-origin ownership, Web Locks, local state proofs, and safe handover. |
 | [Testing and delivery](testing.md) | Test boundaries, real-browser drivers, release serving, and verification caveats. |
@@ -35,7 +35,9 @@ main.dart                         application composition and theme
             ├─ room_protocol      validation, inventories, framing and decoding
             ├─ SignalingPeer      PeerJS + MQTT fallback and RTC channels
             ├─ RoomDiskSync       optional immutable cloud replica and acknowledgment
-            │    └─ YandexDiskClient  private app-folder HTTP adapter
+            ├─ RoomDiskReadSync   bounded read-only public guest polling
+            ├─ readDiskRoomHistory  validated read-only admission snapshot
+            ├─ YandexDiskClient   shared private/public HTTP and consented publication
             ├─ RoomDiskRetirements  independent frozen final-detach replicas
             ├─ DiskBinding        public journal projection, no credential
             ├─ DiskCredentialExchange  editor RTC fallback only behind ready guest hub
@@ -55,6 +57,7 @@ Platform-specific address, connectivity, storage, MQTT-client, and tab adapters 
 5. Remote peers validate the envelope, immutable IDs, and complete resulting author prefixes before persistence, projection, or durable ACK. Old all-legacy history remains readable without automatic renumbering.
 6. Same-origin followers obtain records from shared storage; local messages carry ownership/state proofs rather than drafts or a second database.
 7. For a connected editor, Disk independently unions immutable cloud batches with the local durable journal and uploads missing records. Cloud acknowledgment requires confirmed remote bytes; it is not a WebRTC send/ACK or a new local-save guarantee.
+8. A Disk-enabled invitation can instead import a bounded validated history and role-permitted access before membership, without a live peer. Its initial readiness is distinct from a peer ACK or globally latest history; ordinary RTC reconciliation continues. A public-link guest polls read-only updates, never uploads.
 
 Details and exceptions belong to the subsystem documents above.
 

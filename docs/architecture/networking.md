@@ -70,12 +70,16 @@ at least once is retained even after signaling loss: it may own outgoing or inco
 or kept beside a duplicate registration. The working provider and established winner are not recreated by cold recovery.
 When the whole wrapper loses service or is disposed/conflicted, its internal retries stop; the session owns the next peer.
 
+A pending logical channel records provider failures against the registration epoch, not the persistent backend slot. A recovered cold registration can therefore join an already-pending race without restarting its healthy attempt. Duplicate readiness within the same epoch does not redial a failed attempt. Once that logical channel has reported exhaustion, later provider recovery cannot revive it; a new channel is required. Established winners remain unchanged.
+
 | Fallback constant | Production value / meaning |
 | --- | --- |
-| Registration deadline per attempt | 3 s for preferred backend; 7 s for secondary |
+| Registration deadline per attempt | 3 s for preferred backend; 14 s for secondary |
 | Secondary-ready preference delay | 250 ms for random runtime IDs; 3 s for room aliases |
 | Outgoing channel hedge | 250 ms, independent of registration preference |
 | Cold-backend retry | At most 2; first 500–750 ms, second 1,000–1,250 ms |
+
+The secondary registration budget includes the MQTT adapter's complete bounded startup: up to 8 s connecting, 4 s for parallel subscription acknowledgments, then at most 1.5 s probing/claiming. It must not cut these valid stages off at the old 7 s boundary. This wrapper budget is not a new room-entry deadline: the session's independent 8 s registration, 12 s channel/handshake, and fixed 30 s fresh-admission limits still apply. It prevents premature cancellation when a valid fallback becomes ready before those session limits; it does not promise that every 13.5 s MQTT startup can complete fresh admission. Failed/expired visitors never become hosts or receive membership by timeout.
 
 An established RTC link can survive one provider's loss while another maintains the logical peer. MQTT also preserves open
 RTC links on its own signaling failure. This is not indefinite survival of a session-wide restart: the session keeps links

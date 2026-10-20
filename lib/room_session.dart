@@ -50,8 +50,8 @@ class RoomParticipant {
 /// A persisted room, with an elected (not permanent) signaling rendezvous host.
 ///
 /// Only accepted/saved members may claim [hostAlias]. Invitations contain the
-/// stable [roomId], never a device's transient signaling ID. Fresh members must
-/// receive a valid welcome on an actually open channel before being saved.
+/// stable [roomId], never a device's transient signaling ID. Fresh members need
+/// either a valid live welcome or a validated, durably saved Disk invitation.
 /// Transfers are limited to 8 MiB of UTF-8 JSON; larger histories remain local
 /// and report a synchronization error rather than silently truncating history.
 class RoomSession extends ChangeNotifier {
@@ -63,6 +63,7 @@ class RoomSession extends ChangeNotifier {
     String? participantName,
     List<RoomEdit>? initialHistory,
     this.invitationRole,
+    this.invitationDiskAccess,
     this.preferExistingHost = false,
     this.newlyCreated = false,
     this.peerFactory = createSignalingPeer,
@@ -80,6 +81,12 @@ class RoomSession extends ChangeNotifier {
            : normalizeParticipantName(participantName) {
     if (participantName != null && _entryParticipantName == null) {
       throw ArgumentError.value(participantName, 'participantName');
+    }
+    if (invitationDiskAccess != null &&
+        (invitationRole == null ||
+            invitationDiskAccess!.isEditor !=
+                (invitationRole == RoomRole.editor))) {
+      throw const FormatException('Некорректный доступ в приглашении');
     }
     _history = RoomHistory(
       roomId: roomId,
@@ -102,6 +109,13 @@ class RoomSession extends ChangeNotifier {
       readHistory: () => _history.durableHistory,
       mergeHistory: _mergeDiskHistory,
       onChanged: _diskChanged,
+    );
+    _diskReadSync = RoomDiskReadSync(
+      roomId: roomId,
+      client: _diskClient,
+      readHistory: () => _history.durableHistory,
+      mergeHistory: _mergePublicDiskHistory,
+      onChanged: _changed,
     );
     _diskRetirements = RoomDiskRetirements(
       roomId: roomId,
@@ -143,6 +157,9 @@ class RoomSession extends ChangeNotifier {
   /// invitation role, including for a saved member whose durable role wins.
   final RoomRole? invitationRole;
 
+  /// Optional binding-scoped entry snapshot. Never a welcome or a peer ACK.
+  final RoomDiskAccess? invitationDiskAccess;
+
   /// A first-attempt optimization, never proof of membership or a live host.
   final bool preferExistingHost;
 
@@ -168,8 +185,14 @@ class RoomSession extends ChangeNotifier {
   late final RoomHistory _history;
   late final YandexDiskClient _diskClient;
   late final RoomDiskSync _diskSync;
+  late final RoomDiskReadSync _diskReadSync;
   late final DiskCredentialExchange _diskCredentialExchange;
   Map<String, dynamic>? _diskCredentials;
+  RoomDiskAccess? _diskPublicAccess;
+  bool _diskEntryPending = true;
+  bool _diskEntryReading = false;
+  bool _initialSyncFromDisk = false;
+  String? _diskEntryError;
   Future<void>? _diskCredentialsLoading;
   late final RoomDiskRetirements _diskRetirements;
   String? _diskCommandError;
@@ -277,7 +300,12 @@ class RoomSession extends ChangeNotifier {
   String? get initialSyncError => _initialSyncError;
   bool get localCopyOpened => _localCopyOpened;
   String get initialSyncStatus {
-    if (_initialSyncComplete) return 'История комнаты проверена';
+    if (_initialSyncComplete) {
+      return _initialSyncFromDisk
+          ? 'История загружена с Диска · онлайн-сверка продолжается'
+          : 'История комнаты проверена';
+    }
+    if (_diskEntryReading) return 'Проверяем историю на Диске…';
     if (_localCopyOpened) {
       return 'Локальная копия · синхронизация не подтверждена';
     }
@@ -373,28 +401,58 @@ class RoomSession extends ChangeNotifier {
   }
 
   bool get canConnectDisk =>
-      canEdit && diskBinding == null && !_diskCommandBusy;
+      canEdit && diskBinding == null && !_diskCommandBusy && !_diskEntryPending;
 
   bool get canDisconnectDisk {
     final binding = diskBinding;
-    if (!canEdit || binding == null || _diskCommandBusy) return false;
+    if (!canEdit || binding == null || _diskCommandBusy || _diskEntryPending) {
+      return false;
+    }
     if (binding.ownerActor == actorId) return true;
     final ownerPerson = _boundEditorPersonId(binding.ownerActor);
     return ownerPerson != null && ownerPerson == boundPersonId;
   }
 
+  bool get diskInvitationsAvailable {
+    final binding = diskBinding;
+    if (_disposed || !_joined || binding == null) return false;
+    if (ownRole == RoomRole.editor) return true;
+    final access = _diskPublicAccess;
+    return access != null &&
+        !access.isEditor &&
+        access.bindingId == binding.id &&
+        access.publicUrl != null;
+  }
+
+  bool get canPublishDiskInvitation =>
+      diskInvitationsAvailable &&
+      canEdit &&
+      _durableRoleDocument.participantRoles[actorId] == RoomRole.editor;
+
   bool get diskUnlinkPending => _diskRetirements.pending;
-  bool get diskSyncAcknowledged => _diskSync.acknowledged;
+  bool get diskSyncAcknowledged => canEdit && _diskSync.acknowledged;
   bool get diskSyncBusy =>
-      _diskCommandBusy || _diskSync.busy || _diskRetirements.busy;
+      _diskCommandBusy ||
+      _diskEntryReading ||
+      _diskSync.busy ||
+      _diskReadSync.busy ||
+      _diskRetirements.busy;
   String? get diskSyncError =>
-      _diskCommandError ?? _diskSync.error ?? _diskRetirements.error;
-  String get diskSyncStatus => diskBinding == null
+      _diskCommandError ??
+      _diskEntryError ??
+      _diskSync.error ??
+      _diskReadSync.error ??
+      _diskRetirements.error;
+  String get diskSyncStatus => _diskEntryReading
+      ? 'Чтение истории с Диска…'
+      : diskBinding == null
       ? diskUnlinkPending
             ? 'Отвязка сохранена локально · отправляем на Диск'
             : 'Не подключён'
       : !canEdit
-      ? 'Подключён'
+      ? _diskPublicAccess?.bindingId == diskBinding?.id
+            ? _diskReadSync.status
+            : 'Подключён'
       : _diskSync.status;
 
   Future<void> _loadDiskCredentials() {
@@ -407,13 +465,22 @@ class RoomSession extends ChangeNotifier {
         String? requestedBinding;
         do {
           requestedBinding = diskBinding?.id;
-          value = await store.loadDiskCredentials(
-            roomId,
-            bindingId: requestedBinding,
-          );
+          value = ownRole == RoomRole.editor
+              ? await store.loadDiskCredentials(
+                  roomId,
+                  bindingId: requestedBinding,
+                )
+              : null;
           if (_disposed) return;
         } while (requestedBinding != diskBinding?.id);
-        _diskCredentials = value;
+        _diskCredentials = ownRole == RoomRole.editor ? value : null;
+        final publicValue = diskBinding == null
+            ? null
+            : await store.loadDiskPublicAccess(roomId);
+        if (_disposed) return;
+        _diskPublicAccess = publicValue == null
+            ? null
+            : RoomDiskAccess.fromJson(publicValue);
         _updateDiskSync();
         _shareDiskCredentials();
       } catch (_) {
@@ -440,14 +507,23 @@ class RoomSession extends ChangeNotifier {
     _diskSync.update(
       bindingId: binding?.id,
       token: savedId == binding?.id ? token : null,
-      enabled: canEdit,
+      enabled: canEdit && !_diskEntryPending,
     );
-    unawaited(_diskRetirements.update(enabled: canEdit));
+    _diskReadSync.update(
+      access: _diskPublicAccess?.bindingId == binding?.id
+          ? _diskPublicAccess
+          : null,
+      enabled: editable && !canEdit && !_diskEntryPending,
+    );
+    unawaited(_diskRetirements.update(enabled: canEdit && !_diskEntryPending));
   }
 
   void _diskChanged() {
     if (_disposed) return;
     if (!_diskSync.busy) {
+      if (_diskSync.error == null && _diskSync.acknowledged) {
+        _diskEntryError = null;
+      }
       // A peer may have received a token but failed its local durable save.
       // Periodic cloud rounds also retry directed delivery without logging it.
       for (final state in _connections.values) {
@@ -469,6 +545,143 @@ class RoomSession extends ChangeNotifier {
     // A failed cloud read/save cannot poison the admission/network queue.
     _messages = result.catchError((Object _) {});
     return result;
+  }
+
+  Future<void> _mergePublicDiskHistory(List<RoomEdit> edits) {
+    final access = _diskPublicAccess;
+    final result = _messages.then((_) async {
+      if (_disposed ||
+          !editable ||
+          canEdit ||
+          _diskEntryPending ||
+          access == null ||
+          access != _diskPublicAccess ||
+          diskBinding?.id != access.bindingId) {
+        return;
+      }
+      _validateDiskEntryHistory(edits, access, allowFinalDisconnect: true);
+      final added = await _history.merge(edits);
+      if (added == null) throw StateError('Облачные изменения не сохранены');
+      await _history.flush();
+      if (!_disposed && added.isNotEmpty) _onDurableEdits(added);
+    });
+    _messages = result.catchError((Object _) {});
+    return result;
+  }
+
+  /// Produces only binding-scoped access. Publication is an explicit command,
+  /// never an entry side effect, and needs the caller's prior consent.
+  Future<RoomDiskAccess?> prepareDiskInvitation(
+    RoomRole role, {
+    bool allowPublication = false,
+  }) async {
+    final binding = diskBinding;
+    if (!diskInvitationsAvailable || binding == null) return null;
+    if (_diskCommandBusy || _diskEntryPending) {
+      throw StateError('Дождитесь завершения операции с Диском');
+    }
+    final bindingId = binding.id;
+    if (bindingId == '.' ||
+        bindingId == '..' ||
+        RegExp(r'[/\\\x00-\x1f\x7f-\x9f]').hasMatch(bindingId)) {
+      throw StateError('Некорректное подключение Диска');
+    }
+    bool current() => !_disposed && _joined && diskBinding?.id == bindingId;
+    bool editor() =>
+        current() &&
+        canEdit &&
+        _durableRoleDocument.participantRoles[actorId] == RoomRole.editor;
+    void requireCurrent({bool requireEditor = false}) {
+      if (!current() || (requireEditor && !editor())) {
+        throw StateError('Подключение комнаты или права изменились');
+      }
+    }
+
+    _diskCommandBusy = true;
+    _diskCommandError = null;
+    _changed();
+    try {
+      requireCurrent(requireEditor: role == RoomRole.editor);
+      if (role == RoomRole.guest) {
+        final saved = await store.loadDiskPublicAccess(roomId);
+        requireCurrent();
+        final access = saved == null ? null : RoomDiskAccess.fromJson(saved);
+        if (access != null &&
+            !access.isEditor &&
+            access.bindingId == bindingId) {
+          _validateDiskEntryHistory(_history.durableHistory, access);
+          _diskPublicAccess = access;
+          _updateDiskSync();
+          return access;
+        }
+        if (!allowPublication) return null;
+        requireCurrent(requireEditor: true);
+      }
+      final saved = await store.loadDiskCredentials(
+        roomId,
+        bindingId: bindingId,
+      );
+      requireCurrent(requireEditor: true);
+      final access = saved == null ? null : RoomDiskAccess.fromJson(saved);
+      if (access == null || !access.isEditor || access.bindingId != bindingId) {
+        throw StateError('Нет сохранённого доступа к подключённому Диску');
+      }
+      _validateDiskEntryHistory(_history.durableHistory, access);
+      final token = access.token!;
+      _diskCredentials = saved;
+      if (role == RoomRole.editor) return access;
+
+      bool sameCredential() =>
+          editor() &&
+          _diskCredentials?['bindingId'] == bindingId &&
+          _diskCredentials?['token'] == token;
+      Future<void> verifyCredential() async {
+        requireCurrent(requireEditor: true);
+        final value = await store.loadDiskCredentials(
+          roomId,
+          bindingId: bindingId,
+        );
+        if (!sameCredential() ||
+            value?['bindingId'] != bindingId ||
+            value?['token'] != token) {
+          throw StateError('Доступ к подключённому Диску изменился');
+        }
+      }
+
+      await _history.flush();
+      await verifyCredential();
+      _updateDiskSync();
+      await _diskSync.sync();
+      await verifyCredential();
+      // Concurrent local writes must not be advertised as already uploaded.
+      if (!_diskSync.acknowledged) {
+        throw StateError('Сначала подтвердите текущую копию на Диске');
+      }
+      final publicUrl = await _diskClient.publishDirectory(
+        token,
+        'app:/mytree/$roomId/$bindingId',
+      );
+      await verifyCredential();
+      final publicAccess = RoomDiskAccess.guest(
+        bindingId: bindingId,
+        publicUrl: publicUrl,
+      );
+      await store.saveDiskPublicAccess(roomId, publicAccess.toJson());
+      await verifyCredential();
+      await store.flush();
+      await verifyCredential();
+      _diskPublicAccess = publicAccess;
+      _updateDiskSync();
+      return publicAccess;
+    } catch (_) {
+      if (!_disposed) {
+        _diskCommandError = 'Не удалось подготовить доступ к Диску';
+      }
+      throw StateError('Не удалось подготовить доступ к Диску');
+    } finally {
+      _diskCommandBusy = false;
+      _changed();
+    }
   }
 
   Future<void> connectDisk(String value) async {
@@ -567,7 +780,7 @@ class RoomSession extends ChangeNotifier {
   void _shareDiskCredentials() {
     if (_disposed) return;
     _updateDiskCredentialExchange();
-    if (!canEdit || _diskCredentials == null) return;
+    if (_diskEntryPending || !canEdit || _diskCredentials == null) return;
     final binding = diskBinding;
     if (binding == null || _diskCredentials!['bindingId'] != binding.id) return;
     if (_durableRoleDocument.participantRoles[actorId] != RoomRole.editor) {
@@ -657,6 +870,7 @@ class RoomSession extends ChangeNotifier {
     _diskCredentialExchange.update(
       enabled:
           !_disposed &&
+          !_diskEntryPending &&
           canEdit &&
           !_isTabFollower &&
           diskBinding != null &&
@@ -1122,9 +1336,12 @@ class RoomSession extends ChangeNotifier {
       setForeground,
     );
     _beginInitialWait();
+    final attempt = _entryAttempt;
     if (!_admissionHistoryLoaded && (_joined || invitationRole != null)) {
       if (!await _loadEntryHistory()) return;
     }
+    if (!await _enterFromDisk(attempt)) return;
+    if (_disposed || attempt != _entryAttempt) return;
     if (_joined && _needsEntryProfile && !await _ensureEntryProfile()) return;
     if (_joined) unawaited(_loadDiskCredentials());
     if (newlyCreated && _joined) _completeInitialSync();
@@ -1151,6 +1368,180 @@ class RoomSession extends ChangeNotifier {
       _admissionHistoryLoaded = true;
     }
     return _history.loaded;
+  }
+
+  void _validateDiskEntryHistory(
+    List<RoomEdit> history,
+    RoomDiskAccess access, {
+    bool allowFinalDisconnect = false,
+  }) {
+    var binding = DiskBinding.project(history);
+    if (binding == null && allowFinalDisconnect) {
+      // Only an established matching public reader may import its terminal
+      // snapshot. Prove that the exact disconnect actually closes this binding,
+      // rather than accepting an ignored disconnect or another binding's end.
+      final connections =
+          history
+              .where((edit) => edit.kind == RoomEditKind.diskConnection)
+              .toList()
+            ..sort((left, right) => left.compareTo(right));
+      for (var index = 0; index < connections.length; index++) {
+        final payload = jsonDecode(connections[index].text) as Map;
+        if (payload['action'] != 'disconnect' ||
+            payload['bindingId'] != access.bindingId) {
+          continue;
+        }
+        final previous = DiskBinding.project(connections.take(index));
+        if (previous?.id == access.bindingId) {
+          binding = previous;
+          break;
+        }
+      }
+    }
+    final roles = RoomDocument()..merge(history);
+    if (binding?.id != access.bindingId ||
+        roles.participantRoles[binding!.ownerActor] != RoomRole.editor) {
+      throw const FormatException('Подключение Диска не подтверждено');
+    }
+  }
+
+  /// Shares the journal/admission queue with RTC and storage refreshes, but runs
+  /// before starting either network or the write-capable Disk replica.
+  Future<bool> _enterFromDisk(int attempt) {
+    bool current() =>
+        !_disposed && attempt == _entryAttempt && _initialSyncError == null;
+    final result = _messages.then((_) async {
+      if (!current()) return false;
+      RoomDiskAccess? access = invitationDiskAccess;
+      try {
+        final binding = diskBinding;
+        final acceptedGuest = _joined && ownRole == RoomRole.guest;
+        if (access == null && _joined && binding != null) {
+          if (ownRole == RoomRole.editor) {
+            final saved = await store.loadDiskCredentials(
+              roomId,
+              bindingId: binding.id,
+            );
+            if (!current()) return false;
+            if (saved != null) {
+              final stored = RoomDiskAccess.fromJson(saved);
+              if (stored.isEditor && stored.bindingId == binding.id) {
+                access = stored;
+              }
+            }
+          }
+          if (access == null) {
+            final saved = await store.loadDiskPublicAccess(roomId);
+            if (!current()) return false;
+            if (saved != null) {
+              final stored = RoomDiskAccess.fromJson(saved);
+              if (!stored.isEditor && stored.bindingId == binding.id) {
+                access = stored;
+              }
+            }
+          }
+        }
+        if (access == null) return true;
+        _diskEntryReading = true;
+        _changed();
+        final entryAccess = access;
+        final allowFinalDisconnect =
+            acceptedGuest &&
+            !entryAccess.isEditor &&
+            binding?.id == entryAccess.bindingId;
+        void validateEntryHistory(List<RoomEdit> edits) =>
+            _validateDiskEntryHistory(
+              edits,
+              entryAccess,
+              allowFinalDisconnect: allowFinalDisconnect,
+            );
+        final history = await readDiskRoomHistory(
+          client: _diskClient,
+          roomId: roomId,
+          access: entryAccess,
+          localHistory: _history.durableHistory,
+          isCurrent: current,
+          timeout: _joinDeadline,
+          allowFinalDisconnect: allowFinalDisconnect,
+        );
+        if (!current()) return false;
+        validateEntryHistory(history);
+        final added = await _history.merge(history);
+        if (!current()) return false;
+        if (added == null) throw StateError('История с Диска не сохранена');
+        await _history.flush();
+        if (!current()) return false;
+        validateEntryHistory(_history.durableHistory);
+        if (!await _ensureEntryProfile(stillAdmissible: current)) return false;
+        if (!current()) return false;
+
+        // Durable roles, including roles saved by an earlier failed admission,
+        // always win over a newly opened invitation. Never retain its editor
+        // token for an actor whose existing role is guest.
+        final retainsToken =
+            ownRole == RoomRole.editor &&
+            _durableRoleDocument.participantRoles[actorId] == RoomRole.editor;
+        if (retainsToken && entryAccess.isEditor) {
+          await store.saveDiskCredentials(roomId, entryAccess.toJson());
+          if (!current()) return false;
+        } else if (!entryAccess.isEditor) {
+          await store.saveDiskPublicAccess(roomId, entryAccess.toJson());
+          if (!current()) return false;
+        }
+        if (ownRole == RoomRole.guest) _diskCredentials = null;
+        await _history.flush();
+        if (!current()) return false;
+        validateEntryHistory(_history.durableHistory);
+        if (!_joined) {
+          if (!await _history.saveMembership(stillAdmissible: current)) {
+            throw StateError('Участие не сохранено');
+          }
+          if (!current()) return false;
+          _joined = true;
+          _joinTimer?.cancel();
+          _history.watchAcceptedHistory();
+        }
+        // Recheck the accepted durable copy (and clear a recovered membership
+        // write error) without authoring anything after the membership commit.
+        await _history.refresh();
+        if (!current()) return false;
+        if (_history.error != null) {
+          throw StateError('Не удалось проверить сохранённую историю');
+        }
+        validateEntryHistory(_history.durableHistory);
+        if (retainsToken && entryAccess.isEditor) {
+          _diskCredentials = entryAccess.toJson();
+        } else if (!entryAccess.isEditor) {
+          _diskPublicAccess = entryAccess;
+        }
+        _diskEntryError = null;
+        _completeInitialSync(fromDisk: true);
+        return true;
+      } catch (_) {
+        if (_disposed || attempt != _entryAttempt) return false;
+        // External failures can contain tokens, URLs, or raw JSON. Keep cloud
+        // errors safe and independent from the ordinary online admission path.
+        _diskEntryError =
+            'Не удалось открыть подтверждённую историю с Диска. '
+            'Можно повторить проверку или дождаться онлайн-участника.';
+        _failInitialSync(
+          _history.error ?? _initialSyncError ?? _diskEntryError!,
+        );
+        return true;
+      } finally {
+        if (!_disposed && attempt == _entryAttempt) {
+          _diskEntryReading = false;
+          _diskEntryPending = false;
+          _updateDiskSync();
+          _changed();
+        }
+      }
+    });
+    _messages = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace __) {},
+    );
+    return result;
   }
 
   bool get _needsEntryProfile =>
@@ -1426,6 +1817,7 @@ class RoomSession extends ChangeNotifier {
     _entryAttempt++;
     _initialTimer?.cancel();
     _initialSyncComplete = false;
+    _initialSyncFromDisk = false;
     _localCopyOpened = false;
     _initialSyncError = null;
     _soloCheckpoint = null;
@@ -1452,15 +1844,33 @@ class RoomSession extends ChangeNotifier {
     _changed();
   }
 
-  void _completeInitialSync() {
-    if (_disposed || _initialSyncComplete || !_joined || !_history.loaded) {
+  void _completeInitialSync({bool fromDisk = false}) {
+    if (_disposed || !_joined || !_history.loaded) return;
+    if (!fromDisk &&
+        _diskEntryError != null &&
+        !hasValidatedOnlinePeer &&
+        !_isTabFollower) {
       return;
     }
+    if (_initialSyncComplete) {
+      // Cloud readiness is not an RTC acknowledgment. Only the unmodified
+      // cohort/checkpoint paths may later replace its source with peer proof.
+      if (!fromDisk && _initialSyncFromDisk && hasValidatedOnlinePeer) {
+        _initialSyncFromDisk = false;
+        _changed();
+      }
+      return;
+    }
+    _initialSyncFromDisk = fromDisk;
     _initialSyncComplete = true;
     _localCopyOpened = false;
     _initialSyncError = null;
     _initialTimer?.cancel();
-    _record('Первичная проверка истории завершена');
+    _record(
+      fromDisk
+          ? 'История загружена с Диска; онлайн-сверка продолжается'
+          : 'Первичная проверка истории завершена',
+    );
     _changed();
     // A first join cannot participate in local election before its actual
     // welcome, membership write and durable checkpoint exchange completed.
@@ -1493,6 +1903,7 @@ class RoomSession extends ChangeNotifier {
       return;
     }
     _diskSync.schedule();
+    _diskReadSync.schedule();
     _resumeTimer ??= Timer(
       const Duration(milliseconds: 200),
       _checkAfterResume,
@@ -1577,14 +1988,21 @@ class RoomSession extends ChangeNotifier {
   /// themselves; a failed fresh join remains unaccepted until retried.
   Future<void> retry() async {
     if (_disposed) return;
+    _diskEntryPending = true;
+    _updateDiskSync();
+    if (_networkStarted) _stopNetwork();
     _beginInitialWait();
-    if (!_admissionHistoryLoaded && (_joined || invitationRole != null)) {
-      if (!await _loadEntryHistory()) return;
-    }
-    if (_joined && _needsEntryProfile && !await _ensureEntryProfile()) return;
+    final attempt = _entryAttempt;
     _error = null;
     _networkIssue = null;
     _retryAttempt = 0;
+    if (!_admissionHistoryLoaded && (_joined || invitationRole != null)) {
+      if (!await _loadEntryHistory()) return;
+    }
+    if (!await _enterFromDisk(attempt)) return;
+    if (_disposed || attempt != _entryAttempt) return;
+    if (_joined && _needsEntryProfile && !await _ensureEntryProfile()) return;
+    if (_joined) unawaited(_loadDiskCredentials());
     if (_isTabFollower) {
       _tabState = null;
       _verifiedTabState = null;
@@ -3103,7 +3521,9 @@ class RoomSession extends ChangeNotifier {
     _diskSync.schedule();
     if (diskBinding != null &&
         _diskCredentials?['bindingId'] != diskBinding!.id &&
-        !_diskCommandBusy) {
+        !_diskCommandBusy &&
+        !_diskEntryPending &&
+        (canEdit || _diskPublicAccess?.bindingId != diskBinding!.id)) {
       unawaited(_loadDiskCredentials());
     }
     if (_isTabFollower) {
@@ -3127,7 +3547,9 @@ class RoomSession extends ChangeNotifier {
       _updateDiskSync();
       if (diskBinding != null &&
           _diskCredentials?['bindingId'] != diskBinding!.id &&
-          !_diskCommandBusy) {
+          !_diskCommandBusy &&
+          !_diskEntryPending &&
+          (canEdit || _diskPublicAccess?.bindingId != diskBinding!.id)) {
         unawaited(_loadDiskCredentials());
       }
       _shareDiskCredentials();
@@ -3164,6 +3586,7 @@ class RoomSession extends ChangeNotifier {
     unawaited(_foregroundSubscription?.cancel());
     _diskCredentialExchange.dispose();
     _diskRetirements.dispose();
+    _diskReadSync.dispose();
     _diskSync.dispose();
     _diskClient.close();
     _history.dispose();

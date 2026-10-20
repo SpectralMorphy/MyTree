@@ -11,6 +11,29 @@ import 'package:mytree_webrtc_demo/cloud/yandex_disk_client.dart';
 const _token = 'test-oauth-secret';
 const _path = 'app:/mytree/room-1/изменения & данные.bin';
 const _apiHost = 'cloud-api.yandex.net';
+const _publicUrl = 'https://disk.yandex.ru/d/public-test-folder';
+const _publicPath = '/batches/изменения & данные.bin';
+const _bodyLimit = 8 * 1024 * 1024;
+const _unsafePublicUrls = [
+  '',
+  'http://disk.yandex.ru/d/share',
+  'https://evil.example/d/share',
+  'https://disk.yandex.ru.evil.example/d/share',
+  'https://sub.disk.yandex.ru/d/share',
+  'https://yandex.net/d/share',
+  'https://yadi.sk.evil.example/d/share',
+  'https://disk.yandex.ru@evil.example/d/share',
+  'https://user:password@disk.yandex.ru/d/share',
+  'https://disk.yandex.ru:8443/d/share',
+  'https://disk.yandex.ru./d/share',
+  'https://disk.yandex.ru/file',
+  'https://disk.yandex.ru/d/',
+  'https://disk.yandex.ru/d/share/%2Fextra',
+  'https://disk.yandex.ru/d/share#fragment',
+  '//disk.yandex.ru/d/share',
+  '/d/share',
+  'https://disk.yandex.ru/d/share\n',
+];
 const _download =
     'https://downloader.disk.yandex.ru/disk/bytes?signature=secret';
 const _storage =
@@ -76,6 +99,33 @@ void _apiRequest(http.BaseRequest request, String method, String resource) {
   expect(request.followRedirects, isFalse);
 }
 
+void _publicRequest(http.BaseRequest request, String resource, String path) {
+  expect(request.method, 'GET');
+  expect(request.url.scheme, 'https');
+  expect(request.url.host, _apiHost);
+  expect(request.url.port, 443);
+  expect(request.url.path, '/v1/disk$resource');
+  expect(request.url.queryParameters['public_key'], _publicUrl);
+  expect(request.url.queryParameters['path'], path);
+  expect(request.headers.containsKey('authorization'), isFalse);
+  expect(request.headers.containsKey('cookie'), isFalse);
+  expect(request.url.toString(), isNot(contains(_token)));
+  expect(request.followRedirects, isFalse);
+}
+
+TypeMatcher<YandexDiskException> _publicError({
+  int? status,
+  String? messageContains,
+}) => _error(status: status, messageContains: messageContains)
+    .having((e) => e.toString(), 'no share URL', isNot(contains(_publicUrl)))
+    .having((e) => e.toString(), 'no signed URL', isNot(contains(_download)))
+    .having((e) => e.toString(), 'no signature', isNot(contains('signature=')))
+    .having(
+      (e) => e.toString(),
+      'no server body',
+      isNot(contains('PRIVATE-SERVER-BODY')),
+    );
+
 void _transferRequest(http.BaseRequest request, String method, String href) {
   expect(request.method, method);
   expect(request.url.toString(), href);
@@ -117,6 +167,37 @@ class _TrackedClient extends MockClient {
 
   @override
   void close() => closes++;
+}
+
+Future<Object> _guardedRead(
+  YandexDiskClient disk,
+  String operation, {
+  required bool public,
+  bool Function()? isCurrent,
+  DateTime? deadline,
+}) async {
+  if (operation == 'list') {
+    return public
+        ? disk.listPublicFiles(
+            _publicUrl,
+            isCurrent: isCurrent,
+            deadline: deadline,
+          )
+        : disk.listFiles(
+            _token,
+            _path,
+            isCurrent: isCurrent,
+            deadline: deadline,
+          );
+  }
+  return public
+      ? disk.readPublicFile(
+          _publicUrl,
+          _publicPath,
+          isCurrent: isCurrent,
+          deadline: deadline,
+        )
+      : disk.readFile(_token, _path, isCurrent: isCurrent, deadline: deadline);
 }
 
 void main() {
@@ -186,6 +267,176 @@ void main() {
         await expectLater(
           disk.createDirectory(_token, _path),
           throwsA(_error(status: 403)),
+        );
+      },
+    );
+  });
+
+  group('publishDirectory', () {
+    test(
+      'publishes only when called, then reads back directory metadata',
+      () async {
+        var calls = 0;
+        final disk = YandexDiskClient(
+          client: MockClient((request) async {
+            if (calls++ == 0) {
+              _apiRequest(request, 'PUT', '/resources/publish');
+              expect(request.url.queryParameters, {'path': _path});
+              expect(request.bodyBytes, isEmpty);
+              // The PUT's link is not a trusted destination or confirmation.
+              return _link('https://evil.example/$_token');
+            }
+            _apiRequest(request, 'GET', '/resources');
+            expect(request.url.queryParameters['fields'], 'type,public_url');
+            return _json({'type': 'dir', 'public_url': _publicUrl});
+          }),
+        );
+        addTearDown(disk.close);
+        expect(calls, 0);
+        expect(await disk.publishDirectory(_token, _path), _publicUrl);
+        expect(calls, 2);
+      },
+    );
+
+    for (final metadata in <Object?>[
+      null,
+      [],
+      {},
+      {'type': 'file', 'public_url': _publicUrl},
+      {'type': 'unknown', 'public_url': _publicUrl},
+      {'type': 'dir'},
+      {'type': 'dir', 'public_url': 42},
+      for (final url in _unsafePublicUrls) {'type': 'dir', 'public_url': url},
+    ].indexed) {
+      test(
+        'does not confirm invalid publication metadata ${metadata.$1}',
+        () async {
+          var calls = 0;
+          final disk = YandexDiskClient(
+            client: MockClient((request) async {
+              calls++;
+              return request.method == 'PUT'
+                  ? http.Response('', 200)
+                  : _json(metadata.$2);
+            }),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.publishDirectory(_token, _path),
+            throwsA(_publicError(status: 200)),
+          );
+          expect(calls, 2);
+        },
+      );
+    }
+
+    for (final metadataFailure in [false, true]) {
+      for (final status in [202, 302, 401, 403, 503]) {
+        test(
+          'safe HTTP $status error at '
+          '${metadataFailure ? 'publication metadata' : 'publication PUT'}',
+          () async {
+            var calls = 0;
+            final disk = YandexDiskClient(
+              client: MockClient((request) async {
+                calls++;
+                if (metadataFailure && request.method == 'PUT') {
+                  return http.Response('', 200);
+                }
+                return http.Response(
+                  '$_token $_publicUrl signature=secret PRIVATE-SERVER-BODY',
+                  status,
+                );
+              }),
+            );
+            addTearDown(disk.close);
+            await expectLater(
+              disk.publishDirectory(_token, _path),
+              throwsA(_publicError(status: status)),
+            );
+            expect(calls, metadataFailure ? 2 : 1);
+          },
+        );
+      }
+    }
+
+    test(
+      'publication metadata must be valid JSON, without leaking it',
+      () async {
+        final disk = YandexDiskClient(
+          client: MockClient((request) async {
+            return http.Response(
+              request.method == 'PUT'
+                  ? ''
+                  : '$_token $_publicUrl signature=secret PRIVATE-SERVER-BODY',
+              200,
+            );
+          }),
+        );
+        addTearDown(disk.close);
+        await expectLater(
+          disk.publishDirectory(_token, _path),
+          throwsA(_publicError(status: 200)),
+        );
+      },
+    );
+
+    test(
+      'does not complete before publication read-back confirms the URL',
+      () async {
+        final entered = Completer<void>();
+        final metadata = Completer<http.Response>();
+        final disk = YandexDiskClient(
+          client: MockClient((request) async {
+            if (request.method == 'PUT') return http.Response('', 200);
+            entered.complete();
+            return metadata.future;
+          }),
+        );
+        addTearDown(disk.close);
+        var completed = false;
+        final published = disk.publishDirectory(_token, _path).then((url) {
+          completed = true;
+          return url;
+        });
+        await entered.future;
+        expect(completed, isFalse);
+        metadata.complete(_json({'type': 'dir', 'public_url': _publicUrl}));
+        expect(await published, _publicUrl);
+      },
+    );
+
+    test('publication and metadata share one operation deadline', () async {
+      var calls = 0;
+      final disk = YandexDiskClient(
+        timeout: const Duration(milliseconds: 150),
+        client: MockClient((request) async {
+          calls++;
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          return request.method == 'PUT'
+              ? http.Response('', 200)
+              : _json({'type': 'dir', 'public_url': _publicUrl});
+        }),
+      );
+      addTearDown(disk.close);
+      await expectLater(
+        disk.publishDirectory(_token, _path),
+        throwsA(_publicError(messageContains: 'Время ожидания')),
+      );
+      expect(calls, 2);
+    });
+
+    test(
+      'validates private credentials and app paths before publishing',
+      () async {
+        final disk = YandexDiskClient(
+          client: MockClient((_) async => fail('Invalid publication request')),
+        );
+        addTearDown(disk.close);
+        await expectLater(disk.publishDirectory('', _path), throwsA(_error()));
+        await expectLater(
+          disk.publishDirectory(_token, 'app:/mytree/../other'),
+          throwsA(_error()),
         );
       },
     );
@@ -345,6 +596,937 @@ void main() {
         throwsA(_error(status: 503)),
       );
     });
+  });
+
+  group('public folder access', () {
+    test(
+      'lists anonymously at the fixed API, preserving untrusted names',
+      () async {
+        final offsets = <String>[];
+        final disk = YandexDiskClient(
+          client: MockClient((request) async {
+            _publicRequest(request, '/public/resources', '/batches');
+            final query = request.url.queryParameters;
+            expect(
+              query['fields'],
+              '_embedded.items.name,_embedded.items.type,'
+              '_embedded.total,_embedded.offset,_embedded.limit',
+            );
+            expect(query['limit'], '1000');
+            offsets.add(query['offset']!);
+            return query['offset'] == '0'
+                ? _page(
+                    [_file('первый.json'), _dir('folder')],
+                    total: 3,
+                    limit: 2,
+                  )
+                : _page([_file('two & %.bin')], total: 3, offset: 2, limit: 2);
+          }),
+        );
+        addTearDown(disk.close);
+        expect(await disk.listPublicFiles(_publicUrl), [
+          'первый.json',
+          'two & %.bin',
+        ]);
+        expect(offsets, ['0', '2']);
+      },
+    );
+
+    test(
+      'empty public directory uses the explicit canonical path too',
+      () async {
+        final disk = YandexDiskClient(
+          client: MockClient((request) async {
+            _publicRequest(request, '/public/resources', '/batches');
+            return _page([], total: 0);
+          }),
+        );
+        addTearDown(disk.close);
+        expect(
+          await disk.listPublicFiles(_publicUrl, path: '/batches'),
+          isEmpty,
+        );
+      },
+    );
+
+    test('reads public download metadata and bytes without OAuth', () async {
+      var calls = 0;
+      // Ordinary injected clients do not provide BaseResponseWithUrl.
+      final disk = YandexDiskClient(
+        client: MockClient((request) async {
+          if (calls++ == 0) {
+            _publicRequest(request, '/public/resources/download', _publicPath);
+            expect(request.url.queryParameters, {
+              'public_key': _publicUrl,
+              'path': _publicPath,
+            });
+            return _link(_download);
+          }
+          _transferRequest(request, 'GET', _download);
+          return http.Response.bytes(_bytes, 200);
+        }),
+      );
+      addTearDown(disk.close);
+      expect(await disk.readPublicFile(_publicUrl, _publicPath), _bytes);
+      expect(calls, 2);
+    });
+
+    test('does not publish implicitly when listing or reading', () async {
+      final disk = YandexDiskClient(
+        client: MockClient((request) async {
+          expect(request.method, 'GET');
+          expect(request.url.path, isNot(contains('/publish')));
+          if (request.url.path == '/v1/disk/public/resources') {
+            return _page([], total: 0);
+          }
+          return request.url.host == _apiHost
+              ? _link(_download)
+              : http.Response.bytes(_bytes, 200);
+        }),
+      );
+      addTearDown(disk.close);
+      await disk.listPublicFiles(_publicUrl);
+      await disk.readPublicFile(_publicUrl, _publicPath);
+    });
+
+    for (final url in _unsafePublicUrls.indexed) {
+      test(
+        'rejects unsafe public share URL ${url.$1} before requests',
+        () async {
+          final disk = YandexDiskClient(
+            client: MockClient(
+              (_) async => fail('Invalid share URL reached HTTP'),
+            ),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.listPublicFiles(url.$2),
+            throwsA(_publicError()),
+          );
+          await expectLater(
+            disk.readPublicFile(url.$2, _publicPath),
+            throwsA(_publicError()),
+          );
+        },
+      );
+    }
+
+    for (final path in [
+      '',
+      '/',
+      'batches',
+      'app:/mytree/batches',
+      '//batches',
+      '/other',
+      '/batches/',
+      '/batches/name',
+      '/batches/..',
+      '/batches/./',
+      '/batches\\name',
+      '/batches\n',
+      '/batches\x7f',
+    ]) {
+      test(
+        'rejects noncanonical public listing path ${jsonEncode(path)}',
+        () async {
+          final disk = YandexDiskClient(
+            client: MockClient(
+              (_) async => fail('Invalid listing path reached HTTP'),
+            ),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.listPublicFiles(_publicUrl, path: path),
+            throwsA(_publicError()),
+          );
+        },
+      );
+    }
+
+    for (final path in [
+      '',
+      '/',
+      '/batches',
+      '/batches/',
+      'batches/name',
+      'app:/mytree/batches/name',
+      '//batches/name',
+      '/other/name',
+      '/batches-other/name',
+      '/batches//name',
+      '/batches/.',
+      '/batches/..',
+      '/batches/../name',
+      '/batches/./name',
+      '/batches/nested/name',
+      '/batches/name/',
+      '/batches/name\\other',
+      '/batches/na\nme',
+      '/batches/name\x00',
+      '/batches/name\x7f',
+      '/batches/name\x85',
+    ]) {
+      test(
+        'rejects noncanonical public file path ${jsonEncode(path)}',
+        () async {
+          final disk = YandexDiskClient(
+            client: MockClient(
+              (_) async => fail('Invalid file path reached HTTP'),
+            ),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.readPublicFile(_publicUrl, path),
+            throwsA(_publicError()),
+          );
+        },
+      );
+    }
+
+    test('accepts exactly 2048 listed items across bounded pages', () async {
+      final offsets = <int>[];
+      final disk = YandexDiskClient(
+        client: MockClient((request) async {
+          _publicRequest(request, '/public/resources', '/batches');
+          final offset = int.parse(request.url.queryParameters['offset']!);
+          offsets.add(offset);
+          final limit = offset == 2000 ? 48 : 1000;
+          expect(request.url.queryParameters['limit'], '$limit');
+          return _page(
+            List.generate(limit, (i) => _file('batch-${offset + i}.json')),
+            total: 2048,
+            offset: offset,
+            limit: limit,
+          );
+        }),
+      );
+      addTearDown(disk.close);
+      final names = await disk.listPublicFiles(_publicUrl);
+      expect(names, hasLength(2048));
+      expect(names.last, 'batch-2047.json');
+      expect(offsets, [0, 1000, 2000]);
+    });
+
+    for (final oversizedLater in [false, true]) {
+      test(
+        'rejects oversized total ${oversizedLater ? 'on a later page' : 'up front'}',
+        () async {
+          var calls = 0;
+          final disk = YandexDiskClient(
+            client: MockClient((_) async {
+              calls++;
+              return oversizedLater && calls == 1
+                  ? _page([_file('first')], total: 2)
+                  : _page(
+                      [_file('other')],
+                      total: 2049,
+                      offset: oversizedLater ? 1 : 0,
+                    );
+            }),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.listPublicFiles(_publicUrl),
+            throwsA(_publicError(status: 200)),
+          );
+          expect(calls, oversizedLater ? 2 : 1);
+        },
+      );
+    }
+
+    for (final page in [
+      _page([], total: 1),
+      _page([_dir('directory')], total: 2, offset: 1),
+      _page([_file('a')], total: 0),
+      _page([_file('a')], total: 1, limit: 0),
+      _page([_file('a')], total: 1, limit: 2049),
+      _page([
+        {'name': 'a', 'type': 'unknown'},
+      ], total: 1),
+      _json({
+        '_embedded': {'items': [], 'total': '0', 'offset': 0, 'limit': 1000},
+      }),
+    ].indexed) {
+      test('rejects invalid public pagination ${page.$1}', () async {
+        var calls = 0;
+        final disk = YandexDiskClient(
+          client: MockClient((_) async {
+            calls++;
+            return page.$2;
+          }),
+        );
+        addTearDown(disk.close);
+        await expectLater(
+          disk.listPublicFiles(_publicUrl),
+          throwsA(_publicError(status: 200)),
+        );
+        expect(calls, 1);
+      });
+    }
+
+    test(
+      'does not return a partial public listing after a page error',
+      () async {
+        final disk = YandexDiskClient(
+          client: MockClient((request) async {
+            return request.url.queryParameters['offset'] == '0'
+                ? _page([_file('first')], total: 2)
+                : http.Response('PRIVATE-SERVER-BODY $_publicUrl', 503);
+          }),
+        );
+        addTearDown(disk.close);
+        await expectLater(
+          disk.listPublicFiles(_publicUrl),
+          throwsA(_publicError(status: 503)),
+        );
+      },
+    );
+
+    test('rejects an unsafe public download link before transfer', () async {
+      var calls = 0;
+      final disk = YandexDiskClient(
+        client: MockClient((request) async {
+          calls++;
+          _publicRequest(request, '/public/resources/download', _publicPath);
+          return _link('https://evil.example/$_token?signature=secret');
+        }),
+      );
+      addTearDown(disk.close);
+      await expectLater(
+        disk.readPublicFile(_publicUrl, _publicPath),
+        throwsA(_publicError(status: 200)),
+      );
+      expect(calls, 1);
+    });
+
+    test(
+      'public transfer checks the final URL before reading any bytes',
+      () async {
+        var consumed = false;
+        var cancelled = false;
+        final body = StreamController<List<int>>(
+          onCancel: () => cancelled = true,
+        );
+        body.add(utf8.encode('$_publicUrl PRIVATE-SERVER-BODY'));
+        final closed = body.close();
+        addTearDown(() => closed);
+        final disk = YandexDiskClient(
+          client: _FinalUrlClient(Uri.parse('https://evil.example/file'), (
+            request,
+            _,
+          ) async {
+            return request.url.host == _apiHost
+                ? _streamed(_link(_download))
+                : http.StreamedResponse(
+                    body.stream.map((chunk) {
+                      consumed = true;
+                      return chunk;
+                    }),
+                    200,
+                  );
+          }),
+        );
+        addTearDown(disk.close);
+        await expectLater(
+          disk.readPublicFile(_publicUrl, _publicPath),
+          throwsA(_publicError(status: 200)),
+        );
+        expect(consumed, isFalse);
+        expect(cancelled, isTrue);
+      },
+    );
+
+    for (final transfer in [false, true]) {
+      test(
+        'public ${transfer ? 'transfer' : 'API'} redirects remain errors',
+        () async {
+          var calls = 0;
+          final disk = YandexDiskClient(
+            client: MockClient((request) async {
+              calls++;
+              if (transfer && request.url.host == _apiHost) {
+                return _link(_download);
+              }
+              return http.Response(
+                'PRIVATE-SERVER-BODY',
+                302,
+                headers: {'location': 'https://evil.example/file'},
+              );
+            }),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.readPublicFile(_publicUrl, _publicPath),
+            throwsA(_publicError(status: 302)),
+          );
+          expect(calls, transfer ? 2 : 1);
+        },
+      );
+    }
+  });
+
+  group('public response body bounds', () {
+    for (final atApi in [false, true]) {
+      for (final declaration in ['property', 'header', 'both']) {
+        test('rejects oversized ${atApi ? 'metadata' : 'download'} '
+            'Content-Length from $declaration before reading', () async {
+          var consumed = false;
+          var cancelled = false;
+          var aborted = false;
+          final body = StreamController<List<int>>(
+            onCancel: () => cancelled = true,
+          );
+          body.add(utf8.encode('$_publicUrl $_token PRIVATE-SERVER-BODY'));
+          final closed = body.close();
+          addTearDown(() => closed);
+          final disk = YandexDiskClient(
+            client: MockClient.streaming((request, _) async {
+              if (!atApi && request.url.host == _apiHost) {
+                return _streamed(_link(_download));
+              }
+              unawaited(
+                (request as http.Abortable).abortTrigger!.then((_) {
+                  aborted = true;
+                }),
+              );
+              return http.StreamedResponse(
+                body.stream.map((chunk) {
+                  consumed = true;
+                  return chunk;
+                }),
+                200,
+                contentLength: declaration == 'header' ? null : _bodyLimit + 1,
+                headers: {
+                  if (declaration != 'property')
+                    'content-length': '${_bodyLimit + 1}',
+                },
+              );
+            }),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.readPublicFile(_publicUrl, _publicPath),
+            throwsA(_publicError(status: 200, messageContains: '8 МиБ')),
+          );
+          await Future<void>.delayed(Duration.zero);
+          expect(consumed, isFalse);
+          expect(cancelled, isTrue);
+          expect(aborted, isTrue);
+        });
+      }
+    }
+
+    for (final misleadingLength in [false, true]) {
+      test(
+        'counts streaming bytes and aborts at 8 MiB + 1 '
+        'with ${misleadingLength ? 'short' : 'absent'} Content-Length',
+        () async {
+          final chunk = Uint8List(64 * 1024)..fillRange(0, 64 * 1024, 42);
+          var emitted = 0;
+          var cancelled = false;
+          var aborted = false;
+          Stream<List<int>> chunks() async* {
+            try {
+              for (var i = 0; i < 128; i++) {
+                emitted++;
+                yield chunk;
+              }
+              emitted++;
+              yield [1];
+              emitted++;
+              yield utf8.encode('$_token $_publicUrl PRIVATE-SERVER-BODY');
+            } finally {
+              cancelled = true;
+            }
+          }
+
+          final disk = YandexDiskClient(
+            client: MockClient.streaming((request, _) async {
+              if (request.url.host == _apiHost) {
+                return _streamed(_link(_download));
+              }
+              unawaited(
+                (request as http.Abortable).abortTrigger!.then((_) {
+                  aborted = true;
+                }),
+              );
+              return http.StreamedResponse(
+                chunks(),
+                200,
+                contentLength: misleadingLength ? 1 : null,
+                headers: {if (misleadingLength) 'content-length': '1'},
+              );
+            }),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            disk.readPublicFile(_publicUrl, _publicPath),
+            throwsA(_publicError(status: 200, messageContains: '8 МиБ')),
+          );
+          await Future<void>.delayed(Duration.zero);
+          expect(emitted, 129);
+          expect(cancelled, isTrue);
+          expect(aborted, isTrue);
+        },
+      );
+    }
+
+    test('accepts exactly 8 MiB streamed in multiple chunks', () async {
+      final chunk = Uint8List(64 * 1024)..fillRange(0, 64 * 1024, 42);
+      final disk = YandexDiskClient(
+        client: MockClient.streaming((request, _) async {
+          return request.url.host == _apiHost
+              ? _streamed(_link(_download))
+              : http.StreamedResponse(
+                  Stream<List<int>>.fromIterable(List.filled(128, chunk)),
+                  200,
+                  contentLength: _bodyLimit,
+                );
+        }),
+      );
+      addTearDown(disk.close);
+      final bytes = await disk.readPublicFile(_publicUrl, _publicPath);
+      expect(bytes.length, _bodyLimit);
+      expect(bytes.first, 42);
+      expect(bytes.last, 42);
+    });
+
+    test('oversized stream cancellation cannot stall the safe error', () async {
+      final cancel = Completer<void>();
+      var cancelled = false;
+      var aborted = false;
+      final body = StreamController<List<int>>(
+        onCancel: () {
+          cancelled = true;
+          return cancel.future;
+        },
+      );
+      body.add(Uint8List(_bodyLimit + 1));
+      final disk = YandexDiskClient(
+        timeout: const Duration(milliseconds: 100),
+        client: MockClient.streaming((request, _) async {
+          if (request.url.host == _apiHost) return _streamed(_link(_download));
+          unawaited(
+            (request as http.Abortable).abortTrigger!.then((_) {
+              aborted = true;
+            }),
+          );
+          return http.StreamedResponse(body.stream, 200);
+        }),
+      );
+      addTearDown(disk.close);
+      addTearDown(() async {
+        if (!cancel.isCompleted) cancel.complete();
+        await body.close();
+      });
+      await expectLater(
+        disk.readPublicFile(_publicUrl, _publicPath),
+        throwsA(_publicError(status: 200, messageContains: '8 МиБ')),
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(cancelled, isTrue);
+      expect(aborted, isTrue);
+    });
+
+    test(
+      'body stream errors are redacted and abort only their request',
+      () async {
+        var aborted = false;
+        final raw = MockClient.streaming((request, _) async {
+          if (request.url.host == _apiHost) return _streamed(_link(_download));
+          unawaited(
+            (request as http.Abortable).abortTrigger!.then((_) {
+              aborted = true;
+            }),
+          );
+          return http.StreamedResponse(
+            Stream<List<int>>.error(
+              StateError('$_publicUrl $_token $_download PRIVATE-SERVER-BODY'),
+            ),
+            200,
+          );
+        });
+        final disk = YandexDiskClient(client: raw);
+        addTearDown(disk.close);
+        await expectLater(
+          disk.readPublicFile(_publicUrl, _publicPath),
+          throwsA(_publicError()),
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect(aborted, isTrue);
+      },
+    );
+  });
+
+  group('private response body bounds', () {
+    for (final operation in ['metadata', 'listing', 'download']) {
+      for (final declaration in ['absent', 'short', 'property', 'header']) {
+        test(
+          '$operation rejects oversized private body with $declaration length',
+          () async {
+            final precheck =
+                declaration == 'property' || declaration == 'header';
+            var consumed = 0;
+            var cancelled = false;
+            var aborted = false;
+            var calls = 0;
+            final body = StreamController<List<int>>(
+              onCancel: () {
+                cancelled = true;
+              },
+            );
+            if (!precheck) {
+              final chunk = Uint8List(64 * 1024);
+              for (var i = 0; i < 128; i++) {
+                body.add(chunk);
+              }
+              body.add([1]);
+            }
+            body.add(utf8.encode('$_token $_download PRIVATE-SERVER-BODY'));
+            final closed = body.close();
+            addTearDown(() => closed);
+            final raw = MockClient.streaming((request, _) async {
+              calls++;
+              if (operation == 'download' && request.url.host == _apiHost) {
+                _apiRequest(request, 'GET', '/resources/download');
+                return _streamed(_link(_download));
+              }
+              if (operation == 'download') {
+                _transferRequest(request, 'GET', _download);
+              } else {
+                _apiRequest(
+                  request,
+                  'GET',
+                  operation == 'metadata'
+                      ? '/resources/download'
+                      : '/resources',
+                );
+              }
+              unawaited(
+                (request as http.Abortable).abortTrigger!.then((_) {
+                  aborted = true;
+                }),
+              );
+              return http.StreamedResponse(
+                body.stream.map((chunk) {
+                  consumed++;
+                  return chunk;
+                }),
+                200,
+                contentLength: declaration == 'property'
+                    ? _bodyLimit + 1
+                    : declaration == 'short'
+                    ? 1
+                    : null,
+                headers: {
+                  if (declaration == 'header')
+                    'content-length': '${_bodyLimit + 1}',
+                  if (declaration == 'short') 'content-length': '1',
+                },
+              );
+            });
+            final disk = YandexDiskClient(client: raw);
+            addTearDown(disk.close);
+            await expectLater(
+              operation == 'listing'
+                  ? disk.listFiles(_token, _path)
+                  : disk.readFile(_token, _path),
+              throwsA(_publicError(status: 200, messageContains: '8 МиБ')),
+            );
+            await Future<void>.delayed(Duration.zero);
+            expect(consumed, precheck ? 0 : 129);
+            expect(cancelled, isTrue);
+            expect(aborted, isTrue);
+            expect(calls, operation == 'download' ? 2 : 1);
+            // The caller-owned transport remains usable after one rejected body.
+            raw.close();
+          },
+        );
+      }
+    }
+
+    test('private download accepts exactly 8 MiB streamed in chunks', () async {
+      final chunk = Uint8List(64 * 1024)..fillRange(0, 64 * 1024, 42);
+      final disk = YandexDiskClient(
+        client: MockClient.streaming((request, _) async {
+          return request.url.host == _apiHost
+              ? _streamed(_link(_download))
+              : http.StreamedResponse(
+                  Stream<List<int>>.fromIterable(List.filled(128, chunk)),
+                  200,
+                  contentLength: _bodyLimit,
+                );
+        }),
+      );
+      addTearDown(disk.close);
+      final bytes = await disk.readFile(_token, _path);
+      expect(bytes.length, _bodyLimit);
+      expect(bytes.first, 42);
+      expect(bytes.last, 42);
+    });
+  });
+
+  group('complete listings and compound read guards', () {
+    for (final public in [false, true]) {
+      final access = public ? 'public' : 'private';
+      for (final samePage in [false, true]) {
+        for (final directory in [false, true]) {
+          test('$access rejects duplicate ${directory ? 'directory' : 'file'} '
+              'names ${samePage ? 'within' : 'across'} pages', () async {
+            var calls = 0;
+            final item = directory ? _dir('duplicate') : _file('duplicate');
+            final disk = YandexDiskClient(
+              client: MockClient((_) async {
+                final offset = calls++;
+                return samePage
+                    ? _page([item, item], total: 2)
+                    : _page([item], total: 2, offset: offset, limit: 1);
+              }),
+            );
+            addTearDown(disk.close);
+            await expectLater(
+              _guardedRead(disk, 'list', public: public),
+              throwsA(_publicError(status: 200)),
+            );
+            expect(calls, samePage ? 1 : 2);
+          });
+        }
+      }
+
+      for (final operation in ['list', 'read']) {
+        test(
+          '$access $operation accepts a current guard and future deadline',
+          () async {
+            var calls = 0;
+            final disk = YandexDiskClient(
+              client: MockClient((request) async {
+                calls++;
+                if (operation == 'list') {
+                  return _page([_file('batch.json')], total: 1);
+                }
+                return request.url.host == _apiHost
+                    ? _link(_download)
+                    : http.Response.bytes(_bytes, 200);
+              }),
+            );
+            addTearDown(disk.close);
+            expect(
+              await _guardedRead(
+                disk,
+                operation,
+                public: public,
+                isCurrent: () => true,
+                deadline: DateTime.now().add(const Duration(seconds: 5)),
+              ),
+              operation == 'list' ? ['batch.json'] : _bytes,
+            );
+            expect(calls, operation == 'list' ? 1 : 2);
+          },
+        );
+
+        test(
+          '$access $operation rejects an obsolete guard before HTTP',
+          () async {
+            final disk = YandexDiskClient(
+              client: MockClient(
+                (_) async => fail('Obsolete read reached HTTP'),
+              ),
+            );
+            addTearDown(disk.close);
+            await expectLater(
+              _guardedRead(
+                disk,
+                operation,
+                public: public,
+                isCurrent: () => false,
+              ),
+              throwsA(_publicError(messageContains: 'отменено')),
+            );
+          },
+        );
+
+        test('$access $operation redacts a throwing current guard', () async {
+          final disk = YandexDiskClient(
+            client: MockClient(
+              (_) async => fail('Throwing guard reached HTTP'),
+            ),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            _guardedRead(
+              disk,
+              operation,
+              public: public,
+              isCurrent: () =>
+                  throw StateError('$_token $_publicUrl $_download'),
+            ),
+            throwsA(_publicError(messageContains: 'отменено')),
+          );
+        });
+
+        test(
+          '$access $operation rejects an expired absolute deadline before HTTP',
+          () async {
+            final disk = YandexDiskClient(
+              client: MockClient(
+                (_) async => fail('Expired read reached HTTP'),
+              ),
+            );
+            addTearDown(disk.close);
+            await expectLater(
+              _guardedRead(
+                disk,
+                operation,
+                public: public,
+                deadline: DateTime.now().subtract(const Duration(seconds: 1)),
+              ),
+              throwsA(_publicError(messageContains: 'Время ожидания')),
+            );
+          },
+        );
+
+        test(
+          '$access $operation rechecks guard after '
+          '${operation == 'list' ? 'page one' : 'download metadata'}',
+          () async {
+            var calls = 0;
+            var current = true;
+            final disk = YandexDiskClient(
+              client: MockClient.streaming((request, _) async {
+                calls++;
+                // _send releases the first request after fully consuming its
+                // response, before a compound operation can issue another one.
+                unawaited(
+                  (request as http.Abortable).abortTrigger!.then((_) {
+                    current = false;
+                  }),
+                );
+                return _streamed(
+                  operation == 'list'
+                      ? _page([_file('first')], total: 2, limit: 1)
+                      : _link(_download),
+                );
+              }),
+            );
+            addTearDown(disk.close);
+            await expectLater(
+              _guardedRead(
+                disk,
+                operation,
+                public: public,
+                isCurrent: () => current,
+              ),
+              throwsA(_publicError(messageContains: 'отменено')),
+            );
+            expect(calls, 1);
+          },
+        );
+
+        test(
+          '$access $operation uses the remaining absolute budget for later HTTP',
+          () async {
+            var calls = 0;
+            var aborted = false;
+            var cancelled = false;
+            final stalled = StreamController<List<int>>(
+              onCancel: () {
+                cancelled = true;
+              },
+            );
+            final raw = MockClient.streaming((request, _) async {
+              calls++;
+              if (calls == 1) {
+                await Future<void>.delayed(const Duration(milliseconds: 150));
+                return _streamed(
+                  operation == 'list'
+                      ? _page([_file('first')], total: 2, limit: 1)
+                      : _link(_download),
+                );
+              }
+              unawaited(
+                (request as http.Abortable).abortTrigger!.then((_) {
+                  aborted = true;
+                }),
+              );
+              return http.StreamedResponse(stalled.stream, 200);
+            });
+            final disk = YandexDiskClient(
+              client: raw,
+              timeout: const Duration(seconds: 5),
+            );
+            addTearDown(disk.close);
+            addTearDown(() => stalled.close());
+            final clock = Stopwatch()..start();
+            await expectLater(
+              _guardedRead(
+                disk,
+                operation,
+                public: public,
+                deadline: DateTime.now().add(const Duration(milliseconds: 400)),
+              ),
+              throwsA(_publicError(messageContains: 'Время ожидания')),
+            );
+            await Future<void>.delayed(Duration.zero);
+            expect(calls, 2);
+            expect(clock.elapsed, lessThan(const Duration(milliseconds: 500)));
+            expect(aborted, isTrue);
+            expect(cancelled, isTrue);
+          },
+        );
+      }
+
+      test(
+        '$access guard rejection after headers cancels an unread body',
+        () async {
+          var current = true;
+          var consumed = false;
+          var cancelled = false;
+          var aborted = false;
+          var calls = 0;
+          final body = StreamController<List<int>>(
+            onCancel: () {
+              cancelled = true;
+            },
+          );
+          body.add(utf8.encode('$_token PRIVATE-SERVER-BODY'));
+          final closed = body.close();
+          addTearDown(() => closed);
+          final disk = YandexDiskClient(
+            client: MockClient.streaming((request, _) async {
+              calls++;
+              unawaited(
+                (request as http.Abortable).abortTrigger!.then((_) {
+                  aborted = true;
+                }),
+              );
+              current = false;
+              return http.StreamedResponse(
+                body.stream.map((chunk) {
+                  consumed = true;
+                  return chunk;
+                }),
+                200,
+              );
+            }),
+          );
+          addTearDown(disk.close);
+          await expectLater(
+            _guardedRead(
+              disk,
+              'read',
+              public: public,
+              isCurrent: () => current,
+            ),
+            throwsA(_publicError(messageContains: 'отменено')),
+          );
+          await Future<void>.delayed(Duration.zero);
+          expect(calls, 1);
+          expect(consumed, isFalse);
+          expect(cancelled, isTrue);
+          expect(aborted, isTrue);
+        },
+      );
+    }
   });
 
   group('readFile and transfer security', () {
@@ -1158,6 +2340,18 @@ void main() {
       await expectLater(
         disk.writeFile(_token, _path, _bytes),
         throwsA(_error(messageContains: 'закрыто')),
+      );
+      await expectLater(
+        disk.publishDirectory(_token, _path),
+        throwsA(_error(messageContains: 'закрыто')),
+      );
+      await expectLater(
+        disk.listPublicFiles(_publicUrl),
+        throwsA(_publicError(messageContains: 'закрыто')),
+      );
+      await expectLater(
+        disk.readPublicFile(_publicUrl, _publicPath),
+        throwsA(_publicError(messageContains: 'закрыто')),
       );
       expect((await raw.get(Uri.https(_apiHost, '/test'))).statusCode, 201);
       raw.close();

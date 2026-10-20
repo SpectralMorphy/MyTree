@@ -486,7 +486,7 @@ void main() {
         await _settle(tester);
         final active = healthy.outbound.single..openChannel();
         await tester.pump(
-          Duration(milliseconds: slowBackend == 0 ? 2900 : 6900),
+          Duration(milliseconds: slowBackend == 0 ? 2900 : 13900),
         );
         expect(peer.open, isTrue);
         expect(peer.discoveryComplete, isFalse);
@@ -541,6 +541,111 @@ void main() {
     );
   }
 
+  for (final slowBackend in [0, 1]) {
+    testSignaling(
+      'pending channel can use recovered provider $slowBackend without restarting the healthy attempt',
+      (tester) async {
+        final peer = wrapper()..start();
+        final expired = peers[slowBackend];
+        final healthy = peers[1 - slowBackend]..register();
+        await tester.pump(_delay);
+        final channel = peer.connect('host');
+        var opens = 0;
+        final errors = <Object>[];
+        channel.onOpen.listen((_) => opens++);
+        channel.onError.listen(errors.add);
+        await _settle(tester);
+        final pendingHealthy = healthy.outbound.single;
+        await tester.pump(
+          Duration(milliseconds: slowBackend == 0 ? 2900 : 13900),
+        );
+        expect(expired.disposed, isTrue);
+        expect(channel.open, isFalse);
+        expect(pendingHealthy.disposed, isFalse);
+        await tester.pump(const Duration(milliseconds: 750));
+        expect(peers, hasLength(3));
+        final recovered = peers.last..register();
+        await _settle(tester);
+        expect(
+          recovered.outbound,
+          hasLength(1),
+          reason:
+              'A failure of an expired registration must not bar its replacement.',
+        );
+        recovered.register();
+        await _settle(tester);
+        expect(recovered.outbound, hasLength(1));
+        expect(healthy.outbound, [pendingHealthy]);
+        final winner = recovered.outbound.single..openChannel();
+        await _settle(tester);
+        expect(channel.open, isTrue);
+        expect(opens, 1);
+        expect(errors, isEmpty);
+        expect(pendingHealthy.disposed, isTrue);
+        expect(healthy.disposed, isFalse);
+        await channel.send({'sync': 'recovered registration'});
+        expect(winner.sent, [
+          {'sync': 'recovered registration'},
+        ]);
+        expired.register();
+        pendingHealthy.openChannel();
+        await _settle(tester);
+        expect(
+          opens,
+          1,
+          reason: 'Stale registrations and losing RTC cannot win again.',
+        );
+        expect(winner.disposed, isFalse);
+        expect(errors, isEmpty);
+      },
+    );
+  }
+
+  for (final slowBackend in [0, 1]) {
+    testSignaling(
+      'recovered provider $slowBackend does not revive an exhausted logical channel',
+      (tester) async {
+        final peer = wrapper()..start();
+        final expired = peers[slowBackend];
+        final healthy = peers[1 - slowBackend]..register();
+        await tester.pump(_delay);
+        final channel = peer.connect('host');
+        var opens = 0;
+        final errors = <Object>[];
+        channel.onOpen.listen((_) => opens++);
+        channel.onError.listen(errors.add);
+        await _settle(tester);
+        healthy.outbound.single.fail(StateError('RTC negotiation failed'));
+        await _settle(tester);
+        await tester.pump(
+          Duration(milliseconds: slowBackend == 0 ? 2900 : 13900),
+        );
+        expect(expired.disposed, isTrue);
+        expect(errors, hasLength(1));
+        await tester.pump(const Duration(milliseconds: 750));
+        expect(peers, hasLength(3));
+        final recovered = peers.last..register();
+        await _settle(tester);
+        expect(recovered.outbound, isEmpty);
+        expect(channel.open, isFalse);
+        expect(opens, 0);
+        expect(errors, hasLength(1));
+
+        final next = peer.connect('host');
+        next.onError.listen((_) {});
+        await _settle(tester);
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(recovered.outbound, hasLength(1));
+        recovered.outbound.single.openChannel();
+        await _settle(tester);
+        expect(next.open, isTrue);
+        expect(channel.open, isFalse);
+        expect(opens, 0);
+        expect(errors, hasLength(1));
+      },
+    );
+  }
+
   testSignaling('retry still requires optional provider discovery coverage', (
     tester,
   ) async {
@@ -557,7 +662,7 @@ void main() {
       ],
     )..start();
     primary.register();
-    await tester.pump(const Duration(seconds: 7));
+    await tester.pump(const Duration(seconds: 14));
     await tester.pump(const Duration(milliseconds: 750));
     final replacement = peers.last as _DiscoveringPeer;
     replacement.open = true;
@@ -580,7 +685,7 @@ void main() {
     peers[0].register();
     final errors = <SignalingFailure>[];
     peer.onError.listen(errors.add);
-    await tester.pump(const Duration(seconds: 7));
+    await tester.pump(const Duration(seconds: 14));
     await tester.pump(const Duration(milliseconds: 750));
     expect(peers, hasLength(3));
     peers.last.fail(_unavailable);
@@ -590,7 +695,7 @@ void main() {
     expect(peers, hasLength(3), reason: 'Second retry backs off longer');
     await tester.pump(const Duration(milliseconds: 251));
     expect(peers, hasLength(4));
-    await tester.pump(const Duration(seconds: 7));
+    await tester.pump(const Duration(seconds: 14));
     await tester.pump(const Duration(minutes: 1));
     expect(peers, hasLength(4));
     expect(peers.map((p) => p.id).toSet(), {_id});
@@ -614,7 +719,7 @@ void main() {
     final channel = peer.connect('host');
     await _settle(tester);
     final active = peers[0].outbound.single..openChannel();
-    await tester.pump(const Duration(seconds: 7));
+    await tester.pump(const Duration(seconds: 14));
     await tester.pump(const Duration(milliseconds: 750));
     const conflict = SignalingFailure(
       SignalingFailureKind.idTaken,
@@ -644,7 +749,7 @@ void main() {
       (tester) async {
         final peer = wrapper()..start();
         peers[0].register();
-        await tester.pump(const Duration(seconds: 7));
+        await tester.pump(const Duration(seconds: 14));
         if (disposeDuringRetry) {
           await tester.pump(const Duration(milliseconds: 750));
         }
@@ -669,7 +774,7 @@ void main() {
         peers[0].register();
         final disconnects = <void>[];
         peer.onDisconnected.listen(disconnects.add);
-        await tester.pump(const Duration(seconds: 7));
+        await tester.pump(const Duration(seconds: 14));
         if (retryAlreadyStarted) {
           await tester.pump(const Duration(milliseconds: 750));
         }
@@ -716,7 +821,7 @@ void main() {
     peer.onError.listen(errors.add);
     peer.start();
     peers[0].register();
-    await tester.pump(const Duration(seconds: 7));
+    await tester.pump(const Duration(seconds: 14));
     await tester.pump(const Duration(milliseconds: 750));
     await tester.pump(const Duration(minutes: 1));
     expect(errors, [same(conflict)]);
@@ -765,7 +870,7 @@ void main() {
           ],
         )..start();
         peers[0].register();
-        await tester.pump(const Duration(seconds: 7));
+        await tester.pump(const Duration(seconds: 14));
         await tester.pump(const Duration(milliseconds: 750));
         expect(attempts, hasLength(2));
         await tester.pump(const Duration(milliseconds: 1250));
@@ -1208,7 +1313,11 @@ void main() {
     peer.start();
     await tester.pump(const Duration(seconds: 3));
     expect(errors, isEmpty, reason: 'The standby still has time to register');
-    await tester.pump(const Duration(seconds: 4));
+    expect(peers[0].disposed, isTrue);
+    await tester.pump(const Duration(milliseconds: 10999));
+    expect(errors, isEmpty);
+    expect(peers[1].disposed, isFalse);
+    await tester.pump(const Duration(milliseconds: 1));
     expect(errors, hasLength(1));
     expect(errors.single.kind, SignalingFailureKind.unavailable);
     expect(errors.single.message, contains('timed out'));
@@ -1218,6 +1327,51 @@ void main() {
     expect(opens, isEmpty, reason: 'Expired backends cannot revive the peer');
     expect(peer.open, isFalse);
   });
+
+  for (final readyAfter in [
+    const Duration(milliseconds: 7200),
+    const Duration(milliseconds: 13500),
+  ]) {
+    testSignaling(
+      'MQTT registration may finish after ${readyAfter.inMilliseconds} ms within its complete startup budget',
+      (tester) async {
+        final peer = wrapper();
+        final opens = <String?>[];
+        final errors = <SignalingFailure>[];
+        peer.onOpen.listen(opens.add);
+        peer.onError.listen(errors.add);
+        peer.start();
+        await tester.pump(readyAfter);
+        expect(peers.first.disposed, isTrue);
+        expect(
+          peers[1].disposed,
+          isFalse,
+          reason:
+              'Connect, SUBACK and identity claim have separate bounded stages.',
+        );
+        expect(errors, isEmpty);
+        peers[1].register();
+        await _settle(tester);
+        expect(opens, [_id]);
+        final channel = peer.connect('host');
+        channel.onError.listen((_) {});
+        await _settle(tester);
+        peers[1].outbound.single.openChannel();
+        await _settle(tester);
+        expect(channel.open, isTrue);
+        await tester.pump(const Duration(seconds: 15));
+        expect(errors, isEmpty);
+        expect(peer.open, isTrue);
+        expect(channel.open, isTrue);
+        expect(peers[1].disposed, isFalse);
+        expect(
+          peers.where((provider) => provider.service == 'MQTT'),
+          hasLength(1),
+        );
+        expect(peers[1].outbound, hasLength(1));
+      },
+    );
+  }
 
   testSignaling('late standby registration survives the primary deadline', (
     tester,

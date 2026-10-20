@@ -4,7 +4,7 @@
 
 ## Ownership and Source Map
 
-- [room_identity.dart](../../lib/room_identity.dart): ID generation/validation, invitation roles, URL/QR serialization, and strict invitation parsing.
+- [room_identity.dart](../../lib/room_identity.dart): ID generation/validation, invitation roles, immutable optional `RoomDiskAccess`, URL/QR serialization, and strict invitation/public-share validation.
 - [room_session.dart](../../lib/room_session.dart): admission, local command guards, durable role/binding projections, and participant views.
 - [room_document.dart](../../lib/room_document.dart): participant names, room name, and monotonic role projection.
 - [room_page.dart](../../lib/ui/room_page.dart): name prompts, create/join/restore navigation, and successful-exit handling.
@@ -35,26 +35,45 @@ https://host/application/#room=<roomId>&role=guest
 https://host/application/#room=<roomId>&role=editor
 ```
 
-`createRoomLink()` preserves the current host, port, and application path. Room and role parameters are in the fragment rather than the HTTP path/query. Invitation links are bearer-like discovery information and must stay private; fragment use is not cryptographic authorization.
+`createRoomLink()` preserves the current host, port, application path, and unrelated query. It replaces the original fragment completely. Room, role, and optional `disk` parameters stay in that fragment, not the HTTP path/query:
+
+```text
+https://host/application/#room=<roomId>&role=editor&disk=<base64url-payload>
+https://host/application/#room=<roomId>&role=guest&disk=<base64url-payload>
+```
+
+`disk` is compact UTF-8 JSON encoded as base64url, not encryption. Its exact version-1 schema is either `{v: 1, bindingId, token}` for an editor, or `{v: 1, bindingId, publicUrl}` for a guest. `bindingId` is the immutable active Disk connect-operation ID and uses bounded actor/edit-ID validation, not the hexadecimal room-ID rule. A token is nonempty, at most 4096 characters, unchanged by trimming, and contains no controls. The access JSON is bounded to 32 KiB on decoding. Guest share validation accepts HTTPS/443 links under `/d/…` on exactly `disk.yandex.ru`, `disk.yandex.com`, or `yadi.sk`, without userinfo or a fragment; it is distinct from the HTTP client's signed-download URL allowlist.
+
+Access and role must match; omitted roles mean guest and cannot carry an editor token. Unknown/mixed Disk fields, bad encoding/UTF-8, repeated fragment `room`/`peer`/`role`/`disk`, conflicting room aliases, and duplicate JSON security/access keys, including escaped keys, are rejected. Invalid access never degrades to a plain invitation or raw ID. Legacy unrelated JSON metadata remains permissive. The ID-only readers remain compatibility helpers, not admission validators. Validation failures do not quote the supplied URL, token, or JSON.
+
+Invitations without access keep their previous serialized form. A Disk-enabled invitation is bearer-like access information: an editor invitation contains an OAuth token, while a guest invitation carries public read access. Keep both private; fragment placement avoids sending the invitation to the application host but provides neither encryption nor cryptographic authorization.
 
 At web startup, `consumeRoomAddress()` captures the original URI and synchronously replaces the current browser history entry with its fragment-free form, before Flutter binding, storage, networking, or alias prompts. The original URI is passed to `RoomPage` for strict invitation parsing; invalid/cancelled invitations are scrubbed too. Hosting path and unrelated query parameters remain. The root Flutter route is always named `/`, never the invitation, and successful entry/menu navigation no longer writes room IDs into the address. Explicit Copy URL and QR still generate full role-aware invitations. Clean-address reload restores accepted membership through the existing last-room store; an unaccepted/cancelled invitation is not newly persisted just to survive refresh. Replacing this history entry does not erase external browsing history, revoke prior invitations, or protect local storage from someone with access to the browser profile.
 
 The production UI uses `parseRoomInvitation()` / `roomInvitationFromUri()`. Missing roles mean guest; unknown or repeated roles are rejected. Raw IDs are guest invitations. Legacy JSON QR payloads and the old `#peer` syntax can be parsed, but parsing an old transport ID does not recreate an ephemeral room. The caller still validates the stable room ID.
 
-QR codes contain an ordinary current-origin invitation URL when running on the web; native fallback QR data is JSON. There is no requirement for users to run a scanner service or connection server.
+QR codes contain a current-origin invitation URL on the web; native fallback QR data adds a nested `disk` object to the existing `{v: 1, peerId, role}` JSON when access is present. The invitation dialog's Copy Code action likewise includes the complete JSON invitation when Disk access is available; without it, Copy ID still copies only the ID. Long payloads can exceed QR capacity, so URL/code copying remains available. No scanner service or connection server is required. Editor-token sharing and first publication of guest access require separate explicit UI confirmations; opening or merely rendering the dialog does not publish a folder or expose the access value as selectable text.
 
 ## Creation, First Admission, and Restore
 
 1. `RoomPage` reads the client ID and last room, parses any incoming invitation, and checks saved membership.
 2. If no participant alias is saved, the UI offers an optional name before creation/admission. Accepting an empty value is an explicit anonymous alias; canceling is distinct and does not create a room or write an unaccepted profile. A saved empty alias does not prompt again on restore.
 3. Creating a new random room saves creator membership. Its creator is an editor and can explicitly establish the initial never-shared solo state.
-4. A fresh join must receive a valid compatible welcome from an online participant. The production tree profile requires `familyTree`, `familySurnames`, `personalSurnames`, `explicitSiblings`, `authorHistory`, and `participantIdentity` even for an empty room; rejection precedes history/profile/membership import. Signaling registration and an open DataChannel alone do not grant membership.
-5. Incoming entry history is validated for complete author prefixes before persistence; the participant's name/initial role use the same atomic authored-backlog path as other local edits. Admission rechecks that the channel/generation remains valid around asynchronous writes; then membership can be saved.
-6. The initial durable exchange still controls when the normal editor opens. A welcome is not the completed checkpoint.
+4. A fresh join using only an ID or a legacy/role-only invitation still requires a valid compatible welcome from an online participant. The production tree profile requires `familyTree`, `familySurnames`, `personalSurnames`, `explicitSiblings`, `authorHistory`, and `participantIdentity` even for an empty room; rejection precedes history/profile/membership import. Signaling registration and an open DataChannel alone do not grant membership. A valid Disk-enabled invitation supplies the separate bounded-history admission path below, without requiring another participant online.
+5. Incoming entry history is validated for complete author prefixes before persistence; the participant's name/initial role use the same atomic authored-backlog path as other local edits. Admission rechecks the current channel/generation or Disk-entry attempt around asynchronous writes; then membership can be saved.
+6. The normal editor opens after the applicable initial verification: a complete durable peer exchange, verified Disk admission, or explicit new-room solo initialization. A welcome alone is not a completed peer checkpoint.
 
 A failed membership write can leave already saved profile operations behind: storage is not a cross-record transaction with guaranteed rollback. Retry reads this residue, reuses immutable operations, and does not replace an existing explicit role or a later profile name.
 
-An accepted saved member restores local history and can reconnect without being admitted as a new participant. The UI may offer an explicit local-copy mode if initial synchronization cannot be established. That mode does not grant membership to a fresh client and does not claim successful synchronization.
+An accepted saved member restores local history and can reconnect without being admitted as a new participant. Matching retained editor credentials or guest public access can revalidate Disk history on reload without another participant online. The UI may offer an explicit local-copy mode if initial verification cannot be established. That mode does not grant membership to a fresh client and does not claim successful synchronization.
+
+### Admission from Disk
+
+Before starting RTC or the write-capable Disk replica, `RoomSession` reads the invited binding through `readDiskRoomHistory()`, using the same serialized admission/history queue. The read checks content-addressed filenames and bytes, room/binding envelopes, immutable conflicts, complete author predecessor/base closure over the union with retained local history, and that the invited binding is still active. It is bounded by a deadline, at most 2048 candidate batches, and an 8 MiB aggregate download. Session admission additionally requires an **explicit durable editor role for the active binding's owner**; the legacy implicit-editor fallback is not sufficient evidence.
+
+Only after validation does it merge/flush history, durably prepare the local alias/initial role, save the matching permitted access, and flush again. **Membership is committed last**, before the existing last-room pointer ordering. Attempt/generation and active-binding checks prevent late/cancelled work from accepting a stale entry. This is not a cross-record transaction: failure can leave valid history/profile/access residue, but that residue alone is not membership. Retry reuses it, and an existing explicit guest role is neither promoted by an editor invitation nor given a retained editor token.
+
+Successful Disk entry records `История загружена с Диска · онлайн-сверка продолжается` and opens the verified copy. It does not create a peer ACK, settle a live cohort, or manufacture local-tab readiness evidence. Ordinary RTC discovery/checkpoint exchange continues. The cloud inventory is the available validated copy, **not proof of the newest global history**: another offline editor can still have an unseen tail. “Without an online participant” still requires working access to Yandex Disk, not a device without Internet. Failed Disk reads/saves remain visible and can be retried or followed by ordinary online admission; no empty room or fabricated cloud success is substituted.
 
 ## Optional Participant Aliases
 
@@ -76,7 +95,9 @@ Display prefers the selected actor's nonempty alias, then the actively bound dur
 | Invite guests | Yes | Yes |
 | Invite editors / promote an existing guest | No | Yes |
 | Connect Yandex Disk when no binding is active | No | Yes |
-| Receive Disk credentials / manually synchronize with Disk | No | Yes, for the matching binding and available credential |
+| Receive an editor Disk token / manually synchronize with Disk | No | Yes, for the matching binding and available credential |
+| Read/poll Disk through retained public access | Yes, read-only, for the matching active binding | Public access can be used for entry; editor replication requires a token |
+| Publish the active binding folder for guest invitations | No | Explicit durable editor, matching credential, and publication consent |
 | Disconnect Yandex Disk | No | Owner actor, or editor bound to the same durable person as the owner |
 | Host or relay ordinary room history | Yes | Yes |
 
@@ -86,7 +107,7 @@ Effective roles come from the **durable** role projection. An optimistic promoti
 
 Tree commands validate local structural invariants in addition to the editor guard: known people/items, no locally introduced parent cycle (checked against every active direct-sibling member), and own-actor binding/release ownership and exact current claim. Atomic `createSibling` requires an existing source and unused new identity; existing-person sibling linking is not a command. `unlinkSibling` requires the exact active direct claim, retains assigned parents, and cannot remove a computed-only sibling relationship. These commands use the usual single-edit optimistic/save/error/retry path. New surname commands are person-scoped; the deprecated family helper emits a personal command, and raw shared-family commands are rejected locally. Personal clears inherit the father's canonical surname rather than exposing a legacy shared value. Surname payloads remain strictly validated and bounded to 200 runes by the [tree model](tree-model.md#canonical-surnames). Remote concurrent operations still require deterministic projection, rather than pretending local validation proves a globally serialized order. History decoding/replay and queued immutable retries still accept valid historical family records even when their editing representative is absent or in another family. The independent `personalSurnames` capability prevents older shared-surname clients from silently interpreting the same history differently.
 
-There is no demotion, removal, application-enforced access revocation, administrator hierarchy, signature chain, or authorization server. Roles do not imply that a Yandex Disk credential already exists, and guests must never receive one. The optional [Disk replica](yandex-disk.md) uses public connect/detach metadata and a separate editor-only secret exchange; it grants no new first-admission path.
+There is no demotion, removal, application-enforced access revocation, administrator hierarchy, signature chain, or authorization server. Roles do not imply that a Yandex Disk credential already exists, and guests must never retain an editor token. The optional [Disk replica](yandex-disk.md) uses public connect/detach metadata, separate editor-only credential delivery, and explicitly shared invitations. Its validated-history admission path is for trusted family clients, not new cryptographic authorization; a guest's public link grants reading, not cloud writes.
 
 ## Releasable Person Binding
 

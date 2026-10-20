@@ -8,6 +8,7 @@ import 'package:mytree_webrtc_demo/local/room_tabs.dart';
 import 'package:mytree_webrtc_demo/room_document.dart';
 import 'package:mytree_webrtc_demo/room_protocol.dart';
 import 'package:mytree_webrtc_demo/room_session.dart';
+import 'package:mytree_webrtc_demo/signaling/fallback_signaling.dart';
 import 'package:mytree_webrtc_demo/signaling/peerjs_signaling.dart';
 import 'package:mytree_webrtc_demo/signaling/signaling.dart';
 import 'package:mytree_webrtc_demo/storage/room_store.dart';
@@ -2817,6 +2818,197 @@ void main() {
       expect(room.onlineCount, 2);
       expect(await store.hasMembership(_roomId), isTrue);
       expect(store.membershipCalls, 1);
+    },
+  );
+
+  testRoomWidgets(
+    'fresh fallback join survives 7.2-second secondary registration and completes durable sync',
+    (tester) async {
+      final history = [
+        for (final edit in _authorChain('host', [
+          'older value',
+          'latest value',
+        ]))
+          edit.toJson(),
+      ];
+      final hostStore = _Store();
+      await hostStore.appendHistory(_roomId, history);
+      network.autoRegister = true;
+      final host = session(actor: 'host', store: hostStore);
+      await host.start();
+      await settle(tester);
+      network.autoRegister = false;
+
+      final appendGate = Completer<void>();
+      final membershipGate = Completer<void>();
+      final store = _Store()
+        ..appendGate = appendGate
+        ..membershipGate = membershipGate;
+      final primaries = <_StartupPeer>[];
+      final registrationTimers = <Timer>[];
+      addTearDown(() async {
+        for (final peer in primaries) {
+          await peer.closeEvents();
+        }
+      });
+      var attempts = 0;
+      final room = session(
+        member: false,
+        actor: 'fresh',
+        store: store,
+        factory: (id, configuration) {
+          attempts++;
+          return FallbackSignalingPeer(
+            id: id,
+            configuration: configuration,
+            providers: [
+              (id, _) {
+                final peer = _StartupPeer(
+                  id,
+                  failure: const SignalingFailure(
+                    SignalingFailureKind.unavailable,
+                    'Primary signaling is blocked',
+                  ),
+                );
+                primaries.add(peer);
+                return peer;
+              },
+              (id, configuration) {
+                final peer = network.create(id, configuration);
+                final transport = network.peers.last;
+                // Model a valid MQTT registration: connect 4.9 s + concurrent
+                // SUBACKs 1.7 s + probe 0.5 s + ephemeral claim 0.1 s = 7.2 s.
+                // MQTT stage behavior itself is covered in its protocol suite.
+                registrationTimers.add(
+                  Timer(const Duration(milliseconds: 7200), transport.register),
+                );
+                return peer;
+              },
+            ],
+          );
+        },
+      );
+      try {
+        await room.start();
+        await settle(tester);
+        final secondary = network.peers.last;
+        expect(secondary.id, matches(RegExp(r'^[0-9a-f]{32}$')));
+        // Pump in small steps: registration must be observed before the
+        // unchanged 8-second RoomSession registration deadline, not after it.
+        for (var i = 0; i < 71; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+          await settle(tester);
+        }
+        expect(
+          secondary.destroyed,
+          isFalse,
+          reason: 'the secondary must not be disposed at the old 7-second cap',
+        );
+        expect(secondary.open, isFalse);
+        expect(secondary.outbound, isEmpty);
+        expect(attempts, 1);
+        expect(room.joined, isFalse);
+        expect(room.initialSyncComplete, isFalse);
+        expect(store.membershipCalls, 0);
+        expect(await store.hasMembership(_roomId), isFalse);
+
+        await tester.pump(const Duration(milliseconds: 100));
+        await settle(tester);
+        expect(secondary.destroyed, isFalse);
+        expect(secondary.open, isTrue);
+        final channel = secondary.outbound.single;
+        expect(channel.peer, _alias);
+        expect(channel.open, isTrue);
+        expect(
+          _sentMessages(channel.other!)
+              .singleWhere((message) => message.type == RoomMessageType.welcome)
+              .durableSync,
+          isTrue,
+        );
+        expect(store.appendCalls, greaterThan(0));
+        expect(
+          room.joined,
+          isFalse,
+          reason: 'welcome history is not saved yet',
+        );
+        expect(store.membershipCalls, 0);
+
+        appendGate.complete();
+        await settle(tester);
+        expect(store.membershipCalls, 1);
+        expect(room.joined, isFalse, reason: 'membership must also be durable');
+        expect(room.initialSyncComplete, isFalse);
+        membershipGate.complete();
+        await settle(tester);
+        expect(room.joined, isTrue);
+        expect(await store.hasMembership(_roomId), isTrue);
+        expect(
+          room.initialSyncComplete,
+          isFalse,
+          reason: 'admission still needs the real host ready checkpoint ACK',
+        );
+
+        // The host uses its existing one-second cohort quiet interval.
+        for (var i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+          await settle(tester);
+        }
+        final digest = roomHistoryDigest(decodeRoomHistory(history));
+        expect(await store.loadHistory(_roomId), unorderedEquals(history));
+        expect([
+          host.initialSyncComplete,
+          room.initialSyncComplete,
+        ], everyElement(true));
+        expect([host.onlineCount, room.onlineCount], everyElement(2));
+        expect(room.text, 'latest value');
+        expect(room.initialSyncError, isNull);
+        expect(room.error, isNull);
+        expect(room.localCopyOpened, isFalse);
+        expect(
+          attempts,
+          1,
+          reason: '7.2-second readiness precedes session timeout',
+        );
+        expect(secondary.destroyed, isFalse);
+        expect(channel.disposed, isFalse);
+        final sent = _sentMessages(channel);
+        final received = _sentMessages(channel.other!);
+        for (final messages in [sent, received]) {
+          expect(
+            messages
+                .lastWhere((m) => m.type == RoomMessageType.checkpoint)
+                .syncDigest,
+            digest,
+          );
+        }
+        for (final (outbound, inbound) in [
+          (sent, received),
+          (received, sent),
+        ]) {
+          final checkpoint = outbound.lastWhere(
+            (m) => m.type == RoomMessageType.checkpoint,
+          );
+          expect(
+            inbound.any(
+              (m) =>
+                  m.type == RoomMessageType.syncAck &&
+                  m.syncId == checkpoint.syncId &&
+                  m.syncDigest == digest &&
+                  m.roomReady == true,
+            ),
+            isTrue,
+            reason:
+                'both real sessions must acknowledge the full saved history',
+          );
+        }
+        expect(tester.takeException(), isNull);
+      } finally {
+        for (final timer in registrationTimers) {
+          timer.cancel();
+        }
+        if (!appendGate.isCompleted) appendGate.complete();
+        if (!membershipGate.isCompleted) membershipGate.complete();
+      }
     },
   );
 

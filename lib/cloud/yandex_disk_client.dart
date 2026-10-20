@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
+import '../room_identity.dart' show isValidDiskPublicUrl;
 import 'yandex_http_stub.dart'
     if (dart.library.js_interop) 'yandex_http_web.dart';
 
@@ -20,9 +21,10 @@ class YandexDiskException implements Exception {
       : 'YandexDiskException (HTTP $statusCode): $message';
 }
 
-/// Private application-folder access; requires cloud_api:disk.app_folder.
+/// Private application-folder access and anonymous published-folder reads.
 ///
-/// Paths are supplied by the caller and must be `app:/mytree` or descendants.
+/// Private paths must be `app:/mytree` or descendants and require
+/// cloud_api:disk.app_folder. Public paths are relative to the shared folder.
 /// [timeout] bounds each complete operation, including pagination/read-back.
 /// Writes are immutable and confirmed by reading the actual remote bytes.
 /// An injected client remains owned by its caller.
@@ -49,6 +51,8 @@ class YandexDiskClient {
     'yadi.sk',
   ];
   static const _confirmationAttempts = 5;
+  static const _maxPublicItems = 2048;
+  static const _maxBodyBytes = 8 * 1024 * 1024;
 
   final http.Client _client;
   final bool _ownsClient;
@@ -79,18 +83,105 @@ class YandexDiskClient {
     );
   }
 
-  Future<List<String>> listFiles(String token, String path) async {
+  /// Publishes a private folder and confirms its share URL from metadata.
+  /// Callers must obtain explicit publication confirmation in the UI first.
+  Future<String> publishDirectory(String token, String path) async {
     _validate(token, path);
     final clock = Stopwatch()..start();
+    final published = await _api('PUT', '/resources/publish', token, {
+      'path': path,
+    }, clock);
+    _expect(published, 200);
+    // Never follow a link returned by PUT or infer success from its status alone.
+    final metadata = await _api('GET', '/resources', token, {
+      'path': path,
+      'fields': 'type,public_url',
+    }, clock);
+    _expect(metadata, 200);
+    final value = _json(metadata);
+    final publicUrl = value['public_url'];
+    if (value['type'] != 'dir' ||
+        publicUrl is! String ||
+        !isValidDiskPublicUrl(publicUrl)) {
+      throw _invalidResponse(metadata.statusCode);
+    }
+    return publicUrl;
+  }
+
+  /// [isCurrent] gates every subrequest; [deadline] is an absolute read budget.
+  /// Every response body is bounded to 8 MiB while streaming.
+  Future<List<String>> listFiles(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    _validate(token, path);
+    return _listFiles(
+      (offset, clock) => _api(
+        'GET',
+        '/resources',
+        token,
+        {
+          'path': path,
+          'fields': _listFields,
+          'limit': '1000',
+          'offset': '$offset',
+        },
+        clock,
+        isCurrent: isCurrent,
+        deadline: deadline,
+      ),
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+  }
+
+  /// Lists files without OAuth or browser cookies. Names remain untrusted;
+  /// the batch coordinator must validate them before constructing file paths.
+  Future<List<String>> listPublicFiles(
+    String publicUrl, {
+    String path = '/batches',
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    _validatePublic(publicUrl, path, file: false);
+    return _listFiles(
+      (offset, clock) {
+        final remaining = _maxPublicItems - offset;
+        return _publicApi(
+          '/public/resources',
+          {
+            'public_key': publicUrl,
+            'path': path,
+            'fields': _listFields,
+            'limit': '${remaining < 1000 ? remaining : 1000}',
+            'offset': '$offset',
+          },
+          clock,
+          isCurrent: isCurrent,
+          deadline: deadline,
+        );
+      },
+      maxItems: _maxPublicItems,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+  }
+
+  Future<List<String>> _listFiles(
+    Future<http.Response> Function(int, Stopwatch) page, {
+    int? maxItems,
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    final clock = Stopwatch()..start();
     final names = <String>[];
+    final seenNames = <String>{};
     var offset = 0;
     while (true) {
-      final response = await _api('GET', '/resources', token, {
-        'path': path,
-        'fields': _listFields,
-        'limit': '1000',
-        'offset': '$offset',
-      }, clock);
+      _remaining(clock, isCurrent: isCurrent, deadline: deadline);
+      final response = await page(offset, clock);
       _expect(response, 200);
       final embedded = _json(response)['_embedded'];
       if (embedded is! Map<String, dynamic>) {
@@ -107,6 +198,7 @@ class YandexDiskClient {
           pageOffset is! int ||
           limit is! int ||
           limit <= 0 ||
+          (maxItems != null && (total > maxItems || limit > 1000)) ||
           items.length > limit ||
           offset + items.length > total ||
           (items.isEmpty && offset < total)) {
@@ -119,16 +211,65 @@ class YandexDiskClient {
             (item['type'] != 'file' && item['type'] != 'dir')) {
           throw _invalidResponse(response.statusCode);
         }
-        if (item['type'] == 'file') names.add(item['name'] as String);
+        final name = item['name'] as String;
+        // Overlapping/repeated pages are not a complete remote inventory, even
+        // when their offsets and totals appear to progress consistently.
+        if (!seenNames.add(name)) throw _invalidResponse(response.statusCode);
+        if (item['type'] == 'file') names.add(name);
       }
       offset += items.length;
-      if (offset >= total) return names;
+      if (offset >= total) {
+        _remaining(clock, isCurrent: isCurrent, deadline: deadline);
+        return names;
+      }
     }
   }
 
-  Future<Uint8List> readFile(String token, String path) async {
+  /// [isCurrent] gates both metadata and transfer; [deadline] bounds both.
+  /// Downloads are bounded to 8 MiB while streaming, including private reads.
+  Future<Uint8List> readFile(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
     _validate(token, path);
-    return _readFile(token, path, Stopwatch()..start());
+    return _readFile(
+      token,
+      path,
+      Stopwatch()..start(),
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+  }
+
+  /// Downloads an untrusted public batch, bounded to 8 MiB while streaming.
+  Future<Uint8List> readPublicFile(
+    String publicUrl,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    _validatePublic(publicUrl, path, file: true);
+    final clock = Stopwatch()..start();
+    final link = await _publicApi(
+      '/public/resources/download',
+      {'public_key': publicUrl, 'path': path},
+      clock,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+    _expect(link, 200);
+    final response = await _send(
+      'GET',
+      _link(link),
+      clock,
+      followDownloadRedirects: true,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+    _expect(response, 200);
+    return response.bodyBytes;
   }
 
   Future<void> writeFile(String token, String path, Uint8List bytes) async {
@@ -163,17 +304,27 @@ class YandexDiskClient {
   Future<Uint8List> _readFile(
     String token,
     String path,
-    Stopwatch clock,
-  ) async {
-    final link = await _api('GET', '/resources/download', token, {
-      'path': path,
-    }, clock);
+    Stopwatch clock, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    final link = await _api(
+      'GET',
+      '/resources/download',
+      token,
+      {'path': path},
+      clock,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
     _expect(link, 200);
     final response = await _send(
       'GET',
       _link(link),
       clock,
       followDownloadRedirects: true,
+      isCurrent: isCurrent,
+      deadline: deadline,
     );
     _expect(response, 200);
     return response.bodyBytes;
@@ -224,12 +375,30 @@ class YandexDiskClient {
     String resource,
     String token,
     Map<String, String> query,
-    Stopwatch clock,
-  ) => _send(
+    Stopwatch clock, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) => _send(
     method,
     Uri.parse('$_endpoint$resource').replace(queryParameters: query),
     clock,
     token: token,
+    isCurrent: isCurrent,
+    deadline: deadline,
+  );
+
+  Future<http.Response> _publicApi(
+    String resource,
+    Map<String, String> query,
+    Stopwatch clock, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) => _send(
+    'GET',
+    Uri.parse('$_endpoint$resource').replace(queryParameters: query),
+    clock,
+    isCurrent: isCurrent,
+    deadline: deadline,
   );
 
   Future<http.Response> _send(
@@ -239,9 +408,15 @@ class YandexDiskClient {
     String? token,
     Uint8List? bytes,
     bool followDownloadRedirects = false,
+    bool Function()? isCurrent,
+    DateTime? deadline,
   }) async {
     _ensureOpen();
-    final remaining = _remaining(clock);
+    final remaining = _remaining(
+      clock,
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
     final abort = Completer<void>();
     final request =
         http.AbortableRequest(method, uri, abortTrigger: abort.future)
@@ -255,17 +430,64 @@ class YandexDiskClient {
       request.headers['Content-Type'] = 'application/octet-stream';
       request.bodyBytes = bytes;
     }
+    StreamIterator<List<int>>? body;
     try {
       // Apply the deadline to both receiving headers and consuming the body.
       return await (() async {
         final response = await _client.send(request);
+        // Even clients that ignore abortTrigger must not consume a late body.
+        if (abort.isCompleted) {
+          _discardBody(response);
+          throw TimeoutException('');
+        }
+        try {
+          _remaining(clock, isCurrent: isCurrent, deadline: deadline);
+        } catch (_) {
+          _discardBody(response);
+          rethrow;
+        }
         if (followDownloadRedirects &&
             response is http.BaseResponseWithUrl &&
             !_trustedTransferUri((response as http.BaseResponseWithUrl).url)) {
-          await response.stream.listen((_) {}).cancel();
+          _discardBody(response);
           throw _invalidResponse(response.statusCode);
         }
-        return http.Response.fromStream(response);
+        final declaredLength = response.contentLength;
+        final lengthHeader = response.headers['content-length'];
+        final headerLength = int.tryParse(lengthHeader ?? '');
+        if (lengthHeader != null &&
+            (headerLength == null || headerLength < 0)) {
+          _discardBody(response);
+          throw _invalidResponse(response.statusCode);
+        }
+        if ((declaredLength != null && declaredLength > _maxBodyBytes) ||
+            (headerLength != null && headerLength > _maxBodyBytes)) {
+          _discardBody(response);
+          throw _bodyTooLarge(response.statusCode);
+        }
+        final reader = StreamIterator<List<int>>(response.stream);
+        body = reader;
+        final received = BytesBuilder(copy: false);
+        var length = 0;
+        while (await reader.moveNext()) {
+          _remaining(clock, isCurrent: isCurrent, deadline: deadline);
+          final chunk = reader.current;
+          length += chunk.length;
+          if (length > _maxBodyBytes) {
+            throw _bodyTooLarge(response.statusCode);
+          }
+          received.add(chunk);
+        }
+        _remaining(clock, isCurrent: isCurrent, deadline: deadline);
+        return http.Response.bytes(
+          received.takeBytes(),
+          response.statusCode,
+          request: response.request,
+          headers: response.headers,
+          isRedirect: response.isRedirect,
+          persistentConnection: response.persistentConnection,
+          reasonPhrase: response.reasonPhrase,
+        );
       })().timeout(remaining);
     } on YandexDiskException {
       rethrow;
@@ -281,11 +503,56 @@ class YandexDiskClient {
       // Future.timeout alone leaves Fetch/body consumption alive. Releasing the
       // trigger also frees the adapter's cancellation callback after success.
       abort.complete();
+      final reader = body;
+      if (reader != null) {
+        // Cleanup must not outlive the operation's deadline or replace a safe
+        // error with transport details from a failing cancellation callback.
+        try {
+          unawaited(reader.cancel().catchError((Object _) {}));
+        } catch (_) {
+          // Some injected transports also throw synchronously during cleanup.
+        }
+      }
+      // Complete the request lifecycle before its caller can start a follow-up
+      // page/transfer. Async abort listeners may invalidate the read guard;
+      // without this barrier an await fast path can send once more first.
+      // Await only our completed signal, never transport cancellation futures.
+      await abort.future;
     }
   }
 
-  Duration _remaining(Stopwatch clock) {
-    final remaining = _timeout - clock.elapsed;
+  static void _discardBody(http.StreamedResponse response) {
+    try {
+      unawaited(
+        response.stream.listen((_) {}).cancel().catchError((Object _) {}),
+      );
+    } catch (_) {
+      // The request's abort trigger is also released in _send's finally block.
+    }
+  }
+
+  Duration _remaining(
+    Stopwatch clock, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) {
+    _ensureOpen();
+    if (isCurrent != null) {
+      var current = false;
+      try {
+        current = isCurrent();
+      } catch (_) {
+        // A guard may capture credentials; never expose its original failure.
+      }
+      if (!current) {
+        throw const YandexDiskException('Чтение Яндекс Диска отменено.');
+      }
+    }
+    var remaining = _timeout - clock.elapsed;
+    if (deadline != null) {
+      final absoluteRemaining = deadline.difference(DateTime.now());
+      if (absoluteRemaining < remaining) remaining = absoluteRemaining;
+    }
     if (remaining <= Duration.zero) {
       throw const YandexDiskException(
         'Время ожидания ответа Яндекс Диска истекло.',
@@ -314,6 +581,31 @@ class YandexDiskClient {
         segments.any((part) => part.isEmpty || part == '.' || part == '..')) {
       throw const YandexDiskException(
         'Путь должен находиться в папке app:/mytree.',
+      );
+    }
+  }
+
+  void _validatePublic(String publicUrl, String path, {required bool file}) {
+    _ensureOpen();
+    if (!isValidDiskPublicUrl(publicUrl)) {
+      throw const YandexDiskException(
+        'Не указана корректная публичная ссылка Яндекс Диска.',
+      );
+    }
+    final segments = path.split('/');
+    final canonical = file
+        ? segments.length == 3 &&
+              segments[0].isEmpty &&
+              segments[1] == 'batches' &&
+              segments[2].isNotEmpty &&
+              segments[2] != '.' &&
+              segments[2] != '..'
+        : path == '/batches';
+    if (!canonical ||
+        path.contains('\\') ||
+        RegExp(r'[\x00-\x1f\x7f-\x9f]').hasMatch(path)) {
+      throw const YandexDiskException(
+        'Путь должен находиться в публичной папке /batches.',
       );
     }
   }
@@ -358,6 +650,11 @@ class YandexDiskClient {
   static void _expect(http.Response response, int status) {
     if (response.statusCode != status) throw _httpError(response.statusCode);
   }
+
+  static YandexDiskException _bodyTooLarge(int status) => YandexDiskException(
+    'Ответ Яндекс Диска превышает допустимый размер 8 МиБ.',
+    statusCode: status,
+  );
 
   static YandexDiskException _invalidResponse(int status) =>
       YandexDiskException(

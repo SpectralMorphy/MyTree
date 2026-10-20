@@ -61,9 +61,31 @@ abstract class RoomStore {
     throw UnsupportedError('This store cannot persist Disk credentials');
   });
 
-  /// Signals history (and optionally credential) changes from other browser
-  /// tabs. Subscribe before loading, then reload on each signal. No payload is
-  /// exposed through this stream. Native/memory stores do not broadcast.
+  /// Local-only anonymous read access: exactly {v: 1, bindingId, publicUrl}.
+  /// Separate from editor credentials and history, bound to its room's storage
+  /// key. Only the current pointer is retained; no binding archive or token.
+  /// Missing data returns null; malformed data and unsupported stores throw.
+  Future<Map<String, dynamic>?> loadDiskPublicAccess(String roomId) =>
+      Future.sync(() {
+        requireDiskPublicAccessRoomId(roomId);
+        throw UnsupportedError('This store cannot persist Disk public access');
+      });
+
+  /// Snapshot before asynchronous work. Null removes only the public pointer,
+  /// never credentials, history, or membership. Errors must not echo URLs.
+  /// Custom stores must opt in to persistence, never use an ephemeral fallback.
+  Future<void> saveDiskPublicAccess(
+    String roomId,
+    Map<String, dynamic>? value,
+  ) => Future.sync(() {
+    requireDiskPublicAccessRoomId(roomId);
+    if (value != null) snapshotDiskPublicAccess(value);
+    throw UnsupportedError('This store cannot persist Disk public access');
+  });
+
+  /// Signals history (and optionally credential/public-access) changes from
+  /// other browser tabs. Subscribe before loading, then reload on each signal.
+  /// No payload is exposed. Native/memory stores do not broadcast.
   Stream<void> watchHistory(String roomId) => const Stream<void>.empty();
 
   /// Append detached JSON snapshots. IDs must be nonempty strings and are
@@ -313,6 +335,28 @@ class MemoryRoomStore extends RoomStore {
   final _diskCredentials = <String, Map<String, dynamic>>{};
   final _diskCredentialsByBinding =
       <String, Map<String, Map<String, dynamic>>>{};
+  final _diskPublicAccess = <String, Map<String, dynamic>>{};
+
+  @override
+  Future<Map<String, dynamic>?> loadDiskPublicAccess(String roomId) =>
+      Future.sync(() {
+        requireDiskPublicAccessRoomId(roomId);
+        final value = _diskPublicAccess[roomId];
+        return value == null ? null : snapshotDiskPublicAccess(value);
+      });
+
+  @override
+  Future<void> saveDiskPublicAccess(
+    String roomId,
+    Map<String, dynamic>? value,
+  ) => Future.sync(() {
+    requireDiskPublicAccessRoomId(roomId);
+    if (value == null) {
+      _diskPublicAccess.remove(roomId);
+    } else {
+      _diskPublicAccess[roomId] = snapshotDiskPublicAccess(value);
+    }
+  });
 
   @override
   Future<Map<String, dynamic>?> loadDiskCredentials(

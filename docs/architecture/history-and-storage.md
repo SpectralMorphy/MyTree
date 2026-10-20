@@ -124,7 +124,7 @@ Disposal cancels watching and notifications, **not an append already started**. 
 
 ## Watching and refreshing shared history
 
-`WebRoomStore.watchHistory` listens for browser `storage` events for that room's operation and separate Disk-credential keys. The stream is only a void reload signal; it supplies no journal or credential payload. Native and memory stores expose an empty watch stream.
+`WebRoomStore.watchHistory` listens for browser `storage` events for that room's operation, separate Disk-credential keys, and public-access pointer. The stream is only a void reload signal; it supplies no journal, credential, or public URL payload. Native and memory stores expose an empty watch stream.
 
 For an existing member, `RoomHistory.load()` validates and imports stored history, subscribes, then schedules another read to close the read/subscribe gap. During saved-alias restoration the page can pass its already decoded store snapshot through the session as `initialHistory`, avoiding a duplicate initial read; the history still validates the complete author prefix and retains that gap-closing refresh. A displayed name prompt discards the earlier snapshot so accepting the prompt reloads current storage. A fresh member enables watching only when the session accepts it via `watchAcceptedHistory()`. Neither a watch event nor an already present record grants membership or confirms synchronization.
 
@@ -144,6 +144,7 @@ A refresh decodes and checks the whole stored history, immutable IDs/cores, and 
 | `room.K(roomId).operation.K(editId)` | One canonical JSON operation object. |
 | `room.K(roomId).disk-credentials` | Latest plaintext credential pointer retained for compatibility; never a journal operation. |
 | `room.K(roomId).disk-credentials.binding.K(bindingId)` | Binding-scoped plaintext credential archive, preserving staged connects and final-detach retries. |
+| `room.K(roomId).disk-public-access` | One current plaintext `{v: 1, bindingId, publicUrl}` pointer for anonymous reads, separate from tokens and history. |
 
 A short exclusive **per-room journal Web Lock**, `mytree.room-store.v1.journal.K(roomId)`, protects authored appends, incoming imports, and loads across store instances/tabs. It is shared by all actors writing that room and distinct from the identity lock and lifetime network-owner lock. Inside it, the store scans the room, checks the complete combined history, and writes only new operation keys in predecessor-first order. Authored appends allocate proofs there and return the full canonical history. This reads the journal on append but does **not rewrite** the full room or change old records.
 
@@ -164,6 +165,7 @@ member-K(roomId).json
 history-K(roomId).jsonl
 disk-credentials-K(roomId).json
 disk-credentials-K(roomId).binding.H(bindingId).json
+disk-public-access-K(roomId).json
 ```
 
 For native credential archives, `H(bindingId)` is 64 lowercase SHA-256 hex characters of the UTF-8 binding ID; the payload retains and validates the exact original ID. This bounds filename-component length even for the maximum valid Unicode identity. Browser archive suffixes still use `K(bindingId)`.
@@ -192,11 +194,23 @@ Credentials may be staged before their connect edit exists, using the optional v
 
 Saving null **with** a binding selector removes only that archive and a matching latest pointer; null **without** a selector clears every credential archive/pointer for that room, including native interrupted temporary files. Neither operation removes membership, last room, journal, or tree. Credential keys/files are separate from journal keys, and old latest-only records remain readable without a journal migration. Browser `watchHistory` includes pointer/archive changes but emits only void reload signals. Cloud coordination and final-detach retention are documented in [Yandex Disk](yandex-disk.md).
 
-All credentials have the same plain-JSON/local-origin or filesystem protection as current app storage, **not encryption or OS secret-vault guarantees**. They are never returned by `loadHistory`, projected into ordinary room records, or included in tree exports.
+All credentials have the same plain-JSON/local-origin or filesystem protection as current app storage, **not encryption or OS secret-vault guarantees**. They are never returned by `loadHistory`, projected into ordinary room records, or included in tree exports. Explicit editor invitation sharing can serialize the matching token outside history; it does not change this storage boundary or the store's stricter printable-ASCII token contract.
+
+### Separate public Disk access
+
+`RoomStore.loadDiskPublicAccess(roomId)` / `saveDiskPublicAccess(roomId, value)` persist exactly `{v: 1, bindingId: String, publicUrl: String}` for a canonical application room ID. Binding IDs use bounded actor/edit-ID validation. The shared identity validator restricts links to recognized HTTPS/443 `/d/…` shares on exactly `disk.yandex.ru`, `disk.yandex.com`, or `yadi.sk`, without userinfo or a fragment. Unknown/mixed/token fields, malformed types/versions, duplicate stored JSON keys, and invalid links are errors, not repaired data; error text never echoes the source URL.
+
+This is one **current pointer**, not another credential archive or a room operation. Inputs/results are detached snapshots. Missing values return null; null saves remove only this public pointer, never editor credentials, membership, last room, or history. Browser storage uses the separate key above; native storage uses its existing per-instance queue and a flushed temporary-file/rename update, with explicit removal also clearing an interrupted temporary file. Persistence/unsupported-store errors propagate rather than falling back to ephemeral access; `MemoryRoomStore` supports detached in-memory values explicitly for tests.
+
+A retained public link is bearer-like read access, still plain JSON, and is excluded from journal/export/tab-message payloads. Session logic—not storage—checks that it matches the active binding, requires owner/editor evidence for admission, and enables read-only guest polling. Changing a local pointer does not publish/unpublish a provider folder or revoke a copied link. Public-pointer changes use the same void browser watch signal as credentials, without broadcasting the URL.
 
 ## Membership and storage identity
 
 Both persistent stores write membership **before** updating `last-room`. A failure updating the latter may leave valid membership saved; the reverse ordering is forbidden. Reading a last-room reference without corresponding membership is an error. Missing data on first use is normal; malformed existing data is not silently treated as an empty room. Leaving the UI does not delete membership or clear the last room.
+
+For fresh [Disk admission](yandex-disk.md#offline-capable-invitations-publication-and-admission), membership is the **last admission commit**, after bounded validated cloud/local history has been imported and flushed, the local profile/initial role is durable, and role-permitted editor credentials or public access have been saved and flushed. The session rechecks active-binding/explicit-owner-editor evidence and the current attempt around these writes. After membership it refreshes/revalidates the accepted copy without authoring another profile operation. Existing explicit guest roles survive retries/editor invitations and do not retain an invited editor token.
+
+This sequence is not a transaction spanning journal, access metadata, membership, and last room. A failed/cancelled entry can leave already durable history/profile/access residue without membership; retry reuses immutable records. Neither that residue, a storage notification, nor possession of a raw room ID grants entry. Cloud-read readiness is also separate from peer ACKs, cloud upload acknowledgment, and proof that no offline device has newer history.
 
 The stored client ID becomes the session's `actorId` and edit author. It is local storage identity, not an account login or tree person identity. A durable `bindActor` tree operation can associate several different actors with one person; only editor actors use active claims for visible participant grouping/name/avatar. An own `unbindActor` releases only its exact claim, leaving the other grouped actors and historical authors unchanged. Legacy guest claims remain persisted but are inactive until durable promotion, rather than being deleted or rewritten. Neither binding nor release merges actor roles/membership or changes the room/actor scope of [local tab ownership](local-tabs.md). See [Rooms and identity](rooms-and-identity.md).
 

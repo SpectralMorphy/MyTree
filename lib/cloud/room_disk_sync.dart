@@ -5,8 +5,355 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 
 import '../room_document.dart';
+import '../room_identity.dart';
 import '../room_protocol.dart';
+import 'disk_binding.dart';
 import 'yandex_disk_client.dart';
+
+final _diskBatchName = RegExp(r'^[0-9a-f]{64}\.json$');
+const _maxDiskHistoryBatches = 2048;
+
+List<RoomEdit> _decodeDiskBatch(
+  Uint8List bytes, {
+  required String name,
+  required String roomId,
+  required String bindingId,
+}) {
+  if (bytes.length > maxRoomTransferBytes ||
+      '${sha256.convert(bytes)}.json' != name) {
+    throw const FormatException('Облачный пакет повреждён');
+  }
+  final value = jsonDecode(utf8.decode(bytes));
+  if (value is! Map ||
+      value['v'] != 1 ||
+      value['roomId'] != roomId ||
+      value['bindingId'] != bindingId) {
+    throw const FormatException('Пакет другой комнаты или подключения');
+  }
+  return decodeRoomHistory(value['history']);
+}
+
+/// Reads an admission snapshot without preparing, merging, or writing anything.
+///
+/// Public access is rooted at the binding folder, not the application folder.
+/// The returned canonical union includes [localHistory], which may supply author
+/// predecessors or a later disconnect. Admission/role checks remain with callers.
+/// [allowFinalDisconnect] is only for an established guest with this binding
+/// already active in [localHistory], never for accepting a fresh invitation.
+/// The client owns individual request cancellation; after this overall deadline,
+/// a late response can never start another request or return a successful result.
+Future<List<RoomEdit>> readDiskRoomHistory({
+  required YandexDiskClient client,
+  required String roomId,
+  required RoomDiskAccess access,
+  List<RoomEdit> localHistory = const [],
+  bool Function()? isCurrent,
+  Duration timeout = const Duration(seconds: 30),
+  bool allowFinalDisconnect = false,
+}) async {
+  final clock = Stopwatch()..start();
+  final deadline = DateTime.now().add(timeout);
+  var stopped = false;
+
+  bool requestIsCurrent() {
+    if (stopped ||
+        clock.elapsed >= timeout ||
+        !DateTime.now().isBefore(deadline) ||
+        !(isCurrent?.call() ?? true)) {
+      stopped = true;
+      return false;
+    }
+    return true;
+  }
+
+  void checkCurrent() {
+    if (!requestIsCurrent()) {
+      throw StateError('Чтение истории с Диска прервано');
+    }
+  }
+
+  Future<List<RoomEdit>> readSnapshot() async {
+    checkCurrent();
+    // A binding ID is also a private path segment; the identity schema alone
+    // permits characters that must never become cloud path components.
+    if (!isValidRoomId(roomId) ||
+        !isValidRoomActor(access.bindingId) ||
+        access.bindingId == '.' ||
+        access.bindingId == '..' ||
+        RegExp(r'[/\\\x00-\x1f\x7f-\x9f]').hasMatch(access.bindingId)) {
+      throw const FormatException('Неверное подключение Диска');
+    }
+    final local = List<RoomEdit>.of(localHistory);
+    final directory = 'app:/mytree/$roomId/${access.bindingId}/batches';
+    checkCurrent();
+    final files = access.isEditor
+        ? await client.listFiles(
+            access.token!,
+            directory,
+            isCurrent: requestIsCurrent,
+            deadline: deadline,
+          )
+        : await client.listPublicFiles(
+            access.publicUrl!,
+            path: '/batches',
+            isCurrent: requestIsCurrent,
+            deadline: deadline,
+          );
+    checkCurrent();
+    final candidates = files.where((name) => name.endsWith('.json')).toList();
+    if (candidates.isEmpty || candidates.length > _maxDiskHistoryBatches) {
+      throw const FormatException('Неверное число облачных пакетов');
+    }
+    // Validate every name before constructing any download path.
+    if (candidates.any((name) => !_diskBatchName.hasMatch(name))) {
+      throw const FormatException('Неверное имя облачного пакета');
+    }
+    final remote = <RoomEdit>[];
+    var downloadedBytes = 0;
+    for (final name in candidates.toSet().toList()..sort()) {
+      checkCurrent();
+      final bytes = access.isEditor
+          ? await client.readFile(
+              access.token!,
+              '$directory/$name',
+              isCurrent: requestIsCurrent,
+              deadline: deadline,
+            )
+          : await client.readPublicFile(
+              access.publicUrl!,
+              '/batches/$name',
+              isCurrent: requestIsCurrent,
+              deadline: deadline,
+            );
+      checkCurrent();
+      downloadedBytes += bytes.length;
+      if (downloadedBytes > maxRoomTransferBytes) {
+        throw const FormatException('Облачная история превышает 8 МиБ');
+      }
+      remote.addAll(
+        _decodeDiskBatch(
+          bytes,
+          name: name,
+          roomId: roomId,
+          bindingId: access.bindingId,
+        ),
+      );
+    }
+    if (remote.isEmpty) {
+      throw const FormatException('Облачная история пуста');
+    }
+    final combined = validateAuthorHistory([...local, ...remote]);
+    var combinedBytes = 2; // JSON array brackets, plus records and separators.
+    var first = true;
+    for (final edit in combined) {
+      checkCurrent();
+      if (!first) combinedBytes++;
+      first = false;
+      combinedBytes += utf8.encode(jsonEncode(edit.toJson())).length;
+      if (combinedBytes > maxRoomTransferBytes) {
+        throw const FormatException('История комнаты превышает 8 МиБ');
+      }
+    }
+    final binding = DiskBinding.project(combined);
+    final finalDisconnect =
+        allowFinalDisconnect &&
+        !access.isEditor &&
+        binding == null &&
+        DiskBinding.project(local)?.id == access.bindingId &&
+        _hasFinalDiskDisconnect(combined, access.bindingId);
+    if (binding?.id != access.bindingId && !finalDisconnect) {
+      throw const FormatException('Подключение Диска больше не активно');
+    }
+    checkCurrent();
+    return List<RoomEdit>.unmodifiable(combined);
+  }
+
+  try {
+    final history = await readSnapshot().timeout(
+      timeout,
+      onTimeout: () {
+        stopped = true;
+        throw StateError('Время чтения истории с Диска истекло');
+      },
+    );
+    checkCurrent();
+    return history;
+  } catch (_) {
+    // JSON/transport/platform failures may contain source text, tokens or URLs.
+    // No external exception, including a client-supplied message, escapes here.
+    throw StateError('Не удалось прочитать подтверждённую историю с Диска.');
+  } finally {
+    stopped = true;
+    clock.stop();
+  }
+}
+
+// Called only on a schema/prefix-validated union whose final projection is null.
+// An unrelated/stale disconnect is not evidence this binding was ever active.
+bool _hasFinalDiskDisconnect(List<RoomEdit> history, String bindingId) {
+  final operations =
+      history.where((edit) => edit.kind == RoomEditKind.diskConnection).toList()
+        ..sort((left, right) => left.compareTo(right));
+  final connect = operations.indexWhere(
+    (edit) =>
+        edit.id == bindingId &&
+        (jsonDecode(edit.text) as Map)['action'] == 'connect',
+  );
+  if (connect < 0) return false;
+  for (var index = connect + 1; index < operations.length; index++) {
+    final payload = jsonDecode(operations[index].text) as Map;
+    if (payload['action'] == 'disconnect' &&
+        payload['bindingId'] == bindingId) {
+      return DiskBinding.project(operations.take(index))?.id == bindingId;
+    }
+  }
+  return false;
+}
+
+/// Polls a guest's published binding without ever preparing or uploading files.
+/// Established guests can import its terminal disconnect, then stop polling.
+/// A successful read says nothing about cloud persistence of local guest edits.
+class RoomDiskReadSync {
+  RoomDiskReadSync({
+    required this.roomId,
+    required this.client,
+    required this.readHistory,
+    required this.mergeHistory,
+    required this.onChanged,
+    this.pollInterval = const Duration(seconds: 30),
+  });
+
+  final String roomId;
+  final YandexDiskClient client;
+  final List<RoomEdit> Function() readHistory;
+  final Future<void> Function(List<RoomEdit>) mergeHistory;
+  final void Function() onChanged;
+  final Duration pollInterval;
+  RoomDiskAccess? _access;
+  bool _enabled = false;
+  bool _disposed = false;
+  bool _hasRead = false;
+  bool _finalDisconnected = false;
+  int _generation = 0;
+  Timer? _timer;
+  Future<void>? _running;
+  String? error;
+
+  bool get busy => _running != null;
+
+  String get status {
+    if (_access == null) return 'Нет гостевого доступа к Диску';
+    if (_finalDisconnected) return 'Подключение Диска отключено';
+    if (!_enabled) return 'Чтение Диска приостановлено';
+    if (busy) return 'Чтение истории с Диска…';
+    if (error != null) return 'Диск недоступен · история сохранена локально';
+    if (_hasRead) return 'История прочитана с Диска';
+    return 'Ожидаем историю с Диска';
+  }
+
+  void update({RoomDiskAccess? access, required bool enabled}) {
+    if (_disposed) return;
+    final publicAccess = access != null && !access.isEditor ? access : null;
+    final changed = publicAccess != _access;
+    if (changed) {
+      _hasRead = false;
+      _finalDisconnected = false;
+      error = null;
+    }
+    final nextEnabled = enabled && !_finalDisconnected;
+    if (changed || nextEnabled != _enabled) _generation++;
+    _access = publicAccess;
+    _enabled = nextEnabled;
+    if (!nextEnabled || publicAccess == null) {
+      _timer?.cancel();
+      _timer = null;
+    } else if (changed || _timer == null) {
+      schedule();
+    }
+  }
+
+  bool _current(int generation) =>
+      !_disposed && _enabled && _access != null && generation == _generation;
+
+  void schedule() {
+    if (_disposed || !_enabled || _access == null) return;
+    _timer?.cancel();
+    _timer = Timer(const Duration(milliseconds: 800), () {
+      _timer = null;
+      unawaited(sync().catchError((Object _) {}));
+    });
+  }
+
+  Future<void> sync() {
+    if (_disposed || !_enabled || _access == null) {
+      return Future.error(StateError('Нет гостевого доступа к Диску'));
+    }
+    final running = _running;
+    if (running != null) return running;
+    final generation = _generation;
+    final access = _access!;
+    _timer?.cancel();
+    _timer = null;
+    late final Future<void> result;
+    result = _read(access, generation)
+        .then((_) {
+          if (_current(generation)) error = null;
+        })
+        .catchError((Object _) {
+          const message =
+              'Не удалось прочитать историю с Диска. Повторим позже.';
+          if (_current(generation)) error = message;
+          throw StateError(message);
+        })
+        .whenComplete(() {
+          if (identical(_running, result)) _running = null;
+          if (_disposed) return;
+          onChanged();
+          if (_enabled && _access != null) {
+            _timer?.cancel();
+            _timer = Timer(
+              _current(generation) ? pollInterval : Duration.zero,
+              () {
+                _timer = null;
+                unawaited(sync().catchError((Object _) {}));
+              },
+            );
+          }
+        });
+    _running = result;
+    onChanged();
+    return result;
+  }
+
+  Future<void> _read(RoomDiskAccess access, int generation) async {
+    if (!_current(generation)) return;
+    final history = await readDiskRoomHistory(
+      client: client,
+      roomId: roomId,
+      access: access,
+      localHistory: readHistory(),
+      isCurrent: () => _current(generation),
+      allowFinalDisconnect: true,
+    );
+    if (!_current(generation)) return;
+    await mergeHistory(history);
+    if (!_current(generation)) return;
+    _hasRead = true;
+    if (DiskBinding.project(history) == null) {
+      _finalDisconnected = true;
+      error = null;
+      update(access: access, enabled: false);
+    }
+  }
+
+  void dispose() {
+    _disposed = true;
+    _generation++;
+    _timer?.cancel();
+    _timer = null;
+    // The session shares this client with other Disk operations.
+  }
+}
 
 /// A second durable replica. It never authors edits, changes room admission, or
 /// replaces a shared cloud file: batches are immutable and content-addressed.
@@ -159,25 +506,19 @@ class RoomDiskSync {
     final remote = <String, RoomEdit>{};
     var totalBytes = 0;
     for (final name in names.toList()..sort()) {
-      if (!RegExp(r'^[0-9a-f]{64}\.json$').hasMatch(name)) {
+      if (!_diskBatchName.hasMatch(name)) {
         throw const FormatException('Неверное имя облачного пакета');
       }
       var edits = _batches[name];
       if (edits == null) {
         final bytes = await client.readFile(token, '$directory/$name');
         if (!_current(generation)) return;
-        if (bytes.length > maxRoomTransferBytes ||
-            '${sha256.convert(bytes)}.json' != name) {
-          throw const FormatException('Облачный пакет повреждён');
-        }
-        final value = jsonDecode(utf8.decode(bytes));
-        if (value is! Map ||
-            value['v'] != 1 ||
-            value['roomId'] != roomId ||
-            value['bindingId'] != bindingId) {
-          throw const FormatException('Пакет другой комнаты или подключения');
-        }
-        edits = decodeRoomHistory(value['history']);
+        edits = _decodeDiskBatch(
+          bytes,
+          name: name,
+          roomId: roomId,
+          bindingId: bindingId,
+        );
         _batches[name] = edits;
       }
       for (final edit in edits) {

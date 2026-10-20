@@ -494,6 +494,19 @@ void main() {
     return actor;
   }
 
+  testWidgets('tree toolbar sits flush under the room header', (tester) async {
+    await mount(tester, useDefaultEditor: true);
+    await tester.tap(find.text('Создать комнату'));
+    await answerNamePrompt(tester);
+    final header = tester.getRect(find.byType(AppBar));
+    final toolbar = tester.getRect(find.byKey(const Key('tree-toolbar')));
+    expect(toolbar.top, closeTo(header.bottom, .1));
+    expect(toolbar.left, closeTo(header.left, .1));
+    expect(toolbar.right, closeTo(header.right, .1));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets(
     'default room editor shows the root and saves biography immediately',
     (tester) async {
@@ -1770,7 +1783,14 @@ void main() {
       await tester.tap(find.text('Присоединиться'));
       await tester.pumpAndSettle();
       expect(find.text('ID комнаты или ссылка'), findsOneWidget);
-      expect(find.textContaining('должен быть онлайн'), findsOneWidget);
+      expect(
+        find.textContaining('Для входа по ID нужен онлайн-участник'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('с доступом к Диску позволяет войти без него'),
+        findsOneWidget,
+      );
       await tester.enterText(find.byType(TextField), 'not-a-room');
       await tester.tap(find.text('Подключиться'));
       await tester.pump(const Duration(milliseconds: 500));

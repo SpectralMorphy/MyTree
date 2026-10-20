@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mytree_webrtc_demo/cloud/room_disk_sync.dart';
 import 'package:mytree_webrtc_demo/cloud/yandex_disk_client.dart';
 import 'package:mytree_webrtc_demo/room_document.dart';
+import 'package:mytree_webrtc_demo/room_identity.dart';
 import 'package:mytree_webrtc_demo/room_protocol.dart';
 import 'package:mytree_webrtc_demo/storage/room_store.dart';
 
@@ -14,6 +15,8 @@ const _roomId = '0123456789abcdef0123456789abcdef';
 const _bindingId = 'disk-binding';
 const _token = 'private-oauth-token';
 const _directory = 'app:/mytree/$_roomId/$_bindingId/batches';
+const _publicUrl = 'https://disk.yandex.ru/d/published-binding';
+const _bindingRoot = 'app:/mytree/$_roomId/$_bindingId';
 
 /// Shared fake cloud, also used by the session tests; each client is independent.
 class MemoryDiskBackend {
@@ -23,6 +26,14 @@ class MemoryDiskBackend {
   final listed = <String>[];
   final read = <String>[];
   final written = <String>[];
+  final published = <String>[];
+  final publicListed = <String>[];
+  final publicRead = <String>[];
+  final publicUrls = <String>[];
+  final publicRoots = <String, String>{_publicUrl: _bindingRoot};
+  final requestGuards = <bool Function()?>[];
+  final requestDeadlines = <DateTime?>[];
+  List<String>? listing;
   Future<void> Function(String path)? beforeList;
   Future<void> Function(String path)? beforeRead;
   Future<void> Function(String path, Uint8List bytes)? beforeWrite;
@@ -44,6 +55,10 @@ class MemoryDiskBackend {
         }),
       ),
     );
+    return addRawBatch(bytes, directory: directory);
+  }
+
+  String addRawBatch(Uint8List bytes, {String directory = _directory}) {
     final path = '$directory/${sha256.convert(bytes)}.json';
     files[path] = bytes;
     return path;
@@ -68,23 +83,119 @@ class MemoryDiskClient extends YandexDiskClient {
   }
 
   @override
-  Future<List<String>> listFiles(String token, String path) async {
+  Future<String> publishDirectory(String token, String path) async {
+    backend.published.add(path);
+    final publicUrl = 'https://disk.yandex.ru/d/${path.split('/').last}';
+    backend.publicRoots[publicUrl] = path;
+    return publicUrl;
+  }
+
+  @override
+  Future<List<String>> listFiles(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
     backend.listed.add(path);
+    _recordReadContext(isCurrent, deadline);
+    return _listFiles(path, isCurrent: isCurrent, deadline: deadline);
+  }
+
+  @override
+  Future<List<String>> listPublicFiles(
+    String publicUrl, {
+    String path = '/batches',
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    backend.publicListed.add(path);
+    backend.publicUrls.add(publicUrl);
+    _recordReadContext(isCurrent, deadline);
+    return _listFiles(
+      '${_publicRoot(publicUrl)}$path',
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+  }
+
+  Future<List<String>> _listFiles(
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    _checkReadContext(isCurrent, deadline);
     // Freeze the directory view before the gate to model concurrent listings.
-    final names = [
-      for (final file in backend.files.keys)
-        if (file.startsWith('$path/') &&
-            !file.substring(path.length + 1).contains('/'))
-          file.substring(path.length + 1),
-    ];
+    final names =
+        backend.listing ??
+        [
+          for (final file in backend.files.keys)
+            if (file.startsWith('$path/') &&
+                !file.substring(path.length + 1).contains('/'))
+              file.substring(path.length + 1),
+        ];
     await backend.beforeList?.call(path);
+    _checkReadContext(isCurrent, deadline);
     return names;
   }
 
   @override
-  Future<Uint8List> readFile(String token, String path) async {
+  Future<Uint8List> readFile(
+    String token,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
     backend.read.add(path);
+    _recordReadContext(isCurrent, deadline);
+    return _readFile(path, isCurrent: isCurrent, deadline: deadline);
+  }
+
+  @override
+  Future<Uint8List> readPublicFile(
+    String publicUrl,
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    backend.publicRead.add(path);
+    backend.publicUrls.add(publicUrl);
+    _recordReadContext(isCurrent, deadline);
+    return _readFile(
+      '${_publicRoot(publicUrl)}$path',
+      isCurrent: isCurrent,
+      deadline: deadline,
+    );
+  }
+
+  String _publicRoot(String publicUrl) {
+    final root = backend.publicRoots[publicUrl];
+    if (root == null) {
+      throw const YandexDiskException('Missing public folder', statusCode: 404);
+    }
+    return root;
+  }
+
+  void _recordReadContext(bool Function()? isCurrent, DateTime? deadline) {
+    backend.requestGuards.add(isCurrent);
+    backend.requestDeadlines.add(deadline);
+  }
+
+  void _checkReadContext(bool Function()? isCurrent, DateTime? deadline) {
+    if (!(isCurrent?.call() ?? true) ||
+        (deadline != null && !DateTime.now().isBefore(deadline))) {
+      throw const YandexDiskException('Read cancelled');
+    }
+  }
+
+  Future<Uint8List> _readFile(
+    String path, {
+    bool Function()? isCurrent,
+    DateTime? deadline,
+  }) async {
+    _checkReadContext(isCurrent, deadline);
     await backend.beforeRead?.call(path);
+    _checkReadContext(isCurrent, deadline);
     final bytes = backend.files[path];
     if (bytes == null) {
       throw const YandexDiskException('Missing file', statusCode: 404);
@@ -171,7 +282,1042 @@ class _Replica {
   }
 }
 
+List<RoomEdit> _diskAdmissionHistory() {
+  final history = <RoomEdit>[];
+  void append(RoomEdit edit) {
+    history.add(sequenceAuthoredEdit(edit, history));
+  }
+
+  append(
+    const RoomEdit(
+      id: 'owner-role',
+      author: 'owner',
+      clock: 1,
+      createdAt: 1,
+      text: 'editor',
+      kind: RoomEditKind.participantRole,
+      targetActor: 'owner',
+    ),
+  );
+  append(
+    const RoomEdit(
+      id: _bindingId,
+      author: 'owner',
+      clock: 2,
+      createdAt: 2,
+      text: '{"action":"connect"}',
+      kind: RoomEditKind.diskConnection,
+    ),
+  );
+  append(
+    const RoomEdit(
+      id: 'cloud-text',
+      author: 'owner',
+      clock: 3,
+      createdAt: 3,
+      text: 'Cloud history',
+    ),
+  );
+  return history;
+}
+
+List<RoomEdit> _finalDiskHistory(List<RoomEdit> history) {
+  final last = sequenceAuthoredEdit(
+    const RoomEdit(
+      id: 'final-cloud-text',
+      author: 'owner',
+      clock: 4,
+      createdAt: 4,
+      text: 'Last edit before disconnect',
+    ),
+    history,
+  );
+  final detach = sequenceAuthoredEdit(
+    RoomEdit(
+      id: 'final-detach',
+      author: 'owner',
+      clock: 5,
+      createdAt: 5,
+      text: jsonEncode({'action': 'disconnect', 'bindingId': _bindingId}),
+      kind: RoomEditKind.diskConnection,
+    ),
+    [...history, last],
+  );
+  return [...history, last, detach];
+}
+
+void _expectNoDiskWrites(MemoryDiskBackend backend) {
+  expect(backend.created, isEmpty);
+  expect(backend.published, isEmpty);
+  expect(backend.written, isEmpty);
+}
+
 void main() {
+  for (final public in [false, true]) {
+    group('readDiskRoomHistory ${public ? 'public' : 'private'}', () {
+      late MemoryDiskBackend backend;
+      late MemoryDiskClient client;
+      late RoomDiskAccess access;
+      late List<RoomEdit> history;
+
+      List<String> getReads() => public ? backend.publicRead : backend.read;
+      List<String> getListings() =>
+          public ? backend.publicListed : backend.listed;
+
+      Future<List<RoomEdit>> read({
+        List<RoomEdit> localHistory = const [],
+        bool Function()? isCurrent,
+        Duration timeout = const Duration(seconds: 30),
+        bool allowFinalDisconnect = false,
+      }) => readDiskRoomHistory(
+        client: client,
+        roomId: _roomId,
+        access: access,
+        localHistory: localHistory,
+        isCurrent: isCurrent,
+        timeout: timeout,
+        allowFinalDisconnect: allowFinalDisconnect,
+      );
+
+      setUp(() {
+        backend = MemoryDiskBackend();
+        client = MemoryDiskClient(backend);
+        access = public
+            ? RoomDiskAccess.guest(bindingId: _bindingId, publicUrl: _publicUrl)
+            : RoomDiskAccess.editor(bindingId: _bindingId, token: _token);
+        history = _diskAdmissionHistory();
+        addTearDown(() {
+          _expectNoDiskWrites(backend);
+          client.close();
+        });
+      });
+
+      test(
+        'returns a canonical combined snapshot with read-only access',
+        () async {
+          final firstPath = backend.addBatch(history.reversed.toList());
+          backend.addBatch([history.last]);
+          backend.files['$_directory/readme.txt'] = Uint8List(0);
+          final local = sequenceAuthoredEdit(
+            const RoomEdit(
+              id: 'local-only',
+              author: 'local',
+              clock: 4,
+              createdAt: 4,
+              text: 'Keep the durable local edit',
+            ),
+            history,
+          );
+          final localHistory = [history.first, local];
+          final result = await read(localHistory: localHistory);
+          expect(result.map((edit) => edit.id), [
+            ...history.map((edit) => edit.id),
+            local.id,
+          ]);
+          expect(localHistory, [history.first, local]);
+          expect(() => result.add(local), throwsUnsupportedError);
+          expect(getListings(), [public ? '/batches' : _directory]);
+          expect(getReads(), hasLength(2));
+          expect(
+            getReads(),
+            contains(
+              public ? '/batches/${firstPath.split('/').last}' : firstPath,
+            ),
+          );
+          expect(public ? backend.listed : backend.publicListed, isEmpty);
+          expect(public ? backend.read : backend.publicRead, isEmpty);
+          if (public) {
+            expect(backend.publicUrls, everyElement(_publicUrl));
+          }
+          expect(client.closed, isFalse, reason: 'The caller owns the client');
+        },
+      );
+
+      test(
+        'propagates one guard and absolute deadline to every request',
+        () async {
+          backend.addBatch(history.take(2).toList());
+          backend.addBatch([history.last]);
+          backend.beforeList = (_) async {
+            expect(backend.requestGuards.single!(), isTrue);
+          };
+          backend.beforeRead = (_) async {
+            expect(backend.requestGuards.last!(), isTrue);
+          };
+          final started = DateTime.now();
+          const timeout = Duration(seconds: 5);
+          await read(timeout: timeout);
+          final finished = DateTime.now();
+          expect(backend.requestGuards, hasLength(3));
+          final guard = backend.requestGuards.first!;
+          final deadline = backend.requestDeadlines.first!;
+          expect(backend.requestGuards, everyElement(same(guard)));
+          expect(backend.requestDeadlines, everyElement(same(deadline)));
+          expect(deadline.isBefore(started.add(timeout)), isFalse);
+          expect(deadline.isAfter(finished.add(timeout)), isFalse);
+          expect(
+            guard(),
+            isFalse,
+            reason: 'The completed read context is closed',
+          );
+        },
+      );
+
+      test(
+        'terminal disconnect is not fresh admission or private access',
+        () async {
+          final terminal = _finalDiskHistory(history);
+          backend.addBatch(terminal);
+          await expectLater(read(localHistory: history), throwsStateError);
+          await expectLater(read(allowFinalDisconnect: true), throwsStateError);
+          if (public) {
+            final result = await read(
+              localHistory: history,
+              allowFinalDisconnect: true,
+            );
+            expect(roomHistoryDigest(result), roomHistoryDigest(terminal));
+          } else {
+            await expectLater(
+              read(localHistory: history, allowFinalDisconnect: true),
+              throwsStateError,
+            );
+          }
+        },
+      );
+
+      test(
+        'terminal mode still rejects a projected replacement binding',
+        () async {
+          final terminal = _finalDiskHistory(history);
+          final replacement = sequenceAuthoredEdit(
+            const RoomEdit(
+              id: 'replacement',
+              author: 'owner',
+              clock: 6,
+              createdAt: 6,
+              text: '{"action":"connect"}',
+              kind: RoomEditKind.diskConnection,
+            ),
+            terminal,
+          );
+          backend.addBatch([...terminal, replacement]);
+          await expectLater(
+            read(localHistory: history, allowFinalDisconnect: true),
+            throwsStateError,
+          );
+        },
+      );
+
+      test('uses all listed batches beyond a single 1000-item page', () async {
+        // Pagination belongs to the client. Consume its entire returned list,
+        // including the only binding proof placed after the first page.
+        backend.addBatch([history.last]);
+        final firstName = backend.files.keys.single.split('/').last;
+        final bindingPath = backend.addBatch(history.take(2).toList());
+        backend.listing = [
+          ...List.filled(1000, firstName),
+          bindingPath.split('/').last,
+        ];
+        expect(roomHistoryDigest(await read()), roomHistoryDigest(history));
+        expect(getReads(), hasLength(2));
+      });
+
+      for (final localPredecessor in [false, true]) {
+        test(
+          'prefixes can be supplied by ${localPredecessor ? 'local history' : 'other batches'}',
+          () async {
+            backend.addBatch(history.skip(1).toList());
+            if (!localPredecessor) backend.addBatch([history.first]);
+            final result = await read(
+              localHistory: localPredecessor ? [history.first] : const [],
+            );
+            expect(roomHistoryDigest(result), roomHistoryDigest(history));
+          },
+        );
+      }
+
+      test('valid binding schema is independent of admission roles', () async {
+        final binding = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: _bindingId,
+            author: 'owner-without-role',
+            clock: 1,
+            createdAt: 1,
+            text: '{"action":"connect"}',
+            kind: RoomEditKind.diskConnection,
+          ),
+          const [],
+        );
+        backend.addBatch([binding]);
+        expect((await read()).single.sameContentAs(binding), isTrue);
+      });
+
+      for (final corruption in [
+        'empty',
+        'empty-batch',
+        'missing-binding',
+        'hash',
+        'room',
+        'binding',
+        'version',
+        'envelope',
+        'json',
+        'utf8',
+        'record',
+        'binding-schema',
+        'name',
+        'path-name',
+        'conflict',
+        'local-conflict',
+        'gap',
+        'detached',
+        'local-detach',
+        'rebound',
+        'mixed-room',
+      ]) {
+        test('rejects $corruption instead of admitting a snapshot', () async {
+          var local = <RoomEdit>[];
+          var batch = List<RoomEdit>.of(history);
+          if (corruption == 'empty-batch') batch = [];
+          if (corruption == 'missing-binding') batch = [history.first];
+          if (corruption == 'gap') batch = history.skip(1).toList();
+          if (corruption != 'empty') {
+            backend.addBatch(
+              batch,
+              roomId: corruption == 'room' ? 'f' * 32 : _roomId,
+              bindingId: corruption == 'binding' ? 'other-binding' : _bindingId,
+            );
+          }
+          switch (corruption) {
+            case 'empty' || 'empty-batch':
+              local = history;
+            case 'hash':
+              final path = backend.files.keys.single;
+              backend.files[path] = Uint8List.fromList([
+                ...backend.files[path]!,
+                32,
+              ]);
+            case 'version' || 'record' || 'binding-schema':
+              final envelope =
+                  jsonDecode(utf8.decode(backend.files.values.single))
+                      as Map<String, dynamic>;
+              if (corruption == 'version') {
+                envelope['v'] = 2;
+              } else if (corruption == 'record') {
+                (envelope['history'] as List)[0]['clock'] = -1;
+              } else {
+                (envelope['history'] as List)[1]['text'] =
+                    '{"action":"connect","token":"$_token"}';
+              }
+              backend.files.clear();
+              backend.addRawBatch(
+                Uint8List.fromList(utf8.encode(jsonEncode(envelope))),
+              );
+            case 'envelope' || 'json' || 'utf8':
+              backend.files.clear();
+              backend.addRawBatch(
+                Uint8List.fromList(
+                  corruption == 'utf8'
+                      ? [0xff]
+                      : utf8.encode(corruption == 'json' ? '{bad JSON' : '[]'),
+                ),
+              );
+            case 'name':
+              final path = backend.files.keys.single;
+              backend.files['$_directory/not-a-digest.json'] = backend.files
+                  .remove(path)!;
+            case 'path-name':
+              backend.listing = ['../${'a' * 64}.json'];
+            case 'conflict' || 'local-conflict':
+              final conflicting = RoomEdit.fromJson({
+                ...history.last.toJson(),
+                'text': 'Rewritten immutable ID',
+              })!;
+              if (corruption == 'local-conflict') {
+                local = [...history.take(2), conflicting];
+              } else {
+                backend.addBatch([conflicting]);
+              }
+            case 'detached' || 'local-detach' || 'rebound':
+              final detach = sequenceAuthoredEdit(
+                RoomEdit(
+                  id: 'detach',
+                  author: 'owner',
+                  clock: 4,
+                  createdAt: 4,
+                  text: jsonEncode({
+                    'action': 'disconnect',
+                    'bindingId': _bindingId,
+                  }),
+                  kind: RoomEditKind.diskConnection,
+                ),
+                history,
+              );
+              if (corruption == 'local-detach') {
+                local = [...history, detach];
+              } else {
+                backend.addBatch([detach]);
+              }
+              if (corruption == 'rebound') {
+                backend.addBatch([
+                  sequenceAuthoredEdit(
+                    const RoomEdit(
+                      id: 'replacement-binding',
+                      author: 'owner',
+                      clock: 5,
+                      createdAt: 5,
+                      text: '{"action":"connect"}',
+                      kind: RoomEditKind.diskConnection,
+                    ),
+                    [...history, detach],
+                  ),
+                ]);
+              }
+            case 'mixed-room':
+              backend.addBatch(history, roomId: 'f' * 32);
+          }
+          await expectLater(read(localHistory: local), throwsStateError);
+          if (corruption == 'name' || corruption == 'path-name') {
+            expect(getReads(), isEmpty);
+          }
+        });
+      }
+
+      test('bounds candidate JSON count before downloading any file', () async {
+        backend.addBatch(history);
+        final name = backend.files.keys.single.split('/').last;
+        backend.listing = List.filled(2049, name);
+        await expectLater(read(), throwsStateError);
+        expect(getReads(), isEmpty);
+      });
+
+      test(
+        'accepts the 2048 candidate boundary and deduplicates reads',
+        () async {
+          backend.addBatch(history);
+          backend.listing = List.filled(
+            2048,
+            backend.files.keys.single.split('/').last,
+          );
+          expect(roomHistoryDigest(await read()), roomHistoryDigest(history));
+          expect(getReads(), hasLength(1));
+        },
+      );
+
+      for (final totalLimit in [false, true]) {
+        test('bounds ${totalLimit ? 'total raw' : 'per-file'} bytes', () async {
+          final path = backend.addBatch(history);
+          final payload = backend.files.remove(path)!;
+          final size = totalLimit
+              ? maxRoomTransferBytes ~/ 2 + 1
+              : maxRoomTransferBytes + 1;
+          final padded = Uint8List(size)..fillRange(0, size, 32);
+          padded.setRange(0, payload.length, payload);
+          backend.addRawBatch(padded);
+          if (totalLimit) {
+            final duplicate = Uint8List.fromList(padded);
+            duplicate[duplicate.length - 1] = 10;
+            backend.addRawBatch(duplicate);
+          }
+          // The logical history is tiny and identical across batches. Limits
+          // apply to downloaded bytes, including whitespace and repeated edits.
+          await expectLater(read(), throwsStateError);
+          expect(getReads(), hasLength(totalLimit ? 2 : 1));
+        });
+      }
+
+      test('accepts exactly 8 MiB of raw bytes', () async {
+        final path = backend.addBatch(history);
+        final payload = backend.files.remove(path)!;
+        final padded = Uint8List(maxRoomTransferBytes)
+          ..fillRange(0, maxRoomTransferBytes, 32);
+        padded.setRange(0, payload.length, payload);
+        backend.addRawBatch(padded);
+        expect(roomHistoryDigest(await read()), roomHistoryDigest(history));
+      });
+
+      test(
+        'bounds the canonical union even when each input fits separately',
+        () async {
+          RoomEdit largeEdit(String id, String author) => sequenceAuthoredEdit(
+            RoomEdit(
+              id: id,
+              author: author,
+              clock: 4,
+              createdAt: 4,
+              text: 'x' * (maxRoomTransferBytes ~/ 2),
+            ),
+            const [],
+          );
+          final local = largeEdit('large-local', 'local');
+          final remote = largeEdit('large-remote', 'remote');
+          backend.addBatch([...history, remote]);
+          expect(
+            backend.files.values.single.length,
+            lessThan(maxRoomTransferBytes),
+          );
+          await expectLater(read(localHistory: [local]), throwsStateError);
+        },
+      );
+
+      for (final extraByte in [false, true]) {
+        test(
+          'canonical union ${extraByte ? 'rejects one byte over' : 'accepts exactly'} 8 MiB',
+          () async {
+            final empty = sequenceAuthoredEdit(
+              const RoomEdit(
+                id: 'large-local',
+                author: 'local',
+                clock: 4,
+                createdAt: 4,
+                text: '',
+              ),
+              const [],
+            );
+            final overhead = utf8
+                .encode(
+                  jsonEncode(
+                    [...history, empty].map((edit) => edit.toJson()).toList(),
+                  ),
+                )
+                .length;
+            final large = RoomEdit.fromJson({
+              ...empty.toJson(),
+              'text':
+                  'x' * (maxRoomTransferBytes - overhead + (extraByte ? 1 : 0)),
+            })!;
+            backend.addBatch(history);
+            final local = [...history, large];
+            if (extraByte) {
+              await expectLater(read(localHistory: local), throwsStateError);
+            } else {
+              final result = await read(localHistory: local);
+              expect(result, hasLength(local.length));
+              expect(result.last.sameContentAs(large), isTrue);
+            }
+          },
+        );
+      }
+
+      test(
+        'canonical byte bound counts UTF-8 bytes rather than characters',
+        () async {
+          final large = sequenceAuthoredEdit(
+            RoomEdit(
+              id: 'large-unicode',
+              author: 'local',
+              clock: 4,
+              createdAt: 4,
+              text: 'я' * (maxRoomTransferBytes ~/ 2),
+            ),
+            const [],
+          );
+          backend.addBatch(history);
+          await expectLater(read(localHistory: [large]), throwsStateError);
+        },
+      );
+
+      test(
+        'sanitizes client failures, including URLs and credentials',
+        () async {
+          backend.addBatch(history);
+          backend.beforeRead = (_) async {
+            throw StateError('Transport $_token $_publicUrl');
+          };
+          await expectLater(
+            read(),
+            throwsA(
+              isA<StateError>().having(
+                (error) => error.toString(),
+                'safe message',
+                allOf(
+                  isNot(contains(_token)),
+                  isNot(contains(_publicUrl)),
+                  isNot(contains('Transport')),
+                ),
+              ),
+            ),
+          );
+        },
+      );
+
+      test(
+        'freezes the provided local prefix before awaiting the cloud',
+        () async {
+          backend.addBatch(history.skip(1).toList());
+          final local = [history.first];
+          final entered = Completer<void>();
+          final release = Completer<void>();
+          backend.beforeList = (_) async {
+            entered.complete();
+            await release.future;
+          };
+          final pending = read(localHistory: local);
+          await entered.future;
+          local.clear();
+          release.complete();
+          expect(roomHistoryDigest(await pending), roomHistoryDigest(history));
+          expect(local, isEmpty);
+        },
+      );
+
+      test('cancelled generation starts no requests', () async {
+        backend.addBatch(history);
+        await expectLater(read(isCurrent: () => false), throwsStateError);
+        expect(getListings(), isEmpty);
+        expect(getReads(), isEmpty);
+      });
+
+      for (final stage in ['list', 'read']) {
+        test('cancellation during $stage cannot continue or succeed', () async {
+          backend.addBatch(history.take(2).toList());
+          backend.addBatch([history.last]);
+          final entered = Completer<void>();
+          final release = Completer<void>();
+          Future<void> gate(String _) async {
+            entered.complete();
+            await release.future;
+          }
+
+          if (stage == 'list') {
+            backend.beforeList = gate;
+          } else {
+            backend.beforeRead = gate;
+          }
+          var generation = 0;
+          final pending = read(isCurrent: () => generation == 0);
+          final failed = expectLater(pending, throwsStateError);
+          await entered.future;
+          generation++;
+          expect(backend.requestGuards.last!(), isFalse);
+          release.complete();
+          await failed;
+          expect(getListings(), hasLength(1));
+          expect(getReads(), hasLength(stage == 'list' ? 0 : 1));
+        });
+
+        testWidgets('overall deadline stops late $stage continuation', (
+          tester,
+        ) async {
+          backend.addBatch(history.take(2).toList());
+          backend.addBatch([history.last]);
+          final release = Completer<void>();
+          if (stage == 'list') {
+            backend.beforeList = (_) => release.future;
+          } else {
+            backend.beforeRead = (_) => release.future;
+          }
+          var finished = false;
+          final pending = read(timeout: const Duration(seconds: 1));
+          final failed = expectLater(pending, throwsStateError).then((_) {
+            finished = true;
+          });
+          await tester.pump();
+          expect(getListings(), hasLength(1));
+          expect(getReads(), hasLength(stage == 'list' ? 0 : 1));
+          await tester.pump(const Duration(seconds: 1));
+          expect(finished, isTrue, reason: 'The overall wait is bounded');
+          await failed;
+          expect(backend.requestGuards.last!(), isFalse);
+          release.complete();
+          await tester.pump();
+          expect(getReads(), hasLength(stage == 'list' ? 0 : 1));
+        });
+      }
+
+      test('expired deadline starts no requests', () async {
+        backend.addBatch(history);
+        await expectLater(read(timeout: Duration.zero), throwsStateError);
+        expect(getListings(), isEmpty);
+        expect(getReads(), isEmpty);
+      });
+    });
+  }
+
+  group('RoomDiskReadSync', () {
+    late MemoryDiskBackend backend;
+    late MemoryDiskClient client;
+    late RoomDiskReadSync sync;
+    late RoomDiskAccess access;
+    late List<RoomEdit> cloud;
+    late List<RoomEdit> local;
+    late int merges;
+    late int changes;
+
+    setUp(() {
+      backend = MemoryDiskBackend();
+      client = MemoryDiskClient(backend);
+      access = RoomDiskAccess.guest(
+        bindingId: _bindingId,
+        publicUrl: _publicUrl,
+      );
+      cloud = _diskAdmissionHistory();
+      backend.addBatch(cloud);
+      local = [];
+      merges = 0;
+      changes = 0;
+      sync = RoomDiskReadSync(
+        roomId: _roomId,
+        client: client,
+        readHistory: () => local,
+        mergeHistory: (edits) async {
+          merges++;
+          local = validateAuthorHistory([...local, ...edits]);
+        },
+        onChanged: () => changes++,
+        pollInterval: const Duration(seconds: 10),
+      );
+      addTearDown(() {
+        sync.dispose();
+        expect(client.closed, isFalse, reason: 'Shared client stays open');
+        _expectNoDiskWrites(backend);
+        expect(backend.listed, isEmpty);
+        expect(backend.read, isEmpty);
+        client.close();
+      });
+    });
+
+    test(
+      'merges reads without claiming local guest metadata was uploaded',
+      () async {
+        final profile = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: 'guest-profile',
+            author: 'guest',
+            clock: 4,
+            createdAt: 4,
+            text: 'Guest',
+            kind: RoomEditKind.participantName,
+          ),
+          const [],
+        );
+        local = [profile];
+        final entered = Completer<void>();
+        final release = Completer<void>();
+        backend.beforeList = (_) async {
+          entered.complete();
+          await release.future;
+        };
+        expect(sync.status, 'Нет гостевого доступа к Диску');
+        sync.update(access: access, enabled: true);
+        expect(sync.status, 'Ожидаем историю с Диска');
+        final pending = sync.sync();
+        expect(identical(sync.sync(), pending), isTrue);
+        await entered.future;
+        expect(sync.busy, isTrue);
+        expect(sync.status, 'Чтение истории с Диска…');
+        final concurrent = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: 'guest-concurrent',
+            author: 'guest',
+            clock: 5,
+            createdAt: 5,
+            text: 'Guest renamed while reading',
+            kind: RoomEditKind.participantName,
+          ),
+          local,
+        );
+        local = [...local, concurrent];
+        release.complete();
+        await pending;
+        expect(sync.busy, isFalse);
+        expect(sync.error, isNull);
+        expect(sync.status, 'История прочитана с Диска');
+        expect(sync.status, isNot(contains('подтверждена')));
+        expect(merges, 1);
+        expect(changes, 2);
+        expect(local.map((edit) => edit.id), [
+          ...cloud.map((edit) => edit.id),
+          profile.id,
+          concurrent.id,
+        ]);
+        expect(
+          roomHistoryDigest(backend.uploadedHistory),
+          roomHistoryDigest(cloud),
+        );
+      },
+    );
+
+    testWidgets('debounces and periodically refreshes the public snapshot', (
+      tester,
+    ) async {
+      sync.update(access: access, enabled: true);
+      await tester.pump(const Duration(milliseconds: 799));
+      expect(backend.publicListed, isEmpty);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(merges, 1);
+      expect(sync.status, 'История прочитана с Диска');
+      final later = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'cloud-later',
+          author: 'owner',
+          clock: 4,
+          createdAt: 4,
+          text: 'Later public change',
+        ),
+        cloud,
+      );
+      backend.addBatch([later]);
+      await tester.pump(const Duration(seconds: 9));
+      expect(merges, 1);
+      await tester.pump(const Duration(seconds: 1));
+      expect(merges, 2);
+      expect(local.map((edit) => edit.id), contains(later.id));
+      sync.update(access: access, enabled: false);
+      await tester.pump(const Duration(minutes: 1));
+      expect(merges, 2);
+      expect(sync.status, 'Чтение Диска приостановлено');
+    });
+
+    testWidgets(
+      'imports the final edit and disconnect, then stops even on resume',
+      (tester) async {
+        local = List<RoomEdit>.of(cloud);
+        final terminal = _finalDiskHistory(cloud);
+        backend.addBatch(terminal.skip(cloud.length).toList());
+        sync.update(access: access, enabled: true);
+        await sync.sync();
+        expect(merges, 1);
+        expect(roomHistoryDigest(local), roomHistoryDigest(terminal));
+        expect(sync.error, isNull);
+        expect(sync.status, 'Подключение Диска отключено');
+        final reads = backend.publicRead.length;
+        final listings = backend.publicListed.length;
+        await tester.pump(const Duration(seconds: 61));
+        sync.update(access: access, enabled: true);
+        sync.schedule();
+        await tester.pump(const Duration(seconds: 61));
+        await expectLater(sync.sync(), throwsStateError);
+        expect(backend.publicRead, hasLength(reads));
+        expect(backend.publicListed, hasLength(listings));
+        expect(merges, 1);
+        await expectLater(
+          readDiskRoomHistory(client: client, roomId: _roomId, access: access),
+          throwsStateError,
+        );
+      },
+    );
+
+    for (final corruption in ['gap', 'hash', 'replacement', 'never-active']) {
+      test('terminal polling rejects $corruption without merging', () async {
+        local = List<RoomEdit>.of(cloud);
+        final terminal = _finalDiskHistory(cloud);
+        final path = backend.addBatch(
+          corruption == 'gap'
+              ? [terminal.last]
+              : terminal.skip(cloud.length).toList(),
+        );
+        switch (corruption) {
+          case 'hash':
+            backend.files[path] = Uint8List.fromList([
+              ...backend.files[path]!,
+              32,
+            ]);
+          case 'replacement':
+            backend.addBatch([
+              sequenceAuthoredEdit(
+                const RoomEdit(
+                  id: 'replacement-binding',
+                  author: 'owner',
+                  clock: 6,
+                  createdAt: 6,
+                  text: '{"action":"connect"}',
+                  kind: RoomEditKind.diskConnection,
+                ),
+                terminal,
+              ),
+            ]);
+          case 'never-active':
+            // The expected binding's connect lost to an earlier claim. Its
+            // disconnect is a no-op, not a terminal proof, even though a later
+            // disconnect of the other binding makes the final projection null.
+            backend.addBatch([
+              const RoomEdit(
+                id: 'earlier-binding',
+                author: 'other',
+                clock: 0,
+                createdAt: 0,
+                text: '{"action":"connect"}',
+                kind: RoomEditKind.diskConnection,
+              ),
+              const RoomEdit(
+                id: 'other-detach',
+                author: 'other',
+                clock: 6,
+                createdAt: 6,
+                text: '{"action":"disconnect","bindingId":"earlier-binding"}',
+                kind: RoomEditKind.diskConnection,
+              ),
+            ]);
+        }
+        sync.update(access: access, enabled: true);
+        await expectLater(sync.sync(), throwsStateError);
+        expect(merges, 0);
+        expect(roomHistoryDigest(local), roomHistoryDigest(cloud));
+        expect(sync.error, isNotNull);
+      });
+    }
+
+    testWidgets('never reads with editor, missing or disabled access', (
+      tester,
+    ) async {
+      for (final next in [
+        RoomDiskAccess.editor(bindingId: _bindingId, token: _token),
+        null,
+      ]) {
+        sync.update(access: next, enabled: true);
+        sync.schedule();
+        await expectLater(sync.sync(), throwsStateError);
+        await tester.pump(const Duration(minutes: 1));
+      }
+      sync.update(access: access, enabled: false);
+      sync.schedule();
+      await expectLater(sync.sync(), throwsStateError);
+      await tester.pump(const Duration(minutes: 1));
+      expect(backend.publicListed, isEmpty);
+      expect(merges, 0);
+    });
+
+    test(
+      'failed read is sanitized and can be retried without writes',
+      () async {
+        backend.beforeRead = (_) async {
+          throw StateError('Transport $_token $_publicUrl');
+        };
+        sync.update(access: access, enabled: true);
+        await expectLater(sync.sync(), throwsStateError);
+        expect(merges, 0);
+        expect(local, isEmpty);
+        expect(sync.error, isNotNull);
+        expect(sync.error, isNot(contains(_token)));
+        expect(sync.error, isNot(contains(_publicUrl)));
+        expect(sync.status, contains('недоступен'));
+        backend.beforeRead = null;
+        await sync.sync();
+        expect(sync.error, isNull);
+        expect(merges, 1);
+        expect(sync.status, 'История прочитана с Диска');
+      },
+    );
+
+    testWidgets('a timed-out poll cannot merge a late public response', (
+      tester,
+    ) async {
+      final release = Completer<void>();
+      backend.beforeRead = (_) => release.future;
+      sync.update(access: access, enabled: true);
+      final failed = expectLater(sync.sync(), throwsStateError);
+      await tester.pump();
+      expect(backend.publicRead, hasLength(1));
+      await tester.pump(const Duration(seconds: 30));
+      await failed;
+      expect(sync.busy, isFalse);
+      expect(sync.error, isNotNull);
+      expect(merges, 0);
+      release.complete();
+      await tester.pump();
+      expect(merges, 0);
+      expect(backend.publicRead, hasLength(1));
+      sync.update(access: access, enabled: false);
+    });
+
+    testWidgets(
+      'replacing access invalidates the old poll and reads the new binding',
+      (tester) async {
+        const nextBinding = 'next-binding';
+        const nextUrl = 'https://disk.yandex.ru/d/next-binding';
+        const nextRoot = 'app:/mytree/$_roomId/$nextBinding';
+        final replacement = sequenceAuthoredEdit(
+          const RoomEdit(
+            id: nextBinding,
+            author: 'new-owner',
+            clock: 1,
+            createdAt: 1,
+            text: '{"action":"connect"}',
+            kind: RoomEditKind.diskConnection,
+          ),
+          const [],
+        );
+        backend.publicRoots[nextUrl] = nextRoot;
+        backend.addBatch(
+          [replacement],
+          bindingId: nextBinding,
+          directory: '$nextRoot/batches',
+        );
+        final release = Completer<void>();
+        backend.beforeRead = (path) async {
+          if (path.startsWith('$_directory/')) await release.future;
+        };
+        sync.update(access: access, enabled: true);
+        final oldFailed = expectLater(sync.sync(), throwsStateError);
+        await tester.pump();
+        final nextAccess = RoomDiskAccess.guest(
+          bindingId: nextBinding,
+          publicUrl: nextUrl,
+        );
+        sync.update(access: nextAccess, enabled: true);
+        release.complete();
+        await tester.pump();
+        await oldFailed;
+        expect(merges, 0, reason: 'The cancelled binding must not merge');
+        expect(backend.publicRead, hasLength(1));
+        // pump() only drains microtasks; advance the fake timer queue explicitly
+        // to run the zero-delay retry scheduled after the old poll completes.
+        await tester.pump(Duration.zero);
+        expect(merges, 1);
+        expect(local.single.sameContentAs(replacement), isTrue);
+        expect(sync.error, isNull);
+        expect(sync.status, 'История прочитана с Диска');
+        sync.update(access: nextAccess, enabled: false);
+      },
+    );
+
+    test('failed durable merge does not claim a successful read', () async {
+      sync.dispose();
+      sync = RoomDiskReadSync(
+        roomId: _roomId,
+        client: client,
+        readHistory: () => local,
+        mergeHistory: (_) async {
+          throw StateError('Local journal failed $_token');
+        },
+        onChanged: () {},
+      );
+      sync.update(access: access, enabled: true);
+      await expectLater(sync.sync(), throwsStateError);
+      expect(local, isEmpty);
+      expect(sync.error, isNotNull);
+      expect(sync.error, isNot(contains(_token)));
+      expect(sync.status, isNot('История прочитана с Диска'));
+    });
+
+    for (final stop in ['disable', 'detach', 'dispose']) {
+      test('$stop invalidates an in-flight public snapshot', () async {
+        final entered = Completer<void>();
+        final release = Completer<void>();
+        backend.beforeRead = (_) async {
+          entered.complete();
+          await release.future;
+        };
+        sync.update(access: access, enabled: true);
+        final pending = sync.sync();
+        final failed = expectLater(pending, throwsStateError);
+        await entered.future;
+        if (stop == 'dispose') {
+          sync.dispose();
+        } else {
+          sync.update(access: stop == 'detach' ? null : access, enabled: false);
+        }
+        release.complete();
+        await failed;
+        expect(merges, 0);
+        expect(local, isEmpty);
+        expect(sync.error, isNull);
+        expect(client.closed, isFalse);
+      });
+    }
+  });
+
   test('prepare uses only application room/binding directories', () async {
     final backend = MemoryDiskBackend();
     final replica = _Replica(MemoryRoomStore());

@@ -1,4 +1,4 @@
-// Usage: node tool/check_tree_ui.cjs <playwright-module> <base-url> <screenshots> [all|surnames|personal-surnames|guest-identity|guest-identity-legacy|identity-local|identity-actions-local|dialogs-local|author-history|author-history-local|initial-sync-recovery|explicit-siblings|clean-address-local]
+// Usage: node tool/check_tree_ui.cjs <playwright-module> <base-url> <screenshots> [all|surnames|personal-surnames|guest-identity|guest-identity-legacy|identity-local|identity-actions-local|dialogs-local|author-history|author-history-local|initial-sync-recovery|explicit-siblings|clean-address-local|first-admission-diagnostic|first-admission-relay-diagnostic|first-admission-mqtt-startup]
 // guest-identity-legacy reuses a saved seed (or creates a schema-valid one), without public peers.
 // identity-local checks optional aliases, tooltip, own binding release/rebind and reload on desktop/phone; public transport is blocked.
 // author-history: two fresh profiles / three pages, actual public RTC and same-author tab writers.
@@ -12,13 +12,19 @@ const { chromium } = require(process.argv[2]);
 const base = process.argv[3];
 const output = process.argv[4];
 const suite = process.argv[5] || 'all';
-assert.ok(['all', 'surnames', 'personal-surnames', 'guest-identity', 'guest-identity-legacy', 'identity-local', 'identity-actions-local', 'dialogs-local', 'author-history', 'author-history-local', 'initial-sync-recovery', 'explicit-siblings', 'clean-address-local'].includes(suite), 'Unknown browser suite.');
+assert.ok(['all', 'surnames', 'personal-surnames', 'guest-identity', 'guest-identity-legacy', 'identity-local', 'identity-actions-local', 'dialogs-local', 'author-history', 'author-history-local', 'initial-sync-recovery', 'explicit-siblings', 'clean-address-local', 'first-admission-diagnostic', 'first-admission-relay-diagnostic', 'first-admission-mqtt-startup'].includes(suite), 'Unknown browser suite.');
 if (!base || !output) throw new Error('Pass the application URL and screenshot directory.');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const body = (page) => page.locator('body').ariaSnapshot();
 const personalSurnameSuite = ['surnames', 'personal-surnames'].includes(suite);
 const explicitSiblingSuite = suite === 'explicit-siblings';
 const cleanAddressSuite = suite === 'clean-address-local';
+const relayAdmissionSuite = suite === 'first-admission-relay-diagnostic';
+const mqttStartupSuite = suite === 'first-admission-mqtt-startup';
+if (mqttStartupSuite) assert.match(new URL(base).hostname, /^(?:127\.0\.0\.1|localhost|\[::1\])$/, 'The controlled-latency case is authorized only for the final local release.');
+const firstAdmissionSuite = suite === 'first-admission-diagnostic' || relayAdmissionSuite || mqttStartupSuite;
+const admissionReport = { application: base, suite, headless: true, completed: false, stage: 'prepared',
+  actualBrowserBundles: [], checkpoints: [], runtimeSamples: [], providerEvents: [], http: [], consoleMessages: [], pageErrors: [] };
 const cleanAddressReport = { application: base, suite, headless: true, completed: false, steps: [],
   actualBrowserBundles: [], network: { sameOriginOnly: true, http: [], blockedWebSockets: 0 } };
 const tracedPublicFeature = personalSurnameSuite || explicitSiblingSuite;
@@ -46,8 +52,8 @@ async function activate(page) {
   }
 }
 async function load(page, url) {
-  const expected = explicitSiblingSuite || cleanAddressSuite ? process.env.MYTREE_EXPECTED_BUNDLE_SHA256 : null;
-  if (explicitSiblingSuite || cleanAddressSuite) assert.match(expected || '', /^[0-9a-f]{64}$/, 'The finite browser case requires the explicitly authorized bundle hash.');
+  const expected = explicitSiblingSuite || cleanAddressSuite || firstAdmissionSuite ? process.env.MYTREE_EXPECTED_BUNDLE_SHA256 : null;
+  if (explicitSiblingSuite || cleanAddressSuite || firstAdmissionSuite) assert.match(expected || '', /^[0-9a-f]{64}$/, 'The finite browser case requires the explicitly authorized bundle hash.');
   if (page.url() !== 'about:blank') await page.goto('about:blank');
   const actual = expected ? page.waitForResponse((response) => response.url() === new URL('main.dart.js', `${base.replace(/\/$/, '')}/`).href &&
     response.status() === 200, { timeout: 30000 }) : null;
@@ -56,7 +62,7 @@ async function load(page, url) {
     const response = await actual, bytes = await response.body();
     const entry = { url: response.url(), bytes: bytes.length, fromServiceWorker: response.fromServiceWorker(),
       sha256: require('node:crypto').createHash('sha256').update(bytes).digest('hex') };
-    const targetReport = cleanAddressSuite ? cleanAddressReport : publicSiblingReport;
+    const targetReport = firstAdmissionSuite ? admissionReport : cleanAddressSuite ? cleanAddressReport : publicSiblingReport;
     targetReport.actualBrowserBundles.push(entry);
     await fs.writeFile(path.join(output, 'actual-browser-bundles.json'), JSON.stringify(targetReport.actualBrowserBundles, null, 2));
     assert.equal(entry.sha256, expected); assert.equal(entry.fromServiceWorker, false);
@@ -491,6 +497,497 @@ async function publicGuestIdentity(browser, pages, errors) {
     completeConvergedJournalLength: finalJournal.length, browserErrors: errors,
   }, null, 2));
   console.log('PASS: three independent public RTC profiles; guest has read-only biography and no identity UI; editor-only grouping, exact durable promotion then explicit binding, complete immutable journals and reloads.');
+}
+
+function admissionSafeText(value) {
+  return String(value).replace(/[0-9a-f]{32}/gi, '[synthetic-id]')
+    .replace(/([?&](?:token|key|credential|password|id|peerId)=)[^\s&"']+/gi, '$1[redacted]')
+    .replace(/(?:Bearer|OAuth)\s+[A-Za-z0-9._~-]+/gi, '[redacted-auth]');
+}
+function admissionEndpoint(value) {
+  try { const url = new URL(value); return `${url.protocol}//${url.host}${url.pathname}`.replace(/[0-9a-f]{32}/gi, '[synthetic-id]'); }
+  catch (_) { return admissionSafeText(value).split('?')[0]; }
+}
+
+// Observe complete MQTT packets, never retain payloads or split/rewrite messages.
+function admissionMqttSummary(message) {
+  if (typeof message === 'string') return { supported: false, reason: 'MQTT binary message expected.' };
+  const packets = []; let offset = 0;
+  while (offset < message.length) {
+    const header = message[offset++]; let remaining = 0, multiplier = 1, lengthByte, count = 0;
+    do {
+      if (offset >= message.length || count++ === 4) return { supported: false, reason: 'Incomplete or invalid MQTT length.' };
+      lengthByte = message[offset++]; remaining += (lengthByte & 127) * multiplier; multiplier *= 128;
+    } while (lengthByte & 128);
+    if (offset + remaining > message.length) return { supported: false, reason: 'MQTT packet crosses WebSocket-message boundary.' };
+    const type = header >> 4;
+    if (type < 1 || type > 14) return { supported: false, reason: 'Unknown MQTT packet type.' };
+    packets.push({ type, success: type === 2 ? remaining === 2 && message[offset + 1] === 0 :
+      type === 9 ? remaining >= 3 && Array.from(message.subarray(offset + 2, offset + remaining)).every((code) => code <= 2) : undefined });
+    offset += remaining;
+  }
+  return { supported: packets.length > 0, packets };
+}
+
+async function admissionMqttStartupProxy(context, page, peer) {
+  const latency = admissionReport.controlledLatency = { recipientOnly: true, origin: 'Native WebSocket constructor',
+    connackTargetMilliseconds: 4200, subackTargetMilliseconds: 6550, readinessWindowMilliseconds: [7000, 8000],
+    injectedSockets: 0, blockedPeerJs: [], sockets: [], errors: [], boundaries: 'Only real upstream CONNACK/SUBACK and subsequent ordered whole messages are delayed; outbound bytes and production timers/ICE/payloads are unchanged.' };
+  const timers = new Set(); let stopped = false;
+  const fail = (error) => latency.errors.push(admissionSafeText(error.message || error));
+  await context.route(/^https?:\/\/([^/]+\.)?peerjs\.com(?::\d+)?\//i, (route) => {
+    latency.blockedPeerJs.push({ transport: 'HTTP', endpoint: admissionEndpoint(route.request().url()), time: Date.now() });
+    return route.abort('blockedbyclient');
+  });
+  await context.routeWebSocket((url) => /(^|\.)peerjs\.com$/i.test(url.hostname) || url.hostname === 'test.mosquitto.org', async (client) => {
+    const address = new URL(client.url());
+    if (/(^|\.)peerjs\.com$/i.test(address.hostname)) {
+      latency.blockedPeerJs.push({ transport: 'WebSocket', endpoint: admissionEndpoint(client.url()), time: Date.now() });
+      await client.close({ code: 1008, reason: 'Diagnostic: recipient PeerJS unavailable' }); return;
+    }
+    const entry = { peer, endpoint: admissionEndpoint(client.url()), time: Date.now(), forwarded: [], gates: [] };
+    latency.sockets.push(entry);
+    // The constructor wrapper records synchronously before the routed callback can run.
+    const constructedAt = await page.evaluate((endpoint) => window.__admissionObservation.webSockets
+      .filter((socket) => socket.endpoint === endpoint).at(-1)?.events[0]?.time, entry.endpoint);
+    if (!Number.isFinite(constructedAt) || latency.injectedSockets !== 0) {
+      entry.unverified = !Number.isFinite(constructedAt) ? 'Native construction timestamp unavailable.' : 'Reconnect: injection is never repeated.';
+      client.connectToServer(); return;
+    }
+    latency.injectedSockets++;
+    entry.constructedAt = constructedAt;
+    const server = client.connectToServer();
+    let pending = [], releaseAt = 0;
+    const forward = (message, summary, receivedAt) => {
+      client.send(message); // Original string/Buffer and complete message boundary preserved.
+      entry.forwarded.push({ receivedAt, sentAt: Date.now(), bytes: message.length,
+        sha256: require('node:crypto').createHash('sha256').update(message).digest('hex'), summary });
+    };
+    const release = () => {
+      if (stopped) return;
+      const held = pending; pending = []; releaseAt = 0;
+      for (const item of held) forward(item.message, item.summary, item.receivedAt);
+    };
+    client.onMessage((message) => {
+      const summary = admissionMqttSummary(message), time = Date.now();
+      entry.forwarded.push({ direction: 'outgoing', time, bytes: message.length, summary });
+      server.send(message); // No delay or credential/payload rewriting in this direction.
+    });
+    server.onMessage((message) => {
+      if (stopped) return;
+      try {
+        const receivedAt = Date.now(), summary = admissionMqttSummary(message);
+        if (!summary.supported) entry.unsupported = summary.reason;
+        for (const [type, target] of [[2, 4200], [9, 6550]]) {
+          if (summary.packets?.some((packet) => packet.type === type) && !entry.gates.some((gate) => gate.type === type)) {
+            entry.gates.push({ type, actualUpstreamReceivedAt: receivedAt, intendedReleaseAt: constructedAt + target,
+              upstreamArrivedBeforeTarget: receivedAt < constructedAt + target });
+            releaseAt = Math.max(releaseAt, constructedAt + target);
+          }
+        }
+        if (releaseAt > receivedAt || pending.length) {
+          pending.push({ message, summary, receivedAt });
+          if (pending.length === 1) {
+            const timer = setTimeout(() => { timers.delete(timer); try { release(); } catch (error) { fail(error); } }, Math.max(0, releaseAt - Date.now()));
+            timers.add(timer);
+          }
+        } else forward(message, summary, receivedAt);
+      } catch (error) { fail(error); }
+    });
+  });
+  return () => { stopped = true; for (const timer of timers) clearTimeout(timer); timers.clear(); };
+}
+
+async function admissionRtcEvidence(page) {
+  return page.evaluate(async () => {
+    const observation = window.__admissionObservation;
+    if (!observation) return null;
+    const peers = [];
+    for (const [index, peer] of observation.peers.entries()) {
+      let selectedCandidatePairs = [], statsError = null;
+      try {
+        const stats = await peer.getStats();
+        const selected = [...stats.values()].filter((entry) => entry.type === 'transport' && entry.selectedCandidatePairId)
+          .map((entry) => stats.get(entry.selectedCandidatePairId));
+        const pairs = selected.length ? selected : [...stats.values()].filter((entry) => entry.type === 'candidate-pair' && entry.nominated && entry.state === 'succeeded');
+        selectedCandidatePairs = pairs.map((pair) => {
+          const local = stats.get(pair.localCandidateId), remote = stats.get(pair.remoteCandidateId);
+          return { state: pair.state, nominated: pair.nominated, bytesSent: pair.bytesSent, bytesReceived: pair.bytesReceived,
+            localType: local?.candidateType, remoteType: remote?.candidateType, protocol: local?.protocol,
+            relayProtocol: local?.relayProtocol, networkType: local?.networkType };
+        });
+      } catch (_) { statsError = 'Native getStats unavailable for this peer.'; }
+      peers.push({ index, connection: peer.connectionState, ice: peer.iceConnectionState, gathering: peer.iceGatheringState,
+        signaling: peer.signalingState, policy: peer.getConfiguration().iceTransportPolicy,
+        localDescriptionType: peer.localDescription?.type || null, remoteDescriptionType: peer.remoteDescription?.type || null,
+        selectedCandidatePairs, statsError });
+    }
+    return { peers, channels: observation.channels.map((channel) => ({ state: channel.readyState, label: channel.label,
+      bufferedAmount: channel.bufferedAmount })), webSockets: observation.webSockets, syncPackets: observation.syncPackets,
+      configurations: observation.configurations, events: observation.events, gatheredCandidates: observation.candidates,
+      gatheredCandidateCounts: observation.candidates.reduce((counts, candidate) => {
+        counts[candidate.type] = (counts[candidate.type] || 0) + 1; return counts;
+      }, {}), iceCandidateErrors: observation.iceErrors, handshakes: observation.handshakes };
+  });
+}
+
+async function admissionProfile(browser, mobile) {
+  const context = await browser.newContext({ viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 900 },
+    deviceScaleFactor: mobile ? 2 : 1, isMobile: mobile, hasTouch: mobile,
+    permissions: ['clipboard-read', 'clipboard-write'], serviceWorkers: 'block' });
+  await context.addInitScript(({ relayOnly }) => {
+    window.__firstFrame = false;
+    window.addEventListener('flutter-first-frame', () => { window.__firstFrame = true; }, { once: true });
+    const observation = { peers: [], channels: [], configurations: [], events: [], candidates: [], iceErrors: [], handshakes: [], syncPackets: [], webSockets: [] };
+    window.__admissionObservation = observation;
+    const safeText = (value) => String(value).replace(/[0-9a-f]{32}/gi, '[synthetic-id]')
+      .replace(/([?&](?:token|key|credential|password|id|peerId)=)[^\s&"']+/gi, '$1[redacted]');
+    const endpoint = (value) => {
+      try {
+        const url = new URL(String(value).replace(/^(stuns?|turns?):(?!\/\/)/i, '$1://'));
+        return `${url.protocol}//${url.host}${url.pathname}`.replace(/[0-9a-f]{32}/gi, '[synthetic-id]');
+      } catch (_) { return '[unparseable endpoint]'; }
+    };
+    const NativeWebSocket = window.WebSocket;
+    window.WebSocket = new Proxy(NativeWebSocket, { construct(target, args) {
+      const socket = Reflect.construct(target, args), entry = { endpoint: endpoint(String(args[0])), state: socket.readyState,
+        opened: false, events: [{ type: 'constructed', time: Date.now() }], messages: [] };
+      observation.webSockets.push(entry);
+      socket.addEventListener('message', async (event) => {
+        const time = Date.now();
+        try {
+          let bytes = null, jsonType = null;
+          if (typeof event.data === 'string') { try { jsonType = JSON.parse(event.data).type; } catch (_) {} }
+          else bytes = new Uint8Array(event.data instanceof Blob ? await event.data.arrayBuffer() :
+            ArrayBuffer.isView(event.data) ? event.data.buffer.slice(event.data.byteOffset, event.data.byteOffset + event.data.byteLength) : event.data);
+          const mqttType = bytes?.length ? bytes[0] >> 4 : null;
+          entry.messages.push({ time, jsonType: typeof jsonType === 'string' ? jsonType : null, mqttType,
+            bytes: bytes?.length || null, registrationAck: jsonType === 'OPEN' || mqttType === 9 });
+        } catch (_) { entry.messageObservationUnavailable = true; }
+      });
+      for (const type of ['open', 'close', 'error']) socket.addEventListener(type, (event) => {
+        entry.state = socket.readyState; if (type === 'open') entry.opened = true;
+        entry.events.push({ type, code: type === 'close' ? event.code : undefined,
+          reason: type === 'close' ? safeText(event.reason || '') : undefined, time: Date.now() });
+      });
+      return socket;
+    } });
+    const packet = (value, direction) => {
+      if (typeof value !== 'string') return;
+      try {
+        const data = JSON.parse(value);
+        if (data.type === 'checkpoint' || data.type === 'syncAck') {
+          observation.syncPackets.push({ direction, type: data.type, time: Date.now(),
+            syncDigest: typeof data.syncDigest === 'string' && /^[0-9a-f]{64}$/.test(data.syncDigest) ? data.syncDigest : null });
+          return;
+        }
+        if (data.type !== 'hello' && data.type !== 'welcome' && data.type !== 'reject' && data.type !== 'error') return;
+        const capabilities = Object.fromEntries(Object.entries(data).filter(([key, value]) =>
+          typeof value === 'boolean' && /^[a-zA-Z][a-zA-Z0-9]*$/.test(key)));
+        observation.handshakes.push({ direction, type: data.type, capabilities, time: Date.now(),
+          reason: typeof data.reason === 'string' ? safeText(data.reason) : undefined });
+      } catch (_) { /* Binary fragments and ordinary edits are not handshake evidence. */ }
+    };
+    const tracked = new WeakSet();
+    const trackChannel = (channel) => {
+      if (tracked.has(channel)) return channel;
+      tracked.add(channel); observation.channels.push(channel);
+      channel.addEventListener('message', (event) => packet(event.data, 'incoming'));
+      for (const type of ['open', 'close', 'error']) channel.addEventListener(type, () => observation.events.push({ type: `channel-${type}`, time: Date.now() }));
+      return channel;
+    };
+    const nativeSend = RTCDataChannel.prototype.send;
+    RTCDataChannel.prototype.send = function (...args) { packet(args[0], 'outgoing'); return nativeSend.apply(this, args); };
+    const Native = window.RTCPeerConnection, nativeCreate = Native.prototype.createDataChannel;
+    Native.prototype.createDataChannel = function (...args) { return trackChannel(nativeCreate.apply(this, args)); };
+    window.RTCPeerConnection = new Proxy(Native, { construct(target, args) {
+      // Only the explicitly selected relay diagnostic changes policy; keep the
+      // production ICE servers, credentials and every other argument untouched.
+      const nativeArgs = relayOnly ? [{ ...(args[0] || {}), iceTransportPolicy: 'relay' }, ...args.slice(1)] : args;
+      const peer = Reflect.construct(target, nativeArgs), index = observation.peers.push(peer) - 1;
+      observation.configurations.push({ peer: index, time: Date.now(), diagnosticRelayOnly: relayOnly,
+        effectivePolicy: peer.getConfiguration().iceTransportPolicy,
+        productionIceServersUnchanged: nativeArgs[0]?.iceServers === args[0]?.iceServers,
+        iceServerEndpoints: (args[0]?.iceServers || []).flatMap((server) => {
+          const urls = server.urls || server.url || []; return (Array.isArray(urls) ? urls : [urls]).map(endpoint);
+        }) });
+      peer.addEventListener('datachannel', (event) => trackChannel(event.channel));
+      for (const type of ['connectionstatechange', 'iceconnectionstatechange', 'icegatheringstatechange', 'signalingstatechange']) peer.addEventListener(type, () =>
+        observation.events.push({ peer: index, type, connection: peer.connectionState, ice: peer.iceConnectionState,
+          gathering: peer.iceGatheringState, localDescriptionType: peer.localDescription?.type || null,
+          remoteDescriptionType: peer.remoteDescription?.type || null, time: Date.now() }));
+      peer.addEventListener('icecandidate', (event) => {
+        if (!event.candidate) return;
+        const candidate = event.candidate, type = candidate.type || / typ (\w+)/.exec(candidate.candidate)?.[1] || 'unknown';
+        observation.candidates.push({ peer: index, type, protocol: candidate.protocol || null,
+          relayProtocol: candidate.relayProtocol || null, time: Date.now() });
+      });
+      peer.addEventListener('icecandidateerror', (event) => observation.iceErrors.push({ peer: index,
+        code: event.errorCode, text: safeText(event.errorText || ''), endpoint: endpoint(event.url || ''), time: Date.now() }));
+      return peer;
+    } });
+  }, { relayOnly: relayAdmissionSuite });
+  const page = await context.newPage(), peer = mobile ? 'recipient-phone-emulation' : 'host-desktop';
+  page.setDefaultTimeout(12000);
+  page.on('pageerror', (error) => admissionReport.pageErrors.push({ peer, text: admissionSafeText(error.message) }));
+  page.on('console', (message) => admissionReport.consoleMessages.push({ peer, type: message.type(), text: admissionSafeText(message.text()) }));
+  page.on('response', (response) => {
+    if (admissionReport.http.length < 400) admissionReport.http.push({ peer, endpoint: admissionEndpoint(response.url()),
+      status: response.status(), resourceType: response.request().resourceType() });
+  });
+  page.on('requestfailed', (request) => admissionReport.http.push({ peer, endpoint: admissionEndpoint(request.url()),
+    failure: admissionSafeText(request.failure()?.errorText || 'requestfailed'), resourceType: request.resourceType() }));
+  page.on('websocket', (socket) => {
+    const endpoint = admissionEndpoint(socket.url());
+    admissionReport.providerEvents.push({ peer, type: 'websocket-created', endpoint, time: Date.now() });
+    for (const direction of ['framesent', 'framereceived']) socket.on(direction, ({ payload }) => {
+      let messageType = null, detail = null;
+      const buffer = typeof payload === 'string' ? Buffer.from(payload) : payload;
+      try {
+        const packet = JSON.parse(buffer.toString('utf8'));
+        if (typeof packet.type === 'string') { messageType = packet.type;
+          if (packet.type === 'ERROR') detail = admissionSafeText(String(packet.payload?.msg || packet.payload || 'provider-error')); }
+      } catch (_) { /* MQTT WebSocket frames are binary, not JSON. */ }
+      const mqttType = buffer.length ? buffer[0] >> 4 : null;
+      const registrationAck = direction === 'framereceived' && (messageType === 'OPEN' || messageType === null && mqttType === 9);
+      if (admissionReport.providerEvents.length < 800) admissionReport.providerEvents.push({ peer, direction, endpoint,
+        jsonType: messageType, mqttType: messageType === null ? mqttType : undefined,
+        mqttSummary: mqttStartupSuite && messageType === null ? admissionMqttSummary(buffer) : undefined, bytes: buffer.length,
+        registrationAck, detail, time: Date.now() });
+    });
+    socket.on('close', () => admissionReport.providerEvents.push({ peer, type: 'websocket-closed', endpoint, time: Date.now() }));
+    socket.on('socketerror', (error) => admissionReport.providerEvents.push({ peer, type: 'websocket-error', endpoint,
+      error: admissionSafeText(error), time: Date.now() }));
+  });
+  const stopProxy = mqttStartupSuite && mobile ? await admissionMqttStartupProxy(context, page, peer) : null;
+  return { page, context, peer, stopProxy };
+}
+
+function admissionTransportMilestones() {
+  const latest = admissionReport.checkpoints.at(-1);
+  const origin = admissionReport.recipientAdmissionStartedAt;
+  const elapsed = (time) => origin && Number.isFinite(time) ? time - origin : null;
+  return { timingOrigin: 'Recipient submits the anonymous admission form; negative offsets precede submission.',
+    hostRegisteredBeforeInvitation: admissionReport.hostReady?.observedRegistrationBeforeInvitation || false,
+    peers: (latest?.peers || []).map((profile) => {
+      const rtc = profile.rtc;
+      if (!rtc) return { peer: profile.peer, evidence: 'unavailable' };
+      const relay = rtc.gatheredCandidates.filter((candidate) => candidate.type === 'relay');
+      const descriptions = rtc.events.filter((event) =>
+        ['offer', 'answer'].includes(event.localDescriptionType) && ['offer', 'answer'].includes(event.remoteDescriptionType) &&
+        event.localDescriptionType !== event.remoteDescriptionType);
+      const opened = rtc.events.filter((event) => event.type === 'channel-open');
+      return { peer: profile.peer, policies: rtc.peers.map((peer) => peer.policy),
+        productionIceServersUnchanged: rtc.configurations.length > 0 && rtc.configurations.every((config) => config.productionIceServersUnchanged),
+        turnCandidateGathering: { observed: relay.length > 0, count: relay.length,
+          firstObservedMilliseconds: elapsed(relay[0]?.time), candidateTypeCounts: rtc.gatheredCandidateCounts,
+          nativeGatheringStates: rtc.peers.map((peer) => peer.gathering), errors: rtc.iceCandidateErrors },
+        offerAnswerApplied: { observed: descriptions.length > 0, firstObservedMilliseconds: elapsed(descriptions[0]?.time),
+          finalDescriptions: rtc.peers.map((peer) => ({ local: peer.localDescriptionType, remote: peer.remoteDescriptionType })) },
+        selectedCandidatePairs: rtc.peers.flatMap((peer) => peer.selectedCandidatePairs),
+        dataChannel: { everOpened: opened.length > 0, firstOpenedMilliseconds: elapsed(opened[0]?.time),
+          currentlyOpen: rtc.channels.some((channel) => channel.state === 'open') },
+        applicationHandshake: rtc.handshakes.map((packet) => ({ ...packet, elapsedMilliseconds: elapsed(packet.time) })) };
+    }),
+    durableAdmission: { verified: admissionReport.fullDurableSyntheticJournalsEqual === true && admissionReport.records === 4,
+      verifiedMilliseconds: elapsed(admissionReport.durableAdmissionVerifiedAt),
+      hostBaselineImmutable: admissionReport.hostBaselineRecordsUnchanged === true,
+      fullDurableSyntheticJournalsEqual: admissionReport.fullDurableSyntheticJournalsEqual === true,
+      records: admissionReport.records ?? null, journalSha256: admissionReport.journalSha256 || null } };
+}
+
+function admissionMqttStartupTiming(rtc) {
+  const latency = admissionReport.controlledLatency, entry = latency?.sockets[0];
+  assert.ok(entry && latency.injectedSockets === 1 && latency.sockets.length === 1, 'Exactly one MQTT latency injection without reconnect is required.');
+  assert.deepEqual(latency.errors, []); assert.ok(!entry.unsupported, entry.unsupported);
+  assert.ok(entry.gates.length === 2 && entry.gates.every((gate) => gate.upstreamArrivedBeforeTarget),
+    'Late/unsupported upstream ACK cannot establish the controlled timing scenario.');
+  const socket = rtc.webSockets.find((socket) => socket.endpoint === entry.endpoint && socket.events[0]?.time === entry.constructedAt);
+  const connack = socket?.messages.find((message) => message.mqttType === 2), subacks = socket?.messages.filter((message) => message.mqttType === 9) || [];
+  const subscriptions = entry.forwarded.filter((message) => message.direction === 'outgoing' && message.summary.packets?.some((packet) => packet.type === 8));
+  const delivered = entry.forwarded.filter((message) => message.sentAt);
+  const acceptedAcks = delivered.flatMap((message) => message.summary.packets || []).filter((packet) => packet.type === 9 && packet.success);
+  assert.ok(connack && subacks.length && subscriptions.length >= 2 && acceptedAcks.length >= 2,
+    'Real CONNACK and both real successful SUBACKs must reach the page.');
+  const connackElapsed = connack.time - entry.constructedAt, lastSuback = subacks.at(-1).time;
+  const subackElapsed = lastSuback - entry.constructedAt;
+  const subscriptionElapsed = lastSuback - Math.min(...subscriptions.map((message) => message.time));
+  const firstDialElapsed = Math.min(...rtc.configurations.map((config) => config.time)) - entry.constructedAt;
+  const admittedElapsed = admissionReport.durableAdmissionVerifiedAt - admissionReport.recipientAdmissionStartedAt;
+  const timing = latency.measured = { connackElapsedMilliseconds: connackElapsed, subackElapsedMilliseconds: subackElapsed,
+    subscriptionElapsedMilliseconds: subscriptionElapsed, firstNativeRtcDialMilliseconds: firstDialElapsed,
+    durableAdmissionMilliseconds: admittedElapsed, joinBudgetMilliseconds: 30000, timeoutBoundaryExercised: false,
+    readinessEvidence: 'First native RTC dial after real MQTT registration/claim; not a private provider-ready hook.',
+    modifiedProductionTimers: false };
+  assert.ok(connackElapsed >= 4200 && connackElapsed < 4500 && connackElapsed < 5000, 'CONNACK delivery must fit the real five-second connect stage.');
+  assert.ok(subackElapsed >= 6550 && subackElapsed < 6800 && subscriptionElapsed < 4000, 'Real SUBACKs must fit the real four-second subscription stage.');
+  assert.ok(firstDialElapsed > 7000 && firstDialElapsed < 8000, 'Externally observed MQTT-only RTC dial must start after 7 seconds but before 8 seconds.');
+  assert.ok(admittedElapsed < 30000, 'Real durable admission must finish within the unchanged 30-second join budget.');
+  assert.ok(latency.blockedPeerJs.some((event) => event.transport === 'WebSocket'), 'Recipient PeerJS must actually be unavailable.');
+  assert.ok(!rtc.webSockets.some((socket) => /peerjs/.test(socket.endpoint) && socket.messages.some((message) => message.jsonType === 'OPEN')),
+    'No recipient PeerJS registration may substitute for MQTT fallback.');
+  return timing;
+}
+
+async function firstAdmissionDiagnostic(browser) {
+  const profiles = [], startedAt = Date.now(); let deadline, lastRuntimeSampleAt = 0;
+  const budgetMilliseconds = relayAdmissionSuite || mqttStartupSuite ? 90000 : 120000;
+  const workBudgetMilliseconds = relayAdmissionSuite || mqttStartupSuite ? 85000 : budgetMilliseconds;
+  admissionReport.execution = { budgetMilliseconds, workBudgetMilliseconds, cleanupReserveMilliseconds: budgetMilliseconds - workBudgetMilliseconds,
+    requestedIcePolicy: relayAdmissionSuite ? 'relay' : 'all', productionIceServersPreserved: true,
+    diagnosticPolicyOverride: relayAdmissionSuite, retriesRequested: 0 };
+  const sampleRuntime = async (label, force = false) => {
+    const time = Date.now();
+    if (!force && time - lastRuntimeSampleAt < 2000) return;
+    lastRuntimeSampleAt = time;
+    const peers = [];
+    for (const profile of profiles) if (!profile.page.isClosed()) peers.push({ peer: profile.peer,
+      semantics: admissionSafeText(await body(profile.page).catch(() => 'unavailable')),
+      rtc: await admissionRtcEvidence(profile.page).catch(() => null) });
+    admissionReport.runtimeSamples.push({ label, time, elapsedMilliseconds: time - startedAt,
+      recipientAdmissionElapsedMilliseconds: admissionReport.recipientAdmissionStartedAt ? time - admissionReport.recipientAdmissionStartedAt : null,
+      providerEventsObserved: admissionReport.providerEvents.length, peers });
+    await fs.writeFile(path.join(output, 'admission-runtime-samples.json'), JSON.stringify(admissionReport.runtimeSamples, null, 2));
+  };
+  const saveCheckpoint = async (label) => {
+    const entry = { label, stage: admissionReport.stage, elapsedMilliseconds: Date.now() - startedAt, peers: [] };
+    for (const profile of profiles) if (!profile.page.isClosed()) {
+      const page = profile.page, journal = await history(page).catch(() => null);
+      entry.peers.push({ peer: profile.peer, url: admissionEndpoint(page.url()),
+        semantics: admissionSafeText(await body(page).catch(() => 'unavailable')),
+        completeSyntheticJournal: journal, rtc: await admissionRtcEvidence(page).catch(() => null) });
+      await page.screenshot({ path: path.join(output, `${label}-${profile.peer}.png`), timeout: 1500 }).catch((error) => {
+        entry.screenshotErrors ||= []; entry.screenshotErrors.push({ peer: profile.peer, error: admissionSafeText(error.message) });
+      });
+    }
+    admissionReport.checkpoints.push(entry);
+    await fs.writeFile(path.join(output, `${label}.json`), JSON.stringify(entry, null, 2));
+    return entry;
+  };
+  try {
+    await Promise.race([(async () => {
+      admissionReport.stage = 'host-load';
+      const host = await admissionProfile(browser, false); profiles.push(host);
+      await load(host.page, base);
+      admissionReport.stage = 'host-anonymous-create';
+      await host.page.getByRole('button', { name: 'Создать комнату', exact: true }).click();
+      const prompt = host.page.getByRole('alertdialog'); await prompt.getByText('Как вас зовут?', { exact: true }).waitFor();
+      await prompt.getByRole('button', { name: 'Продолжить', exact: true }).click();
+      await host.page.getByRole('button', { name: 'Выбрать Без имени', exact: true }).waitFor({ timeout: 45000 });
+      const hostBaseline = await history(host.page);
+      assert.equal(hostBaseline.length, 2); // Anonymous participant + editor grant, no person naming race.
+      admissionReport.stage = 'host-signaling-registration';
+      await waitUntil(async () => {
+        await sampleRuntime('host-registration');
+        const sockets = await host.page.evaluate(() => window.__admissionObservation.webSockets.filter((socket) => socket.opened && socket.state === 1).map((socket) => socket.endpoint));
+        const events = admissionReport.providerEvents.filter((event) => event.peer === host.peer && sockets.includes(event.endpoint));
+        if (mqttStartupSuite) return events.some((event) => event.jsonType === 'OPEN' && event.registrationAck) &&
+          events.filter((event) => event.direction === 'framereceived').flatMap((event) => event.mqttSummary?.packets || [])
+            .filter((packet) => packet.type === 9 && packet.success).length >= 2;
+        return events.some((event) => event.registrationAck);
+      }, 'Host did not receive a real PeerJS OPEN or MQTT subscription acknowledgment on a currently open socket before invitation.', 35000);
+      const hostStatus = await host.page.getByRole('button', { name: /^Участники:/ }).ariaSnapshot();
+      assert.match(hostStatus, /Участники:/);
+      assert.doesNotMatch(hostStatus, /Нет подключения к сети/);
+      admissionReport.hostReady = { observedRegistrationBeforeInvitation: true, participantStatus: admissionSafeText(hostStatus),
+        bothProvidersRegistered: mqttStartupSuite ? true : undefined,
+        elapsedMilliseconds: Date.now() - startedAt };
+      await saveCheckpoint('admission-host-registered');
+      admissionReport.stage = 'copy-actual-guest-invitation';
+      const invitation = await invite(host.page, 'guest'); // Real clipboard URL, not address-bar reconstruction.
+      const copied = new URL(invitation), application = new URL(base);
+      assert.equal(copied.origin, application.origin); assert.equal(copied.pathname, application.pathname);
+      assert.equal(new URLSearchParams(copied.hash.slice(1)).get('role'), 'guest');
+      admissionReport.invitation = { actualUiClipboard: true, role: 'guest', hostingPath: copied.pathname,
+        sha256: require('node:crypto').createHash('sha256').update(invitation).digest('hex'), roomIdentity: 'fresh synthetic room only; no existing user room or credential input' };
+      admissionReport.stage = 'fresh-phone-recipient-load';
+      const recipient = await admissionProfile(browser, true); profiles.push(recipient);
+      await load(recipient.page, invitation);
+      const name = recipient.page.getByRole('alertdialog'); await name.getByText('Как вас зовут?', { exact: true }).waitFor();
+      admissionReport.stage = 'fresh-phone-first-admission';
+      admissionReport.recipientAdmissionStartedAt = Date.now();
+      await name.getByRole('button', { name: 'Продолжить', exact: true }).click();
+      await sampleRuntime('recipient-admission-start', true);
+      let entryFailure = null;
+      await waitUntil(async () => {
+        await sampleRuntime('recipient-admission-progress');
+        const semantics = await body(recipient.page);
+        if (/Выбрать Без имени/.test(semantics)) return true;
+        if (/Не удалось подключиться за 30 секунд|Не удалось присоединиться|несовместим|не поддержива|отклонил|Отказано/i.test(semantics)) { entryFailure = admissionSafeText(semantics); return true; }
+        return false;
+      }, 'Fresh recipient did not reach the tree or a concrete production admission error within 45 seconds.', 45000);
+      await sampleRuntime('recipient-admission-result', true);
+      await saveCheckpoint('admission-recipient-result');
+      if (entryFailure) throw new Error(`Actual first admission failed: ${entryFailure}`);
+      admissionReport.stage = 'complete-durable-journal-convergence';
+      await converged([host.page, recipient.page]);
+      const final = await history(host.page); assert.deepEqual(await history(recipient.page), final);
+      for (const old of hostBaseline) assert.deepEqual(final.find((record) => record.id === old.id), old);
+      assert.equal(final.length, 4, 'Two anonymous members and two durable roles are the only expected admission records.');
+      assert.equal(final.filter((record) => record.kind === 'participantRole' && record.text === 'guest').length, 1);
+      Object.assign(admissionReport, { records: final.length, fullDurableSyntheticJournalsEqual: true, hostBaselineRecordsUnchanged: true,
+        durableAdmissionVerifiedAt: Date.now(), journalSha256: require('node:crypto').createHash('sha256').update(JSON.stringify(final)).digest('hex') });
+      const rtc = await Promise.all(profiles.map((profile) => admissionRtcEvidence(profile.page)));
+      const expectedPolicy = relayAdmissionSuite ? 'relay' : 'all';
+      assert.ok(rtc.every((entry) => entry.configurations.length > 0 && entry.configurations.every((config) => config.productionIceServersUnchanged)),
+        'The diagnostic must preserve the actual production ICE server list and credentials.');
+      assert.ok(rtc.every((entry) => entry.channels.some((channel) => channel.state === 'open') &&
+        entry.peers.some((peer) => peer.connection === 'connected' && peer.policy === expectedPolicy && peer.selectedCandidatePairs.length &&
+          (!relayAdmissionSuite || peer.selectedCandidatePairs.every((pair) => pair.localType === 'relay' && pair.remoteType === 'relay')))),
+      `Actual ${expectedPolicy} ICE connection/selected pair and open channels are required on both profiles.`);
+      assert.ok(rtc.every((entry) => entry.peers.some((peer) =>
+        ['offer', 'answer'].includes(peer.localDescriptionType) && ['offer', 'answer'].includes(peer.remoteDescriptionType) &&
+        peer.localDescriptionType !== peer.remoteDescriptionType)), 'Both profiles must actually apply an offer and answer, without retaining SDP.');
+      if (relayAdmissionSuite) assert.ok(rtc.every((entry) => entry.gatheredCandidateCounts.relay > 0),
+        'Relay admission must include a real gathered relay candidate on both profiles, not just signaling success.');
+      const handshakes = rtc.flatMap((entry) => entry.handshakes);
+      assert.ok(['hello', 'welcome'].every((type) => handshakes.some((packet) => packet.type === type)),
+        'Real application hello/welcome were not observed; tree visibility alone is insufficient.');
+      if (mqttStartupSuite) {
+        const sync = rtc.flatMap((entry) => entry.syncPackets);
+        const matched = sync.filter((packet) => packet.type === 'syncAck' && packet.direction === 'incoming' && packet.syncDigest &&
+          sync.some((other) => other.type === 'syncAck' && other.direction === 'outgoing' && other.syncDigest === packet.syncDigest) &&
+          sync.some((other) => other.type === 'checkpoint' && other.syncDigest === packet.syncDigest));
+        assert.ok(matched.length, 'Real delivered syncAck matching an observed checkpoint is required; journal equality alone is not ACK evidence.');
+        admissionReport.actualSyncAcks = matched.map((packet) => ({ ...packet,
+          elapsedMilliseconds: packet.time - admissionReport.recipientAdmissionStartedAt,
+          matchesFinalJournal: packet.syncDigest === initialSyncDigest(final), matchesHostBaseline: packet.syncDigest === initialSyncDigest(hostBaseline) }));
+        admissionReport.mqttStartupTiming = admissionMqttStartupTiming(rtc[1]);
+      }
+      await fs.writeFile(path.join(output, 'admission-complete-synthetic-journal.json'), JSON.stringify(final, null, 2));
+      await saveCheckpoint('admission-complete-convergence');
+      assert.deepEqual(admissionReport.pageErrors, []);
+      assert.ok(!admissionReport.consoleMessages.some((entry) => compactFlutterFailure.test(entry.text)), 'Flutter rendering failure in actual public browser.');
+      Object.assign(admissionReport, { completed: true, stage: 'complete', elapsedMilliseconds: Date.now() - startedAt,
+        firstAdmissionPassed: true, relayOnlyAdmissionPassed: relayAdmissionSuite ? true : undefined,
+        controlledMqttStartupPassed: mqttStartupSuite ? true : undefined,
+        productionIcePolicyUnchanged: !relayAdmissionSuite, iceTransportPolicy: expectedPolicy,
+        independentProfiles: ['desktop host', '390x844 phone-emulated recipient'],
+        rtc, handshakes,
+        limitations: ['Same machine/desktop browser with phone emulation is not a physical phone or cross-NAT proof.',
+          relayAdmissionSuite ? 'Only relay policy is diagnostic; actual production ICE servers and credentials are preserved. Any relay success covers this machine/network/time only.' :
+            'Selected host/srflx/relay candidate types are reported, never assumed to establish public TURN reachability.',
+          mqttStartupSuite ? 'Controlled latency only: recipient PeerJS blocked; real MQTT CONNACK/SUBACK delivery delayed, with unchanged whole-message bytes/order. Native RTC dial is external readiness evidence; the 30-second failure boundary is not exercised by an earlier successful join.' :
+            'No provider rewriting, added server/credential, TLS bypass, extra recipient, localhost comparison, reload, old matrix, account or credential-file access.'] });
+    })(), new Promise((_, reject) => {
+      deadline = setTimeout(() => reject(new Error(`Finite ${suite} reached its ${workBudgetMilliseconds / 1000}-second work deadline; report partial and close owned contexts.`)), workBudgetMilliseconds);
+    })]);
+  } catch (error) {
+    admissionReport.failure = admissionSafeText(error.stack || error);
+    admissionReport.elapsedMilliseconds = Date.now() - startedAt;
+    await saveCheckpoint('admission-failure');
+    process.exitCode = 1;
+  } finally {
+    clearTimeout(deadline);
+    for (const profile of profiles) profile.stopProxy?.();
+    try {
+      admissionReport.transportMilestones = admissionTransportMilestones();
+      await fs.writeFile(path.join(output, 'admission-transport-milestones.json'), JSON.stringify(admissionReport.transportMilestones, null, 2));
+      await fs.writeFile(path.join(output, `${suite}.json`), JSON.stringify(admissionReport, null, 2));
+    } finally {
+      await Promise.all(profiles.map((profile) => profile.context.close()));
+    }
+  }
 }
 
 async function connectedRelayEvidence(page) {
@@ -2340,12 +2837,16 @@ async function localAuthorHistory(browser, pages, errors) {
 
 (async () => {
   await fs.mkdir(output, { recursive: true });
-  if (tracedPublicFeature || cleanAddressSuite) assert.deepEqual(await fs.readdir(output), [],
+  if (tracedPublicFeature || cleanAddressSuite || firstAdmissionSuite) assert.deepEqual(await fs.readdir(output), [],
     'Use a fresh empty focused-feature artifacts directory; failed evidence is never overwritten.');
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   const pages = [];
   const errors = [];
   try {
+    if (firstAdmissionSuite) {
+      await firstAdmissionDiagnostic(browser);
+      return;
+    }
     if (cleanAddressSuite) {
       await cleanAddressLocal(browser, pages, errors);
       return;
