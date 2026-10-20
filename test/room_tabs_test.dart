@@ -5,8 +5,12 @@ import 'package:mytree_webrtc_demo/local/room_tabs.dart';
 import 'package:mytree_webrtc_demo/local/room_tabs_stub.dart';
 
 const _room = '0123456789abcdef0123456789abcdef';
+const _resync = 'fedcba9876543210fedcba9876543210';
 
-RoomTabState _state({Map<String, String> inventory = const {}}) => RoomTabState(
+RoomTabState _state({
+  Map<String, String> inventory = const {},
+  List<String> completedResyncs = const [],
+}) => RoomTabState(
   roomId: _room,
   actorId: 'actor',
   onlineCount: 2,
@@ -15,6 +19,7 @@ RoomTabState _state({Map<String, String> inventory = const {}}) => RoomTabState(
   status: 'Онлайн · участников: 2',
   initialSyncStatus: 'История комнаты проверена',
   inventory: inventory,
+  completedResyncs: completedResyncs,
 );
 
 void main() {
@@ -207,6 +212,74 @@ void main() {
       );
     },
   );
+
+  test('resync completions are optional for ordinary and legacy states', () {
+    final state = _state();
+    expect(state.completedResyncs, isEmpty);
+    expect(() => state.completedResyncs.add(_resync), throwsUnsupportedError);
+    expect(state.toJson().containsKey('completedResyncs'), isFalse);
+    expect(RoomTabState.fromJson(state.toJson())!.completedResyncs, isEmpty);
+    final explicitEmpty = RoomTabState.fromJson({
+      ...state.toJson(),
+      'completedResyncs': [],
+    })!;
+    expect(explicitEmpty.completedResyncs, isEmpty);
+    expect(explicitEmpty.toJson().containsKey('completedResyncs'), isFalse);
+  });
+
+  test('resync completions are copied, immutable and JSON round trip', () {
+    final ids = [_resync, _room];
+    final state = _state(completedResyncs: ids);
+    ids.clear();
+    expect(state.completedResyncs, [_resync, _room]);
+    expect(() => state.completedResyncs.clear(), throwsUnsupportedError);
+    final decoded = RoomTabState.fromJson(
+      jsonDecode(jsonEncode(state.toJson())),
+    )!;
+    expect(decoded.completedResyncs, [_resync, _room]);
+    expect(decoded.toJson(), state.toJson());
+    expect(() => decoded.completedResyncs.clear(), throwsUnsupportedError);
+    final decodedIds = [_resync];
+    final copied = RoomTabState.fromJson({
+      ...state.toJson(),
+      'completedResyncs': decodedIds,
+    })!;
+    decodedIds.clear();
+    expect(copied.completedResyncs, [_resync]);
+  });
+
+  test('resync completions reject malformed, duplicate or oversized IDs', () {
+    final value = _state().toJson();
+    for (final invalid in <Object?>[
+      null,
+      true,
+      1,
+      _resync,
+      {},
+      [null],
+      [1],
+      [''],
+      ['a' * 31],
+      ['a' * 33],
+      ['A' * 32],
+      ['g' * 32],
+      [_resync, _resync],
+      [_resync, null],
+      [for (var i = 0; i < 65; i++) i.toRadixString(16).padLeft(32, '0')],
+    ]) {
+      expect(
+        RoomTabState.fromJson({...value, 'completedResyncs': invalid}),
+        isNull,
+        reason: '$invalid',
+      );
+    }
+    final ids = [
+      for (var i = 0; i < 64; i++) i.toRadixString(16).padLeft(32, '0'),
+    ];
+    final bounded = RoomTabState.fromJson({...value, 'completedResyncs': ids})!;
+    expect(bounded.completedResyncs, ids);
+    expect(bounded.toJson()['completedResyncs'], hasLength(64));
+  });
 
   test('native local-tab factory leaves independent stores unchanged', () {
     expect(createRoomTabs(_room, 'actor'), isNull);

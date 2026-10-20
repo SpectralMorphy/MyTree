@@ -39,7 +39,7 @@ Startup registers the channel listener before requesting ownership:
 
 Only the owner runs the normal room networking after this decision; a follower retires its own peer/channels and requests local state instead. `_networkOwner` checks both the session's role and `roomTabs.isLeader`, guarding networking/publishing even before a queued role callback has run. A new local owner resets inherited proof and runs the ordinary remote entry checks; stored edits and membership are retained.
 
-There is **no heartbeat lease, timeout-based takeover, `steal`, or visibility-based release** in this coordinator. Hiding or suspending the owner does not make a visible follower steal its lock. `RoomSession.setForeground(false)` records a background timestamp; resuming a follower requests fresh owner state, while resuming an owner checks ordinary connectivity. Visibility alone proves neither a live peer nor a completed synchronization. Consequently a suspended owner can delay followers until it resumes or its lock is actually released; the code does not promise immediate visible-tab failover.
+There is **no heartbeat lease, timeout-based takeover, `steal`, or visibility-based release** in this coordinator. Hiding or suspending the owner does not make a visible follower steal its lock. `RoomSession.setForeground(false)` records a background timestamp. A qualifying resume of a confirmed follower requests a correlated live recheck from its owner; the owner starts a new verification round instead of returning cached readiness. Visibility alone proves neither a live peer nor completed synchronization. A suspended owner can still delay followers until it resumes or its lock is actually released; the code does not promise immediate visible-tab failover.
 
 Disposing a queued follower aborts its pending request. A tab disposed during startup cannot later become an active owner.
 
@@ -50,7 +50,8 @@ Disposing a queued follower aborts its pending request. A tab disposed during st
 - room and actor IDs;
 - online count, explicit network availability, and an optional actor roster;
 - initial-sync readiness, the distinct local-copy flag, and status/error strings;
-- an **immutable inventory** mapping edit IDs to SHA-256 content digests.
+- an **immutable inventory** mapping edit IDs to SHA-256 content digests;
+- optional `completedResyncs`, at most 64 unique live-recheck request IDs, validated separately from readiness.
 
 There is no history array, editor text, participant-name map, tree payload, or photo body in the checkpoint. The digest implementation in [room_protocol.dart](../../lib/room_protocol.dart) uses a fixed field order over the edit envelope, including non-text kind, role subject, and author proof when present. Legacy digest bytes are unchanged. Equal IDs with different payloads or proofs are not considered synchronized.
 
@@ -110,9 +111,11 @@ The [room-page UI](../../lib/ui/room_page.dart) opens the room body only for `jo
 
 ### Current entry proof versus an older UI latch
 
-The owner's published `initialSyncComplete` comes from `_currentTabEntryReady`, not merely its already-latched UI flag. It reflects the current remote checkpoint/cohort barrier; a newly opened sibling cannot inherit old success while another initial contribution is still being imported. A freshly created, never-shared room has the session's separate explicit solo proof.
+The owner's published `initialSyncComplete` comes from `_currentTabEntryReady`, not merely its already-latched UI flag. It reflects the current remote checkpoint/cohort barrier; a newly opened sibling cannot inherit old success while another initial contribution is still being imported. A freshly created, never-shared room has the session's separate explicit solo proof; a validated, persisted Disk entry retains its distinct Disk-source readiness.
 
 Once an existing follower has completed entry, ordinary same-term snapshots do not clear that UI readiness latch. A new local role/term or explicit retry resets the attempt; coordination errors clear inherited readiness/local-copy proof but do not erase saved membership. A follower retry requests its owner's state rather than starting another peer.
+
+A qualifying wake is stricter: optional `RoomTabsResync` sends a fresh request ID to the currently selected owner/term, preserving it across owner discovery. The adapter validates bounded IDs, deduplicates at most 64 requests and never answers a `resync` with cached readiness. The owner coalesces requests into a new durable verification round and publishes completed IDs only after fresh peer proof or a freshly verified Disk read. The resumed follower ignores ready/local-copy snapshots lacking its matching completion ID, and still verifies the advertised inventory against shared durable storage. Old-owner/wrong-request responses cannot release loading; timeout leaves an explicit local-copy escape rather than new sockets or lock stealing.
 
 ## Presence: revocation is faster than promotion
 

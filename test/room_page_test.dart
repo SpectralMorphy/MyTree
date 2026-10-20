@@ -1601,6 +1601,153 @@ void main() {
     },
   );
 
+  for (final dialogOpen in [false, true]) {
+    testWidgets(
+      'resume loading covers stale editor and open dialog=$dialogOpen',
+      (tester) async {
+        await store.saveMembership(roomId);
+        await mount(tester);
+        final session = tester
+            .widget<RoomDiskStatusButton>(find.byType(RoomDiskStatusButton))
+            .session;
+        expect(session.initialSyncComplete, isTrue);
+        if (dialogOpen) await settings(tester, 'Настройки комнаты');
+        final before = await store.loadHistory(roomId);
+        session.setForeground(false);
+        peers.last.disconnected = true;
+        session.setForeground(true);
+        expect(session.initialSyncComplete, isFalse);
+        await tester.pump();
+        await tester.pump();
+        expect(find.byKey(const Key('room-text')), findsNothing);
+        expect(find.text('Сверяем изменения после возвращения…'), findsWidgets);
+        if (dialogOpen) {
+          expect(
+            find.byKey(const Key('resume-loading-overlay')).hitTestable(),
+            findsOneWidget,
+          );
+          expect(find.text('Сохранить').hitTestable(), findsNothing);
+        }
+        await tester.pump(const Duration(seconds: 31));
+        for (var i = 0; i < 8; i++) {
+          await tester.pump();
+        }
+        expect(session.initialSyncComplete, isFalse);
+        expect(find.textContaining('30 секунд'), findsWidgets);
+        await tester.tap(
+          find.text('Открыть локальную копию').hitTestable().last,
+        );
+        await tester.pump();
+        await tester.pump();
+        expect(session.localCopyOpened, isTrue);
+        expect(find.byKey(const Key('resume-loading-overlay')), findsNothing);
+        if (dialogOpen) {
+          expect(find.byType(RoomSettingsDialog), findsOneWidget);
+        } else {
+          expect(find.byKey(const Key('sync-status')), findsOneWidget);
+        }
+        expect(await store.loadHistory(roomId), before);
+        await tester.pumpWidget(const SizedBox.shrink());
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  for (final exit in [false, true]) {
+    testWidgets(
+      'phone biography survives resume or exits to menu, exit=$exit',
+      (tester) async {
+        await seedBoundRoom(alias: 'Анна');
+        final tree = TreeDocument();
+        await store.appendHistory(roomId, [
+          RoomEdit(
+            id: 'resume-parent',
+            author: 'relative-author',
+            clock: 100,
+            createdAt: 100,
+            kind: RoomEditKind.tree,
+            text: jsonEncode(
+              tree.createPerson('relative', name: 'Родитель').toJson(),
+            ),
+          ).toJson(),
+          RoomEdit(
+            id: 'resume-parent-link',
+            author: 'relative-author',
+            clock: 101,
+            createdAt: 101,
+            kind: RoomEditKind.tree,
+            text: jsonEncode({
+              'type': 'setValue',
+              'personId': rootTreePersonId,
+              'field': 'fatherId',
+              'value': 'relative',
+            }),
+          ).toJson(),
+        ]);
+        await mount(tester, useDefaultEditor: true);
+        tester.view.physicalSize = const Size(390, 844);
+        await tester.pumpAndSettle();
+        final editor = tester.state(find.byType(TreeEditor));
+        final session = tester
+            .widget<RoomDiskStatusButton>(find.byType(RoomDiskStatusButton))
+            .session;
+        await tester.tap(find.byKey(const Key('open-biography')));
+        await tester.pumpAndSettle();
+        expect(find.byKey(const Key('tree-biography-route')), findsOneWidget);
+        session.setForeground(false);
+        peers.last.disconnected = true;
+        session.setForeground(true);
+        await tester.pump();
+        await tester.pump();
+        expect(
+          find.byKey(const Key('resume-loading-overlay')).hitTestable(),
+          findsOneWidget,
+        );
+        expect(
+          tester.state(find.byType(TreeEditor, skipOffstage: false)),
+          same(editor),
+        );
+        expect(editor.mounted, isTrue);
+        expect(
+          tester
+              .widget<PopupMenuButton<String>>(
+                find.byKey(const Key('room-menu'), skipOffstage: false),
+              )
+              .enabled,
+          isFalse,
+        );
+        if (exit) {
+          await tester.tap(find.text('Вернуться в меню').hitTestable().last);
+          await tester.pumpAndSettle();
+          expect(find.text('Создать комнату'), findsOneWidget);
+          expect(find.byKey(const Key('tree-biography-route')), findsNothing);
+          expect(find.byKey(const Key('resume-loading-overlay')), findsNothing);
+        } else {
+          await tester.pump(const Duration(seconds: 31));
+          for (var i = 0; i < 8; i++) {
+            await tester.pump();
+          }
+          await tester.tap(
+            find.text('Открыть локальную копию').hitTestable().last,
+          );
+          await tester.pumpAndSettle();
+          expect(editor.mounted, isTrue);
+          expect(find.byKey(const Key('resume-loading-overlay')), findsNothing);
+          final relative = find.byKey(const ValueKey('relative-Отец-relative'));
+          await tester.ensureVisible(relative);
+          await tester.tap(
+            find.descendant(of: relative, matching: find.text('Родитель')),
+          );
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(editor.mounted, isTrue);
+        }
+        await tester.pumpWidget(const SizedBox.shrink());
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
   testWidgets(
     'unavailable signaling shows retry instead of silently opening stale text',
     (tester) async {
@@ -2370,7 +2517,11 @@ void main() {
       final before = await store.loadHistory(roomId);
       await mount(tester, seedName: false);
       final action = find.byKey(const Key('disk-sync-button'));
-      expect(action, role == RoomRole.editor ? findsOneWidget : findsNothing);
+      expect(action, findsOneWidget);
+      expect(
+        tester.widget<IconButton>(action).onPressed,
+        role == RoomRole.editor ? isNotNull : isNull,
+      );
       expect(find.byKey(const Key('disk-sync-status')), findsNothing);
       expect(find.text('Ожидаем доступ от редактора'), findsNothing);
       if (role == RoomRole.editor) {
@@ -2408,6 +2559,38 @@ void main() {
         reason:
             'Reading status and retrying without a key must not author history.',
       );
+      await tester.pumpWidget(const SizedBox.shrink());
+      expect(tester.takeException(), isNull);
+    });
+  }
+
+  for (final width in [320.0, 390.0]) {
+    testWidgets('phone guest keeps a read-only Disk icon at $width', (
+      tester,
+    ) async {
+      await seedGuestRoom();
+      await mount(tester, useDefaultEditor: true);
+      tester.view.physicalSize = Size(width, 844);
+      await tester.pumpAndSettle();
+      final action = find.byKey(const Key('disk-sync-button'));
+      expect(action, findsOneWidget);
+      final rect = tester.getRect(action);
+      expect(rect.left, greaterThanOrEqualTo(0));
+      expect(rect.right, lessThanOrEqualTo(width));
+      expect(
+        rect.right,
+        lessThanOrEqualTo(
+          tester.getRect(find.byKey(const Key('participants-button'))).left,
+        ),
+      );
+      expect(tester.widget<IconButton>(action).onPressed, isNull);
+      final before = await store.loadHistory(roomId);
+      await tester.longPress(action);
+      await tester.pumpAndSettle();
+      expect(find.text('Яндекс Диск: Не подключён'), findsOneWidget);
+      expect(find.byType(RoomSettingsDialog), findsNothing);
+      expect(await store.loadHistory(roomId), before);
+      expect(await store.loadDiskCredentials(roomId), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
       expect(tester.takeException(), isNull);
     });

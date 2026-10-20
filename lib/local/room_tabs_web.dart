@@ -110,7 +110,7 @@ RoomTabs? createRoomTabs(String roomId, String actorId) {
   }
 }
 
-class _WebRoomTabs implements RoomTabs {
+class _WebRoomTabs implements RoomTabs, RoomTabsResync {
   _WebRoomTabs(
     this.roomId,
     this.actorId,
@@ -128,6 +128,8 @@ class _WebRoomTabs implements RoomTabs {
   final String _tabId = createRoomId();
   final _roles = StreamController<void>.broadcast();
   final _states = StreamController<RoomTabState>.broadcast();
+  final _resyncRequests = StreamController<String>.broadcast();
+  final _recentResyncRequests = <String>{};
   final _release = Completer<JSAny?>();
   Future<void>? _starting;
   Completer<bool>? _decision;
@@ -140,6 +142,7 @@ class _WebRoomTabs implements RoomTabs {
   String? _owner;
   String? _requestId;
   String? _requestTerm;
+  String? _pendingResyncId;
   RoomTabState? _latest;
 
   @override
@@ -150,6 +153,9 @@ class _WebRoomTabs implements RoomTabs {
 
   @override
   Stream<RoomTabState> get onState => _states.stream;
+
+  @override
+  Stream<String> get onResyncRequested => _resyncRequests.stream;
 
   @override
   Future<void> start() => _starting ??= _start();
@@ -281,6 +287,19 @@ class _WebRoomTabs implements RoomTabs {
       'request': request,
       if (_term != null) 'term': _term,
     });
+    final pending = _pendingResyncId;
+    if (_term != null && _owner != null && pending != null) {
+      _post('resync', {'term': _term, 'from': _tabId, 'request': pending});
+    }
+  }
+
+  @override
+  void requestResync(String requestId) {
+    if (_disposed || _leader || !isValidRoomId(requestId)) return;
+    // Discovery/owner selection may still be in flight. Keep this independent
+    // of ordinary state request IDs and retry only with a selected live term.
+    _pendingResyncId = requestId;
+    requestState();
   }
 
   void _post(String kind, Map<String, Object?> fields) {
@@ -323,6 +342,27 @@ class _WebRoomTabs implements RoomTabs {
       return;
     }
     final kind = decoded['kind'];
+    if (kind == 'resync') {
+      final from = decoded['from'];
+      final request = decoded['request'];
+      if (!isLeader ||
+          decoded['term'] != _term ||
+          from is! String ||
+          !isValidRoomId(from) ||
+          request is! String ||
+          !isValidRoomId(request) ||
+          _recentResyncRequests.contains(request)) {
+        return;
+      }
+      if (_recentResyncRequests.length == 64) {
+        _recentResyncRequests.remove(_recentResyncRequests.first);
+      }
+      _recentResyncRequests.add(request);
+      // Cached readiness is not a live proof. The session must perform the
+      // exchange and explicitly publish this ID in completedResyncs later.
+      _resyncRequests.add(request);
+      return;
+    }
     if (kind == 'discover' || kind == 'request') {
       final from = decoded['from'];
       final request = decoded['request'];
@@ -434,6 +474,9 @@ class _WebRoomTabs implements RoomTabs {
       }
       _requestId = null;
       _requestTerm = null;
+      if (state.completedResyncs.contains(_pendingResyncId)) {
+        _pendingResyncId = null;
+      }
       _states.add(state);
     } catch (error, stackTrace) {
       if (!_disposed && request == _requestId) {
@@ -456,6 +499,8 @@ class _WebRoomTabs implements RoomTabs {
     _latest = null;
     _requestId = null;
     _requestTerm = null;
+    _pendingResyncId = null;
+    _recentResyncRequests.clear();
     _queuedAbort?.abort();
     final listener = _listener;
     if (listener != null) _channel.removeEventListener('message', listener);
@@ -464,5 +509,6 @@ class _WebRoomTabs implements RoomTabs {
     if (!_release.isCompleted) _release.complete(null);
     unawaited(_roles.close());
     unawaited(_states.close());
+    unawaited(_resyncRequests.close());
   }
 }

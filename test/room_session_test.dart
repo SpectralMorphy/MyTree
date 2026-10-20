@@ -403,14 +403,25 @@ class _TabsHub {
   }
 }
 
-class _FakeRoomTabs with _Events implements RoomTabs {
+class _FakeRoomTabs with _Events implements RoomTabs, RoomTabsResync {
   _FakeRoomTabs(this.hub);
   final _TabsHub hub;
   bool started = false;
   bool disposed = false;
   int starts = 0;
   int requests = 0;
+  final resyncRequests = <String>[];
   void Function()? onRelease;
+
+  @override
+  Stream<String> get onResyncRequested => on<String>('resync');
+
+  @override
+  void requestResync(String requestId) {
+    if (resyncRequests.contains(requestId)) return;
+    resyncRequests.add(requestId);
+    hub.leader?.emit<String>('resync', requestId);
+  }
 
   @override
   bool get isLeader => started && !disposed && identical(hub.leader, this);
@@ -471,6 +482,7 @@ RoomTabState _tabState(
   bool localCopy = false,
   int online = 1,
   String? error,
+  List<String> completedResyncs = const [],
 }) => RoomTabState(
   roomId: roomId,
   actorId: actor,
@@ -483,6 +495,7 @@ RoomTabState _tabState(
       : 'Сохраняем и сверяем полную историю…',
   initialSyncError: error,
   inventory: roomHistoryInventory(decodeRoomHistory(history)),
+  completedResyncs: completedResyncs,
 );
 
 Map<String, dynamic> _edit(
@@ -4572,7 +4585,8 @@ void main() {
       await settle(tester);
       expect(network.peers, hasLength(2));
       expect(oldPeer.destroyed, isTrue);
-      expect(room.initialSyncComplete, isTrue);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.verifyingAfterResume, isTrue);
       expect(room.text, 'durable before suspension');
       expect(room.historyLength, 1);
     },
@@ -4627,32 +4641,18 @@ void main() {
       clock = clock.add(const Duration(hours: 1));
       expect(network.peers, hasLength(2));
       expect([incoming.open, outgoing.open], [true, true]);
-      final sentBefore = [incoming.sent.length, outgoing.sent.length];
       host.setForeground(true);
       member.setForeground(true);
+      expect(
+        [host.initialSyncComplete, member.initialSyncComplete],
+        [false, false],
+      );
+      expect([host.localCopyOpened, member.localCopyOpened], [false, false]);
       host.resume();
       member.resume();
+      await settle(tester);
+      expect([incoming.disposed, outgoing.disposed], [true, true]);
       await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      for (final (index, channel) in [incoming, outgoing].indexed) {
-        expect(
-          _sentMessages(
-            channel,
-          ).where((m) => m.type == RoomMessageType.presence),
-          isNotEmpty,
-        );
-        expect(channel.sent.length, greaterThan(sentBefore[index]));
-        expect(channel.sent.last['type'], 'presence');
-      }
-      await tester.pump(const Duration(milliseconds: 5999));
-      await settle(tester);
-      expect([incoming.disposed, outgoing.disposed], [false, false]);
-      expect(
-        network.peers,
-        hasLength(2),
-        reason: 'successful blackhole sends are not received packets',
-      );
-      await tester.pump(const Duration(milliseconds: 1));
       await settle(tester);
       await tester.pump(const Duration(seconds: 1));
       await settle(tester);
@@ -4671,6 +4671,96 @@ void main() {
         [host.initialSyncComplete, member.initialSyncComplete],
         [true, true],
       );
+    },
+  );
+
+  testRoomWidgets(
+    'wake hides stale copy until missed history and fresh ACK are durable',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 20);
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final storage = _Store();
+      final member = session(
+        actor: 'member',
+        store: storage,
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final old = network.peers.last.outbound.single;
+      final staleAck = _ackLocal(old, actor: 'host');
+      old.dropData = true;
+      old.other!.dropData = true;
+      member.setForeground(false);
+      await host.edit('changed while phone slept');
+      await settle(tester);
+      expect(member.text, isEmpty);
+      final gate = storage.appendGate = Completer<void>();
+      clock = clock.add(const Duration(seconds: 4));
+      member.setForeground(true);
+      expect(member.initialSyncComplete, isFalse);
+      expect(member.verifyingAfterResume, isTrue);
+      expect(member.initialSyncStatus, 'Сверяем изменения после возвращения…');
+      old.receive(staleAck);
+      old.receive(_checkpoint(const [], actor: 'host'));
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(old.disposed, isTrue);
+      expect(member.initialSyncComplete, isFalse);
+      expect(member.verifyingAfterResume, isTrue);
+      expect(await storage.loadHistory(_roomId), isEmpty);
+      // Duplicate foreground and presence events cannot restart the budget or
+      // turn the previous connection's durable proof into a new one.
+      member.setForeground(true);
+      member.resume();
+      gate.complete();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(member.verifyingAfterResume, isFalse);
+      expect(member.text, 'changed while phone slept');
+      expect(
+        roomHistoryInventory(member.changes),
+        roomHistoryInventory(host.changes),
+      );
+      expect(storage.membershipCalls, 0);
+    },
+  );
+
+  testRoomWidgets(
+    'resumed solo cannot substitute discovery for synchronization',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 20);
+      final room = session(newlyCreated: true, now: () => clock);
+      await room.start();
+      await settle(tester);
+      expect(room.initialSyncComplete, isTrue);
+      room.setForeground(false);
+      clock = clock.add(const Duration(seconds: 4));
+      room.setForeground(true);
+      expect(room.verifyingAfterResume, isTrue);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 2));
+      await settle(tester);
+      expect(room.networkAvailable, isTrue);
+      expect(room.initialSyncComplete, isFalse);
+      await tester.pump(const Duration(seconds: 28));
+      await settle(tester);
+      expect(room.initialSyncError, contains('30 секунд'));
+      room.openLocalCopy();
+      expect(room.localCopyOpened, isTrue);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.verifyingAfterResume, isFalse);
     },
   );
 
@@ -4817,7 +4907,8 @@ void main() {
       await settle(tester);
       expect(network.peers, hasLength(2));
       expect(peer.destroyed, isTrue);
-      expect(room.initialSyncComplete, isTrue);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.verifyingAfterResume, isTrue);
     },
   );
 
@@ -4875,7 +4966,7 @@ void main() {
   );
 
   testRoomWidgets(
-    'resume with no validated channels preserves readiness, local copy and full journal',
+    'confirmed copy waits after suspension but an explicit local copy stays open',
     (tester) async {
       final readyStore = _Store();
       final localStore = _Store();
@@ -4914,7 +5005,7 @@ void main() {
       await settle(tester);
       expect(network.peers, hasLength(4));
       expect(observed, isNotEmpty);
-      expect(observed, everyElement((true, false, true)));
+      expect(observed, everyElement((false, false, true)));
       expect([ready.joined, local.joined], [true, true]);
       expect([ready.text, local.text], ['latest', 'latest']);
       expect([ready.historyLength, local.historyLength], [2, 2]);
@@ -4931,7 +5022,7 @@ void main() {
   );
 
   testRoomWidgets(
-    'local follower resume requests leader state without public sockets or readiness reset',
+    'local follower resume rejects cached ready state until correlated fresh proof',
     (tester) async {
       final hub = _TabsHub();
       final owner = roomTabs(hub);
@@ -4951,11 +5042,101 @@ void main() {
       follower.resume();
       await tester.pump(const Duration(milliseconds: 200));
       await settleTabs(tester);
-      expect(tab.requests, requests + 1);
+      expect(tab.requests, requests);
+      expect(tab.resyncRequests, hasLength(1));
+      expect(follower.initialSyncComplete, isFalse);
+      owner.publish(_tabState(const [], online: 2));
+      await settleTabs(tester);
+      expect(follower.initialSyncComplete, isFalse);
+      owner.publish(
+        _tabState(
+          const [],
+          online: 2,
+          completedResyncs: ['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'],
+        ),
+      );
+      await settleTabs(tester);
+      expect(follower.initialSyncComplete, isFalse);
+      owner.publish(
+        _tabState(
+          const [],
+          online: 2,
+          completedResyncs: [tab.resyncRequests.single],
+        ),
+      );
+      await settleTabs(tester);
       expect(follower.initialSyncComplete, isTrue);
       expect(follower.onlineCount, 2);
       expect(network.peers, isEmpty);
       expect(network.connections, isEmpty);
+    },
+  );
+
+  testRoomWidgets(
+    'resumed local follower asks its owner for a new durable peer round',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 20);
+      final remote = session(actor: 'remote', newlyCreated: true);
+      await remote.start();
+      await settle(tester);
+      final hub = _TabsHub();
+      final shared = _Store();
+      final ownerTab = roomTabs(hub);
+      final owner = session(
+        actor: 'local',
+        store: shared,
+        preferExistingHost: true,
+        tabCoordinator: ownerTab,
+      );
+      await owner.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settleTabs(tester);
+      final followerTab = roomTabs(hub);
+      final follower = session(
+        actor: 'local',
+        store: shared,
+        tabCoordinator: followerTab,
+        now: () => clock,
+      );
+      await follower.start();
+      await settleTabs(tester);
+      expect(
+        [owner.initialSyncComplete, follower.initialSyncComplete],
+        [true, true],
+      );
+      final peersBefore = network.peers.length;
+      follower.setForeground(false);
+      clock = clock.add(const Duration(seconds: 4));
+      follower.setForeground(true);
+      expect(follower.initialSyncComplete, isFalse);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settleTabs(tester);
+      expect(owner.initialSyncComplete, isFalse);
+      expect(follower.initialSyncComplete, isFalse);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settleTabs(tester);
+      expect(
+        [owner.initialSyncComplete, follower.initialSyncComplete],
+        [true, true],
+      );
+      expect(
+        hub.state!.completedResyncs,
+        contains(followerTab.resyncRequests.single),
+      );
+      expect(
+        network.peers.length,
+        peersBefore + 2,
+        reason:
+            'The owner tries the occupied alias, then follows; the local follower opens no sockets',
+      );
+      expect(
+        roomHistoryInventory(follower.changes),
+        roomHistoryInventory(remote.changes),
+      );
     },
   );
 

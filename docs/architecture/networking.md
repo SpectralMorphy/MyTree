@@ -173,8 +173,10 @@ Changing scheme/host/port changes browser storage origin, so a new temporary tun
 [Browser network hooks](../../lib/network_status_web.dart) watch online/offline and visibility/resume/pageshow;
 [RoomPage](../../lib/ui/room_page.dart) also forwards Flutter lifecycle. `navigator.onLine` is only a hint: offline revokes
 online display, while online/foreground is not proof of a reachable provider or peer. The [native stub](../../lib/network_status_stub.dart)
-does not infer connectivity from an OS hint. The session probes eligible settled links after a 200 ms debounce, allowing
-six seconds for received heartbeat traffic; connecting, checkpoint-pending, and assembling links keep normal deadlines.
+does not infer connectivity from an OS hint. A qualifying wake of a confirmed copy invalidates readiness and retires stale
+channels, then starts fresh discovery after a 200 ms debounce rather than waiting for the old 20-second liveness timer.
+Unfinished entry and explicit local-copy recovery still probe eligible settled links with six seconds for received
+heartbeat traffic; connecting, checkpoint-pending and assembling links keep normal deadlines.
 See [synchronization](synchronization.md#recovery-and-truthful-ui) for guards, backoff, and the full deadline table.
 
 When diagnosing, distinguish registration (`signalingService`), an actually open channel, a validated welcome/online actor,

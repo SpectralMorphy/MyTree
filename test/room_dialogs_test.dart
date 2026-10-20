@@ -329,7 +329,7 @@ void main() {
     }
 
     testWidgets(
-      'guest is hidden but an unbound editor keeps a neutral cloud on live updates',
+      'guest keeps read-only Disk status and an unbound editor keeps a neutral cloud',
       (tester) async {
         final session = _DialogSession(role: RoomRole.guest)
           ..binding = _diskBinding()
@@ -338,7 +338,11 @@ void main() {
         addTearDown(session.dispose);
         await _showDiskButton(tester, session);
         final button = find.byKey(const Key('disk-sync-button'));
-        expect(button, findsNothing);
+        expect(button, findsOneWidget);
+        expect(tester.widget<IconButton>(button).onPressed, isNull);
+        await tester.longPress(button);
+        await tester.pumpAndSettle();
+        expect(find.text(_diskTooltipMessage(tester)), findsOneWidget);
         session.role = RoomRole.editor;
         session.binding = null;
         session.diskRetiring = false;
@@ -354,10 +358,14 @@ void main() {
         session.updateRoster(session.roster);
         await tester.pump();
         expect(button, findsOneWidget);
+        final staleSync = tester.widget<IconButton>(button).onPressed;
         session.role = RoomRole.guest;
         session.updateRoster(session.roster);
         await tester.pump();
-        expect(button, findsNothing);
+        expect(button, findsOneWidget);
+        expect(tester.widget<IconButton>(button).onPressed, isNull);
+        staleSync?.call();
+        await tester.pump();
         expect(session.syncCalls, 0);
         expect(tester.takeException(), isNull);
         await tester.pumpWidget(const SizedBox.shrink());
@@ -650,7 +658,8 @@ void main() {
         session.role = RoomRole.guest;
         session.updateRoster(session.roster);
         await tester.pump();
-        expect(button, findsNothing);
+        expect(button, findsOneWidget);
+        expect(tester.widget<IconButton>(button).onPressed, isNull);
         session.role = RoomRole.editor;
         session.binding = _diskBinding(id: 'replacement');
         session.diskAcknowledged = true;

@@ -549,6 +549,7 @@ void main() {
     MemoryDiskClient? diskClient,
     RoomDiskAccess? access,
     String? name,
+    DateTime Function() now = DateTime.now,
   }) {
     final result = RoomSession(
       roomId: _roomId,
@@ -558,6 +559,7 @@ void main() {
       invitationRole: role,
       invitationDiskAccess: access,
       participantName: name,
+      now: now,
       newlyCreated: creator,
       preferExistingHost: follower,
       peerFactory: (id, configuration) =>
@@ -726,6 +728,183 @@ void main() {
       );
     });
   }
+
+  for (final role in RoomRole.values) {
+    diskTest('resumed ${role.name} waits for a fresh durable Disk read', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      seedCloud();
+      var clock = DateTime.utc(2026, 10, 20);
+      final store = _Store();
+      final room = session(
+        actor: 'reader',
+        store: store,
+        member: false,
+        role: role,
+        access: _entryAccess(role),
+        now: () => clock,
+      );
+      await room.start();
+      expect(room.initialSyncComplete, isTrue);
+      room.setForeground(false);
+      final history = _diskEntryHistory();
+      final later = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'resume-cloud-later',
+          author: 'owner',
+          clock: 25,
+          createdAt: 25,
+          text: 'Changed while the phone was asleep',
+        ),
+        history,
+      );
+      seedCloud(history: [...history, later]);
+      final readGate = Completer<void>();
+      cloud.beforeRead = (_) => readGate.future;
+      final saveGate = Completer<void>();
+      store.beforeAppend = (edits) async {
+        if (edits.any((edit) => edit['id'] == later.id)) await saveGate.future;
+      };
+      clock = clock.add(const Duration(seconds: 4));
+      room.setForeground(true);
+      expect(room.verifyingAfterResume, isTrue);
+      await tester.pump(const Duration(milliseconds: 200));
+      await _settle(tester);
+      expect(room.initialSyncComplete, isFalse);
+      expect(
+        network.peers.length,
+        greaterThan(1),
+        reason: 'RTC starts before the cloud read finishes',
+      );
+      readGate.complete();
+      await _settle(tester);
+      expect(room.initialSyncComplete, isFalse);
+      expect(
+        decodeRoomHistory(
+          await store.loadHistory(_roomId),
+        ).any((edit) => edit.id == later.id),
+        isFalse,
+      );
+      saveGate.complete();
+      await _settle(tester);
+      expect(room.initialSyncComplete, isTrue);
+      expect(room.verifyingAfterResume, isFalse);
+      expect(room.initialSyncStatus, contains('с Диска'));
+      expect(room.text, later.text);
+      expect(store.membershipSaveAttempts, 1);
+      expect(room.hasValidatedOnlinePeer, isFalse);
+    });
+  }
+
+  diskTest(
+    'late saved editor access opens accepted room after fresh Disk validation',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      await store.saveMembership(_roomId);
+      await store.appendHistory(
+        _roomId,
+        _diskEntryHistory().map((edit) => edit.toJson()).toList(),
+      );
+      final room = session(actor: 'owner', store: store);
+      await room.start();
+      await tester.pump(const Duration(seconds: 31));
+      await _settle(tester);
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.initialSyncError, contains('30 секунд'));
+      await store.saveDiskCredentials(
+        _roomId,
+        _entryAccess(RoomRole.editor).toJson(),
+      );
+      await room.syncDisk();
+      await _settle(tester);
+      expect(room.diskSyncAcknowledged, isTrue);
+      expect(room.initialSyncComplete, isTrue);
+      expect(room.initialSyncError, isNull);
+      expect(room.initialSyncStatus, contains('с Диска'));
+      expect(room.hasValidatedOnlinePeer, isFalse);
+      expect(store.membershipSaveAttempts, 1);
+    },
+  );
+
+  diskTest(
+    'late Disk recovery waits for strict read and flush, not its green ACK',
+    (tester) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      await store.saveMembership(_roomId);
+      await store.appendHistory(
+        _roomId,
+        _diskEntryHistory().map((edit) => edit.toJson()).toList(),
+      );
+      final room = session(actor: 'owner', store: store);
+      await room.start();
+      await _settle(tester);
+      await store.saveDiskCredentials(
+        _roomId,
+        _entryAccess(RoomRole.editor).toJson(),
+      );
+      var lists = 0;
+      final read = Completer<void>();
+      final flush = Completer<void>();
+      cloud.beforeList = (_) async {
+        if (++lists == 2) {
+          await read.future;
+          store.beforeFlush = () => flush.future;
+        }
+      };
+      await room.syncDisk();
+      await _settle(tester);
+      expect(lists, 2);
+      expect(room.diskSyncAcknowledged, isTrue);
+      expect(room.initialSyncComplete, isFalse);
+      read.complete();
+      await _settle(tester);
+      expect(room.initialSyncComplete, isFalse);
+      store.beforeFlush = null;
+      flush.complete();
+      await _settle(tester);
+      expect(room.initialSyncComplete, isTrue);
+    },
+  );
+
+  diskTest('late Disk recovery cannot open an invalid binding owner history', (
+    tester,
+  ) async {
+    network.autoRegister = false;
+    seedCloud(history: _diskEntryHistory(ownerRole: RoomRole.guest));
+    final store = _Store();
+    await store.saveMembership(_roomId);
+    await store.appendHistory(
+      _roomId,
+      _diskEntryHistory(
+        ownerRole: RoomRole.guest,
+      ).map((edit) => edit.toJson()).toList(),
+    );
+    await store.appendHistory(_roomId, [
+      _role('reader', RoomRole.editor).toJson(),
+    ]);
+    final room = session(actor: 'reader', store: store);
+    await room.start();
+    await _settle(tester);
+    await store.saveDiskCredentials(
+      _roomId,
+      _entryAccess(RoomRole.editor).toJson(),
+    );
+    await room.syncDisk();
+    await _settle(tester);
+    expect(room.diskSyncAcknowledged, isTrue);
+    expect(room.initialSyncComplete, isFalse);
+    expect(room.initialSyncError, contains('Диска'));
+    expect(
+      room.joined,
+      isTrue,
+      reason: 'Accepted membership is not erased on failed verification',
+    );
+  });
 
   for (final stage in [
     'history',

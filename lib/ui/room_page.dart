@@ -92,6 +92,12 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   bool _joinDialogOpen = false;
   int _generation = 0;
   RoomSession? _session;
+  OverlayEntry? _resumeOverlay;
+  bool _resumeOverlayScheduled = false;
+  bool _roomSurfaceOpened = false;
+
+  bool get _roomActionsEnabled =>
+      !_leaving && _session?.verifyingAfterResume != true;
 
   @override
   void initState() {
@@ -226,6 +232,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       iceConfiguration: widget.iceConfiguration,
     );
     _session = session;
+    _roomSurfaceOpened = false;
     _menuError = null;
     session.addListener(_sessionChanged);
     setState(() {});
@@ -258,6 +265,10 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     if (!mounted) return;
     final session = _session;
     if (session == null) return;
+    if (session.joined &&
+        (session.initialSyncComplete || session.localCopyOpened)) {
+      _roomSurfaceOpened = true;
+    }
     if (session.joined) {
       if (session.hasValidatedOnlinePeer ||
           (session.initialSyncComplete && session.onlineCount > 1)) {
@@ -267,6 +278,52 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       _lastRoom = session.roomId;
     }
     setState(() {});
+    _scheduleResumeOverlay();
+  }
+
+  void _scheduleResumeOverlay() {
+    if (_resumeOverlayScheduled) return;
+    _resumeOverlayScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _resumeOverlayScheduled = false;
+      if (!mounted) return;
+      final session = _session;
+      if (session == null || !session.verifyingAfterResume) {
+        _removeResumeOverlay();
+      } else if (_resumeOverlay == null &&
+          ModalRoute.of(context)?.isCurrent == false) {
+        // A phone biography or an open dialog lives above this page's body.
+        // Cover those routes too, without discarding their already-saved drafts.
+        FocusManager.instance.primaryFocus?.unfocus();
+        final overlay = _resumeOverlay = OverlayEntry(
+          builder: (context) => Positioned.fill(
+            child: BlockSemantics(
+              child: Material(
+                key: const Key('resume-loading-overlay'),
+                color: Theme.of(context).colorScheme.surface,
+                child: ListenableBuilder(
+                  listenable: session,
+                  builder: (_, _) => Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      const ModalBarrier(dismissible: false),
+                      SafeArea(child: _buildJoining(session)),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        Overlay.of(context, rootOverlay: true).insert(overlay);
+      }
+    });
+  }
+
+  void _removeResumeOverlay() {
+    _resumeOverlay?.remove();
+    _resumeOverlay?.dispose();
+    _resumeOverlay = null;
   }
 
   Future<void> _joinRoom() async {
@@ -311,10 +368,18 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
         _recentlyOnlineRooms.remove(session.roomId);
         forgetRecentRoomHost(session.roomId);
       }
+      final route = ModalRoute.of(context);
+      if (route != null && !route.isCurrent) {
+        Navigator.of(
+          context,
+        ).popUntil((candidate) => identical(candidate, route));
+      }
       ++_generation;
       session.removeListener(_sessionChanged);
       session.dispose();
       _session = null;
+      _roomSurfaceOpened = false;
+      _removeResumeOverlay();
       setState(() => _menuError = null);
     } catch (error) {
       _showMessage('Не удалось завершить локальное сохранение: $error');
@@ -337,7 +402,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
 
   Future<void> _participants() async {
     final session = _session;
-    if (session == null || !session.joined || _leaving) return;
+    if (session == null || !session.joined || !_roomActionsEnabled) return;
     final invite = await showDialog<bool>(
       context: context,
       builder: (_) => RoomParticipantsDialog(session: session),
@@ -352,7 +417,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
 
   void _roomMenu(String value) {
     final session = _session;
-    if (session == null || _leaving) return;
+    if (session == null || !_roomActionsEnabled) return;
     if (value == 'menu') {
       unawaited(_exitToMenu());
     } else if (value == 'settings') {
@@ -386,6 +451,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   void _invite() {
     final session = _session;
     if (session == null ||
+        !_roomActionsEnabled ||
         !session.joined ||
         (!session.initialSyncComplete && !session.localCopyOpened)) {
       return;
@@ -415,6 +481,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _removeResumeOverlay();
     ++_generation;
     _session?.removeListener(_sessionChanged);
     _session?.dispose();
@@ -431,11 +498,11 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
         title: inRoom
             ? Semantics(
                 button: true,
-                enabled: !_leaving,
+                enabled: _roomActionsEnabled,
                 child: PopupMenuButton<String>(
                   key: const Key('room-menu'),
                   tooltip: 'Меню комнаты',
-                  enabled: !_leaving,
+                  enabled: _roomActionsEnabled,
                   onSelected: _roomMenu,
                   itemBuilder: (_) => const [
                     PopupMenuItem(
@@ -478,14 +545,16 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
           if (inRoom)
             RoomDiskStatusButton(
               session: session!,
-              enabled: !_leaving,
+              enabled: _roomActionsEnabled,
               onConnect: () => _roomMenu('settings'),
             ),
           if (inRoom)
             RoomParticipantsButton(
               otherOnlineCount: session!.otherOnlineCount,
               networkAvailable: session.networkAvailable,
-              onPressed: _leaving ? null : () => unawaited(_participants()),
+              onPressed: _roomActionsEnabled
+                  ? () => unawaited(_participants())
+                  : null,
             ),
           const SizedBox(width: 8),
         ],
@@ -495,10 +564,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
             ? const RoomLoadingView(status: 'Читаем данные на устройстве…')
             : session == null
             ? _buildMenu()
-            : session.joined &&
-                  (session.initialSyncComplete || session.localCopyOpened)
-            ? _buildRoom(session)
-            : _buildJoining(session),
+            : _buildSessionSurface(session),
       ),
     );
   }
@@ -556,14 +622,33 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     onExit: _leaving ? null : () => unawaited(_exitToMenu()),
   );
 
+  Widget _buildSessionSurface(RoomSession session) {
+    final ready =
+        session.joined &&
+        (session.initialSyncComplete || session.localCopyOpened);
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        if (_roomSurfaceOpened)
+          Offstage(
+            offstage: !ready,
+            child: TickerMode(enabled: ready, child: _buildRoom(session)),
+          ),
+        if (!ready) _buildJoining(session),
+      ],
+    );
+  }
+
   Widget _buildRoom(RoomSession session) {
     final customEditor = widget.roomEditorBuilder?.call(session);
+    final blocked =
+        _leaving || (!session.initialSyncComplete && !session.localCopyOpened);
     // The tree toolbar is full-bleed under the AppBar. The historical text
     // editor keeps its inset so its floating label stays clear of the header.
     Widget editor = AbsorbPointer(
-      absorbing: _leaving,
+      absorbing: blocked,
       child: ExcludeFocus(
-        excluding: _leaving,
+        excluding: blocked,
         child: customEditor ?? TreeEditor(session: session),
       ),
     );

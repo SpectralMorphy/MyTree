@@ -205,18 +205,25 @@ Browser visibility/resume/pageshow events, Flutter lifecycle events, an online h
 over 20 seconds can trigger recovery. Initial foreground notification alone does not restart discovery. Returning after
 at least three seconds hidden, or with unavailable network state, requests a check; requests are coalesced for 200 ms.
 
-The wake check drops terminal/dead channels immediately, but accelerates probing only for admitted (`ready`) channels
-with no pending checkpoint and no assembly. It sends ordinary presence and waits six seconds for **received** traffic,
-allowing the remote's regular five-second heartbeat. No receive progress means retirement; successful sending is not proof.
-The same eligibility is checked at expiry. Connecting channels, a hello still saving, pending checkpoints, and assemblies
-keep their normal deadlines. A newly arriving handshake also prevents re-election while its channel remains pending.
+A qualifying wake of an already-confirmed accepted copy immediately clears readiness, retires the previous network
+generation and shows loading. After the coalesced 200 ms delay it starts fresh discovery/checkpoint exchange and, when
+matching access exists, a bounded validated Disk entry read. RTC starts before awaiting Disk. Old channel checkpoint/ACK
+flags cannot release this wait, and solo discovery is not a substitute for a fresh durable peer exchange or a freshly
+validated and persisted Disk snapshot. Duplicate wake events do not reset its fixed 30-second budget.
+
+Short connectivity hints during an unfinished entry or an explicitly opened local copy retain the conservative probe
+path: terminal/dead channels drop immediately; admitted settled channels receive a presence probe and six seconds for
+**received** heartbeat traffic. Connecting channels, a hello still saving, pending checkpoints and assemblies keep their
+normal deadlines. A newly arriving handshake likewise prevents premature re-election.
 
 With no remaining channels, recovery can bypass backoff and restart normal alias election. A nonfailed registration younger
 than eight seconds is preserved. Ordinary reconnect delay is `min(8000, 400 * 2^min(attempt, 4)) + random(0..699)` ms;
 a wake restart resets its attempt count. Generation/channel-identity guards ignore stale callbacks, sends, and ACKs;
-retirement cancels timers/subscriptions and decoder state. A local follower requests leader state instead of opening sockets.
-Recovery preserves membership, the journal, and already-latched readiness/local-copy choice; explicit retry starts a new
-verification attempt. Later edits do not send an already-open editor back to initial loading.
+retirement cancels timers/subscriptions and decoder state. A resumed local follower requests a correlated fresh proof from
+its network owner instead of opening sockets or accepting the owner's cached ready state; its durable inventory still
+must verify locally. Recovery preserves membership, the journal and an explicit local-copy choice. A confirmed copy
+returns to loading only for a qualifying wake, not for each ordinary incoming edit. Timeout/errors retain Retry and the
+explicit accepted-local-copy escape without claiming successful synchronization.
 
 During initial entry, losing an admitted channel is not itself an immediate terminal verification error: the existing
 backoff schedules a fresh transport on either side, including a hub that loses its last incoming initial participant.

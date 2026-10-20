@@ -191,6 +191,8 @@ class RoomSession extends ChangeNotifier {
   RoomDiskAccess? _diskPublicAccess;
   bool _diskEntryPending = true;
   bool _diskEntryReading = false;
+  bool _diskRecoveryReading = false;
+  int _seenDiskRounds = 0;
   bool _initialSyncFromDisk = false;
   String? _diskEntryError;
   Future<void>? _diskCredentialsLoading;
@@ -247,6 +249,11 @@ class RoomSession extends ChangeNotifier {
   Timer? _soloTimer;
   int _entryAttempt = 0;
   bool _initialSyncComplete = false;
+  bool _resumeVerification = false;
+  bool _resumeRecoveryPending = false;
+  String? _tabResyncId;
+  final _pendingTabResyncs = <String>{};
+  final _completedTabResyncs = <String>{};
   bool _localCopyOpened = false;
   bool _settledHosting = false;
   String? _initialSyncError;
@@ -297,6 +304,8 @@ class RoomSession extends ChangeNotifier {
       (_joined ? RoomRole.editor : invitationRole ?? RoomRole.editor);
 
   bool get initialSyncComplete => _initialSyncComplete;
+  bool get verifyingAfterResume =>
+      _resumeVerification && !_initialSyncComplete && !_localCopyOpened;
   String? get initialSyncError => _initialSyncError;
   bool get localCopyOpened => _localCopyOpened;
   String get initialSyncStatus {
@@ -313,6 +322,7 @@ class RoomSession extends ChangeNotifier {
       return 'Не удалось проверить историю комнаты';
     }
     if (!_history.loaded) return 'Читаем сохранённую историю…';
+    if (_resumeVerification) return 'Сверяем изменения после возвращения…';
     if (_isTabFollower) {
       return _verifiedTabState?.initialSyncStatus ??
           'Проверяем историю через соседнюю вкладку…';
@@ -520,6 +530,13 @@ class RoomSession extends ChangeNotifier {
 
   void _diskChanged() {
     if (_disposed) return;
+    final rounds = _diskSync.completedRounds;
+    if (rounds != _seenDiskRounds) {
+      _seenDiskRounds = rounds;
+      if (_joined && !_initialSyncComplete && !_diskEntryPending) {
+        _verifyRecoveredDiskHistory();
+      }
+    }
     if (!_diskSync.busy) {
       if (_diskSync.error == null && _diskSync.acknowledged) {
         _diskEntryError = null;
@@ -532,6 +549,69 @@ class RoomSession extends ChangeNotifier {
       _shareDiskCredentials();
     }
     _changed();
+  }
+
+  void _verifyRecoveredDiskHistory() {
+    final binding = diskBinding;
+    final credentials = _diskCredentials;
+    if (_diskRecoveryReading ||
+        binding == null ||
+        !canEdit ||
+        credentials?['bindingId'] != binding.id) {
+      return;
+    }
+    final access = RoomDiskAccess.fromJson(credentials!);
+    final attempt = _entryAttempt;
+    bool current() =>
+        !_disposed &&
+        _joined &&
+        canEdit &&
+        attempt == _entryAttempt &&
+        diskBinding?.id == access.bindingId &&
+        _diskCredentials?['bindingId'] == access.bindingId &&
+        _diskCredentials?['token'] == access.token;
+    _diskRecoveryReading = true;
+    // A background replica ACK alone is not admission/entry proof. Re-read the
+    // exact binding with the stricter bounded entry validator before opening it.
+    final result = _messages.then((_) async {
+      if (!current() || _initialSyncComplete) return;
+      _diskEntryReading = true;
+      _changed();
+      try {
+        final history = await readDiskRoomHistory(
+          client: _diskClient,
+          roomId: roomId,
+          access: access,
+          localHistory: _history.durableHistory,
+          isCurrent: current,
+          timeout: _joinDeadline,
+        );
+        if (!current()) return;
+        _validateDiskEntryHistory(history, access);
+        if (await _history.merge(history) == null) {
+          throw StateError('История с Диска не сохранена');
+        }
+        await _history.flush();
+        if (!current()) return;
+        _validateDiskEntryHistory(_history.durableHistory, access);
+        _diskEntryError = null;
+        _completeInitialSync(fromDisk: true);
+      } catch (_) {
+        if (current()) {
+          _diskEntryError =
+              'Не удалось проверить сохранённую историю с Диска. Повторите проверку.';
+          _failInitialSync(_history.error ?? _diskEntryError!);
+        }
+      } finally {
+        _diskEntryReading = false;
+      }
+    });
+    _messages = result
+        .whenComplete(() {
+          _diskRecoveryReading = false;
+          if (!_disposed) _changed();
+        })
+        .catchError((Object _) {});
   }
 
   Future<void> _mergeDiskHistory(List<RoomEdit> edits) {
@@ -549,6 +629,7 @@ class RoomSession extends ChangeNotifier {
 
   Future<void> _mergePublicDiskHistory(List<RoomEdit> edits) {
     final access = _diskPublicAccess;
+    final attempt = _entryAttempt;
     final result = _messages.then((_) async {
       if (_disposed ||
           !editable ||
@@ -563,6 +644,19 @@ class RoomSession extends ChangeNotifier {
       final added = await _history.merge(edits);
       if (added == null) throw StateError('Облачные изменения не сохранены');
       await _history.flush();
+      if (!_disposed &&
+          attempt == _entryAttempt &&
+          access == _diskPublicAccess &&
+          diskBinding?.id == access.bindingId &&
+          !_initialSyncComplete) {
+        _validateDiskEntryHistory(
+          _history.durableHistory,
+          access,
+          allowFinalDisconnect: true,
+        );
+        _diskEntryError = null;
+        _completeInitialSync(fromDisk: true);
+      }
       if (!_disposed && added.isNotEmpty) _onDurableEdits(added);
     });
     _messages = result.catchError((Object _) {});
@@ -1621,6 +1715,14 @@ class RoomSession extends ChangeNotifier {
     _tabSubscriptions.add(
       tabs.onState.listen(_receiveTabState, onError: _tabError),
     );
+    if (tabs is RoomTabsResync) {
+      _tabSubscriptions.add(
+        (tabs as RoomTabsResync).onResyncRequested.listen(
+          _receiveTabResync,
+          onError: _tabError,
+        ),
+      );
+    }
     try {
       await tabs.start();
       if (_disposed) return;
@@ -1654,7 +1756,10 @@ class RoomSession extends ChangeNotifier {
     _tabVerifyTimer = null;
     // A new local owner has no inherited remote proof. Ordinary snapshots in
     // the same term do not undo latched readiness; election/retry does.
-    if (!first || (_running && !_tabLeader)) _beginInitialWait();
+    if (!first || (_running && !_tabLeader)) {
+      _beginInitialWait(resuming: _resumeVerification);
+    }
+    if (_tabLeader) _tabResyncId = null;
     if (_tabLeader) {
       if (!(first && retainNetwork && _running)) {
         _stopNetwork();
@@ -1679,9 +1784,37 @@ class RoomSession extends ChangeNotifier {
 
   void _requestTabState() {
     try {
-      roomTabs?.requestState();
+      final tabs = roomTabs;
+      final request = _tabResyncId;
+      if (request != null && tabs is RoomTabsResync) {
+        (tabs as RoomTabsResync).requestResync(request);
+      } else {
+        tabs?.requestState();
+      }
     } catch (error) {
       _tabError(error);
+    }
+  }
+
+  void _receiveTabResync(String request) {
+    if (_disposed ||
+        !_networkOwner ||
+        !_joined ||
+        !_history.loaded ||
+        !isValidRoomId(request) ||
+        _completedTabResyncs.contains(request) ||
+        _pendingTabResyncs.contains(request)) {
+      return;
+    }
+    if (_pendingTabResyncs.length == 64) {
+      _pendingTabResyncs.remove(_pendingTabResyncs.first);
+    }
+    _pendingTabResyncs.add(request);
+    if (_initialSyncComplete) {
+      _beginResumeVerification();
+    } else {
+      // An ongoing entry already has a fixed deadline and fresh channel round.
+      _resumeVerification = true;
     }
   }
 
@@ -1746,6 +1879,12 @@ class RoomSession extends ChangeNotifier {
     )) {
       return;
     }
+    final request = _tabResyncId;
+    if (_resumeVerification &&
+        (request == null || !state.completedResyncs.contains(request))) {
+      // A newly directed response can still contain the owner's old ready cache.
+      return;
+    }
     _verifiedTabState = state;
     if (state.initialSyncComplete) {
       _completeInitialSync();
@@ -1758,6 +1897,7 @@ class RoomSession extends ChangeNotifier {
 
   bool get _currentTabEntryReady {
     if (!_initialSyncComplete) return false;
+    if (_initialSyncFromDisk) return true;
     // A random freshly created, never-shared room has an explicit solo proof,
     // even if public signaling is offline. Any real/pending cohort overrides it.
     if (newlyCreated && !_validatedRemoteSeen && _connections.isEmpty) {
@@ -1797,6 +1937,7 @@ class RoomSession extends ChangeNotifier {
         initialSyncStatus: initialSyncStatus,
         initialSyncError: initialSyncError,
         inventory: _durableTabInventory,
+        completedResyncs: _completedTabResyncs.toList(),
       );
       final previous = _publishedTabState;
       if (previous != null &&
@@ -1808,6 +1949,7 @@ class RoomSession extends ChangeNotifier {
           previous.status == state.status &&
           previous.initialSyncStatus == state.initialSyncStatus &&
           previous.initialSyncError == state.initialSyncError &&
+          listEquals(previous.completedResyncs, state.completedResyncs) &&
           mapEquals(previous.inventory, state.inventory)) {
         return;
       }
@@ -1820,7 +1962,8 @@ class RoomSession extends ChangeNotifier {
     });
   }
 
-  void _beginInitialWait() {
+  void _beginInitialWait({bool resuming = false}) {
+    _resumeVerification = resuming;
     _entryAttempt++;
     _initialTimer?.cancel();
     _initialSyncComplete = false;
@@ -1853,6 +1996,12 @@ class RoomSession extends ChangeNotifier {
 
   void _completeInitialSync({bool fromDisk = false}) {
     if (_disposed || !_joined || !_history.loaded) return;
+    if (_resumeVerification &&
+        !fromDisk &&
+        !_isTabFollower &&
+        !hasValidatedOnlinePeer) {
+      return;
+    }
     if (!fromDisk &&
         _diskEntryError != null &&
         !hasValidatedOnlinePeer &&
@@ -1870,6 +2019,15 @@ class RoomSession extends ChangeNotifier {
     }
     _initialSyncFromDisk = fromDisk;
     _initialSyncComplete = true;
+    _resumeVerification = false;
+    _tabResyncId = null;
+    for (final request in _pendingTabResyncs) {
+      if (_completedTabResyncs.length == 64) {
+        _completedTabResyncs.remove(_completedTabResyncs.first);
+      }
+      _completedTabResyncs.add(request);
+    }
+    _pendingTabResyncs.clear();
     _localCopyOpened = false;
     _initialSyncError = null;
     _initialTimer?.cancel();
@@ -1896,19 +2054,65 @@ class RoomSession extends ChangeNotifier {
     }
     final hiddenAt = _backgroundedAt;
     _backgroundedAt = null;
-    if (hiddenAt != null &&
-        (now().difference(hiddenAt) >= const Duration(seconds: 3) ||
-            !networkAvailable)) {
+    final heartbeat = _lastHeartbeatAt;
+    if ((hiddenAt != null &&
+            (now().difference(hiddenAt) >= const Duration(seconds: 3) ||
+                !networkAvailable)) ||
+        (heartbeat != null &&
+            now().difference(heartbeat) > _livenessDeadline)) {
+      if (_initialSyncComplete) _beginResumeVerification();
       resume();
     }
   }
 
-  /// Wake up discovery after suspension without resetting durable entry state
-  /// or retiring channels which still answer the ordinary presence heartbeat.
-  void resume() {
-    if (_disposed || !_joined || !_history.loaded || !_networkOnlineHint) {
+  void _beginResumeVerification() {
+    if (_disposed || !_joined || !_history.loaded || _resumeVerification) {
       return;
     }
+    _stopNetwork();
+    _tabState = null;
+    _verifiedTabState = null;
+    _publishedTabState = null;
+    _diskEntryPending = true;
+    _updateDiskSync();
+    _resumeRecoveryPending = true;
+    if (_isTabFollower) _tabResyncId = createRoomId();
+    _beginInitialWait(resuming: true);
+    resume();
+  }
+
+  Future<void> _resumeVerifiedCopy() async {
+    final attempt = _entryAttempt;
+    _resumeRecoveryPending = false;
+    if (_isTabFollower) {
+      _diskEntryPending = false;
+      _updateDiskSync();
+      _requestTabState();
+      return;
+    }
+    // Start discovery now, not after a slow cloud read or stale RTC heartbeat.
+    _error = null;
+    _networkIssue = null;
+    _retryAttempt = 0;
+    _startNetwork();
+    await _enterFromDisk(attempt);
+    if (_disposed || attempt != _entryAttempt) return;
+    _diskEntryPending = false;
+    _updateDiskSync();
+  }
+
+  /// Short connectivity hints preserve healthy channels. A real suspension of
+  /// a confirmed copy instead needs fresh durable proof before showing it again.
+  void resume() {
+    if (_disposed || !_joined || !_history.loaded) return;
+    final heartbeat = _lastHeartbeatAt;
+    if (_initialSyncComplete &&
+        heartbeat != null &&
+        now().difference(heartbeat) > _livenessDeadline) {
+      _beginResumeVerification();
+      return;
+    }
+    if (!_networkOnlineHint) return;
     _diskSync.schedule();
     _diskReadSync.schedule();
     _resumeTimer ??= Timer(
@@ -1920,6 +2124,10 @@ class RoomSession extends ChangeNotifier {
   void _checkAfterResume() {
     _resumeTimer = null;
     if (_disposed || !_joined || !_networkOnlineHint) return;
+    if (_resumeRecoveryPending) {
+      unawaited(_resumeVerifiedCopy());
+      return;
+    }
     if (_isTabFollower) {
       _requestTabState();
       return;
@@ -1998,7 +2206,8 @@ class RoomSession extends ChangeNotifier {
     _diskEntryPending = true;
     _updateDiskSync();
     if (_networkStarted) _stopNetwork();
-    _beginInitialWait();
+    _beginInitialWait(resuming: _resumeVerification);
+    _resumeRecoveryPending = false;
     final attempt = _entryAttempt;
     _error = null;
     _networkIssue = null;
@@ -2062,6 +2271,7 @@ class RoomSession extends ChangeNotifier {
       final previous = _lastHeartbeatAt;
       _lastHeartbeatAt = tick;
       if (previous != null && tick.difference(previous) > _livenessDeadline) {
+        if (_initialSyncComplete) _beginResumeVerification();
         resume();
       }
       for (final state in _connections.values.toList()) {

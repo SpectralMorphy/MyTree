@@ -12,6 +12,13 @@ abstract interface class RoomTabs {
   void dispose();
 }
 
+/// Optional live-proof requests, separate from ordinary cached checkpoints.
+/// The owner reports completion later through [RoomTabState.completedResyncs].
+abstract interface class RoomTabsResync {
+  Stream<String> get onResyncRequested;
+  void requestResync(String requestId);
+}
+
 typedef RoomTabsFactory = RoomTabs? Function(String roomId, String actorId);
 
 /// An accepted tab's checkpoint. Followers verify its immutable inventory in
@@ -29,10 +36,12 @@ class RoomTabState {
     this.initialSyncError,
     this.networkAvailable = false,
     List<String>? onlineActors,
+    List<String> completedResyncs = const [],
   }) : inventory = Map.unmodifiable(inventory),
        onlineActors = onlineActors == null
            ? null
-           : List.unmodifiable(onlineActors);
+           : List.unmodifiable(onlineActors),
+       completedResyncs = List.unmodifiable(completedResyncs);
 
   final String roomId;
   final String actorId;
@@ -45,6 +54,9 @@ class RoomTabState {
   final String initialSyncStatus;
   final String? initialSyncError;
   final Map<String, String> inventory;
+
+  /// Bounded live-proof completions, not an acknowledgement of cached readiness.
+  final List<String> completedResyncs;
 
   Map<String, dynamic> toJson() => {
     'v': 1,
@@ -59,6 +71,7 @@ class RoomTabState {
     'initialSyncStatus': initialSyncStatus,
     'initialSyncError': initialSyncError,
     'inventory': inventory,
+    if (completedResyncs.isNotEmpty) 'completedResyncs': completedResyncs,
   };
 
   static RoomTabState? fromJson(Object? value) {
@@ -102,6 +115,17 @@ class RoomTabState {
       }
       onlineActors = actors.cast<String>();
     }
+    List<String> completedResyncs = const [];
+    if (value.containsKey('completedResyncs')) {
+      final completed = value['completedResyncs'];
+      if (completed is! List ||
+          completed.length > 64 ||
+          completed.any((id) => id is! String || !isValidRoomId(id)) ||
+          completed.toSet().length != completed.length) {
+        return null;
+      }
+      completedResyncs = completed.cast<String>();
+    }
     final inventory = <String, String>{};
     for (final entry in (value['inventory'] as Map).entries) {
       if (!isValidRoomActor(entry.key) ||
@@ -123,6 +147,7 @@ class RoomTabState {
       initialSyncStatus: value['initialSyncStatus'] as String,
       initialSyncError: value['initialSyncError'] as String?,
       inventory: inventory,
+      completedResyncs: completedResyncs,
     );
   }
 }

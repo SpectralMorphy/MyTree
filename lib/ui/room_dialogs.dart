@@ -586,7 +586,6 @@ class _RoomDiskStatusButtonState extends State<RoomDiskStatusButton> {
       final error =
           session.diskSyncError ??
           (session.diskSyncAcknowledged ? null : _error);
-      if (!session.canEdit) return const SizedBox.shrink();
       final disconnected =
           session.diskBinding == null && !session.diskUnlinkPending;
       final colors = Theme.of(context).colorScheme;
@@ -619,7 +618,10 @@ class _RoomDiskStatusButtonState extends State<RoomDiskStatusButton> {
         if (error != null) error,
       ].join('\n');
       final onPressed =
-          widget.enabled && !busy && (!disconnected || widget.onConnect != null)
+          widget.enabled &&
+              session.canEdit &&
+              !busy &&
+              (!disconnected || widget.onConnect != null)
           ? () => unawaited(_sync())
           : null;
       return Semantics(

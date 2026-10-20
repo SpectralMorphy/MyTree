@@ -384,8 +384,12 @@ class RoomDiskSync {
   Future<void>? _running;
   final _batches = <String, List<RoomEdit>>{};
   String? _acknowledgedDigest;
+  int _completedRounds = 0;
   String? error;
   bool get busy => _running != null;
+
+  /// Progress only, not admission evidence or a replacement for a validated read.
+  int get completedRounds => _completedRounds;
 
   bool get acknowledged =>
       _acknowledgedDigest != null &&
@@ -588,6 +592,7 @@ class RoomDiskSync {
     // Acknowledges only this frozen local set, not concurrent edits, not another
     // device's unseen tail, and never an unconfirmed HTTP 202 upload.
     _acknowledgedDigest = roomHistoryDigest(history);
+    _completedRounds++;
   }
 
   void dispose() {

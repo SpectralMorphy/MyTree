@@ -1341,6 +1341,245 @@ void main() {
     },
   );
 
+  for (final hostAlreadyBound in [false, true]) {
+    treeTest(
+      'guest editor invitation reopen then bind and third editor relay hostAlreadyBound=$hostAlreadyBound',
+      (tester) async {
+        final aliceStore = store();
+        final alice = session(
+          actor: 'alice',
+          storage: aliceStore,
+          creator: true,
+        );
+        await alice.start();
+        await _settle(tester);
+        final hostPeer = network.registered[alice.hostAlias]!;
+        await alice.editTreeText(
+          rootTreePersonId,
+          TreeTextField.name,
+          'Корневая персона',
+        );
+        if (hostAlreadyBound) await alice.bindToPerson(rootTreePersonId);
+
+        final bobStore = store();
+        final guest = session(
+          actor: 'bob',
+          storage: bobStore,
+          role: RoomRole.guest,
+          member: false,
+          follower: true,
+        );
+        await guest.start();
+        await _settleRoom(tester);
+        expect(guest.joined, isTrue);
+        expect(guest.initialSyncComplete, isTrue);
+        expect(guest.initialSyncError, isNull);
+        expect(guest.ownRole, RoomRole.guest);
+        expect(guest.canEdit, isFalse);
+        expect(guest.boundPersonId, isNull);
+        expect(await bobStore.hasMembership(_roomId), isTrue);
+        final guestInventory = roomHistoryInventory(guest.changes);
+        expect(guestInventory, roomHistoryInventory(alice.changes));
+        expect(
+          roomHistoryInventory(
+            decodeRoomHistory(await bobStore.loadHistory(_roomId)),
+          ),
+          guestInventory,
+        );
+        guest.dispose();
+        await _settle(tester);
+
+        final bob = session(
+          actor: 'bob',
+          storage: bobStore,
+          role: RoomRole.editor,
+          member: await bobStore.hasMembership(_roomId),
+          follower: true,
+        );
+        await bob.start();
+        await _settleRoom(tester);
+        expect(bob.joined, isTrue);
+        expect(bob.initialSyncComplete, isTrue);
+        expect(bob.ownRole, RoomRole.editor);
+        expect(bob.canBindToPerson, isTrue);
+        final promotedHistory = decodeRoomHistory(
+          await bobStore.loadHistory(_roomId),
+        );
+        expect(
+          (RoomDocument()..merge(promotedHistory)).participantRoles['bob'],
+          RoomRole.editor,
+        );
+        expect(
+          roomHistoryInventory(
+            promotedHistory.where(
+              (edit) => guestInventory.containsKey(edit.id),
+            ),
+          ),
+          guestInventory,
+        );
+        expect(
+          roomHistoryInventory(promotedHistory),
+          roomHistoryInventory(bob.changes),
+        );
+        await bob.bindToPerson(rootTreePersonId);
+        await _settleRoom(tester);
+        expect(bob.boundPersonId, rootTreePersonId);
+        expect(bob.canBindToPerson, isFalse);
+
+        final carolStore = store();
+        final carol = session(
+          actor: 'carol',
+          storage: carolStore,
+          member: false,
+          follower: true,
+        );
+        await carol.start();
+        await _settleRoom(tester);
+        expect(network.registered[alice.hostAlias], same(hostPeer));
+        expect(hostPeer.disposed, isFalse);
+        expect(bob.connectedToRemoteHost, isTrue);
+        expect(carol.connectedToRemoteHost, isTrue);
+        final rooms = [alice, bob, carol];
+        final bindings = {
+          if (hostAlreadyBound) 'alice': rootTreePersonId,
+          'bob': rootTreePersonId,
+        };
+        final identities = {
+          if (!hostAlreadyBound) 'actor:alice',
+          'person:$rootTreePersonId',
+          'actor:carol',
+        };
+        final inventory = roomHistoryInventory([
+          for (final room in rooms) ...room.changes,
+        ]);
+        for (final room in rooms) {
+          expect(room.initialSyncComplete, isTrue);
+          expect(room.initialSyncError, isNull);
+          expect(room.storageError, isNull);
+          expect(room.onlineCount, 3, reason: room.actorId);
+          expect(room.otherOnlineCount, hostAlreadyBound ? 1 : 2);
+          expect(room.participants, hasLength(hostAlreadyBound ? 2 : 3));
+          expect(
+            room.participants
+                .map(
+                  (person) => person.personId == null
+                      ? 'actor:${person.actorId}'
+                      : 'person:${person.personId}',
+                )
+                .toSet(),
+            identities,
+            reason: room.actorId,
+          );
+          expect(room.participants.every((person) => person.isOnline), isTrue);
+          expect(
+            room.participants.every((person) => person.role == RoomRole.editor),
+            isTrue,
+          );
+          final self = room.participants.singleWhere((person) => person.isSelf);
+          expect(self.actorId, room.actorId);
+          expect(self.name, 'Profile ${room.actorId}');
+          expect(self.isOnline, isTrue);
+          expect(self.personId, bindings[room.actorId]);
+          final bound = room.participants.singleWhere(
+            (person) => person.personId == rootTreePersonId,
+          );
+          final boundActor = hostAlreadyBound && room != bob ? 'alice' : 'bob';
+          expect(bound.actorId, boundActor);
+          expect(bound.name, 'Profile $boundActor');
+          expect(bound.boundPersonFullName, 'Корневая персона');
+          expect(
+            bound.isSelf,
+            room == bob || (hostAlreadyBound && room == alice),
+          );
+          expect(room.tree.bindings, bindings);
+          expect(room.durableTree.bindings, bindings);
+          expect(roomHistoryInventory(room.changes), inventory);
+          expect(_projection(room.durableTree), _projection(alice.tree));
+        }
+        for (final storage in [aliceStore, bobStore, carolStore]) {
+          expect(
+            roomHistoryInventory(
+              decodeRoomHistory(await storage.loadHistory(_roomId)),
+            ),
+            inventory,
+          );
+        }
+
+        final toBob = hostPeer.attached.singleWhere(
+          (channel) =>
+              channel.open &&
+              !channel.disposed &&
+              _channelMessages(channel.other!).any(
+                (message) =>
+                    message.type == RoomMessageType.hello &&
+                    message.actor == 'bob',
+              ),
+        );
+        final fromCarol = hostPeer.attached
+            .singleWhere(
+              (channel) =>
+                  channel.open &&
+                  !channel.disposed &&
+                  _channelMessages(channel.other!).any(
+                    (message) =>
+                        message.type == RoomMessageType.hello &&
+                        message.actor == 'carol',
+                  ),
+            )
+            .other!;
+        final trafficBefore = {
+          fromCarol: _channelMessages(fromCarol).length,
+          toBob: _channelMessages(toBob).length,
+        };
+        await carol.applyTreeOperation(carol.tree.createPerson('relay-child'));
+        await carol.editTreeText(
+          'relay-child',
+          TreeTextField.name,
+          'Правка от C',
+        );
+        // Ordinary event delivery only: no heartbeat or recovery polling tick.
+        await _settle(tester);
+        final newEdits = carol.changes
+            .where((edit) => !inventory.containsKey(edit.id))
+            .toList();
+        expect(newEdits, hasLength(2));
+        expect(newEdits.every((edit) => edit.author == 'carol'), isTrue);
+        for (final entry in trafficBefore.entries) {
+          final relayed = _channelMessages(entry.key)
+              .skip(entry.value)
+              .where((message) => message.type == RoomMessageType.edits);
+          expect(
+            relayed.map((message) => message.actor),
+            everyElement(entry.key == fromCarol ? 'carol' : 'alice'),
+          );
+          expect(
+            relayed.expand((message) => message.history).map((edit) => edit.id),
+            containsAll(newEdits.map((edit) => edit.id)),
+          );
+        }
+        final finalInventory = roomHistoryInventory(carol.changes);
+        for (final room in rooms) {
+          expect(room.onlineCount, 3);
+          expect(room.otherOnlineCount, hostAlreadyBound ? 1 : 2);
+          expect(room.tree.person('relay-child')!.name, 'Правка от C');
+          expect(room.durableTree.person('relay-child')!.name, 'Правка от C');
+          expect(roomHistoryInventory(room.changes), finalInventory);
+          expect(_projection(room.tree), _projection(carol.tree));
+          expect(_projection(room.durableTree), _projection(carol.tree));
+        }
+        for (final storage in [aliceStore, bobStore, carolStore]) {
+          expect(
+            roomHistoryInventory(
+              decodeRoomHistory(await storage.loadHistory(_roomId)),
+            ),
+            finalInventory,
+          );
+        }
+        expect(network.registered[alice.hostAlias], same(hostPeer));
+      },
+    );
+  }
+
   treeTest(
     'two actors bound to one person share online identity, person name and selected avatar',
     (tester) async {
