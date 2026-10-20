@@ -17,6 +17,11 @@ import 'room_dialogs.dart';
 import 'tree_brand.dart';
 import 'tree_editor.dart';
 
+const _buildVersion = String.fromEnvironment(
+  'MYTREE_BUILD_VERSION',
+  defaultValue: 'dev',
+);
+
 class RoomPage extends StatefulWidget {
   const RoomPage({
     super.key,
@@ -410,6 +415,16 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
                       child: Text('Изменить моё имя'),
                     ),
                     PopupMenuItem(value: 'menu', child: Text('Выход в меню')),
+                    PopupMenuDivider(),
+                    PopupMenuItem(
+                      value: 'version',
+                      enabled: false,
+                      child: SelectableText(
+                        'Версия: $_buildVersion',
+                        key: Key('room-build-version'),
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
                   ],
                   child: Padding(
                     padding: const EdgeInsets.symmetric(vertical: 12),

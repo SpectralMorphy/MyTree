@@ -2465,8 +2465,79 @@ void main() {
     },
   );
 
+  for (final size in [const Size(320, 568), const Size(1100, 850)]) {
+    testWidgets(
+      'room menu version is last and can be selected and copied at ${size.width}',
+      (tester) async {
+        await store.saveMembership(roomId);
+        await mount(tester);
+        tester.view.physicalSize = size;
+        await tester.pumpAndSettle();
+        final history = await store.loadHistory(roomId);
+        final clipboard = <String>[];
+        tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+          SystemChannels.platform,
+          (call) async {
+            if (call.method == 'Clipboard.setData') {
+              clipboard.add((call.arguments as Map)['text'] as String);
+            }
+            return null;
+          },
+        );
+        addTearDown(
+          () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+            SystemChannels.platform,
+            null,
+          ),
+        );
+        await tester.tap(find.byKey(const Key('room-menu')));
+        await tester.pumpAndSettle();
+        final items = tester
+            .widgetList<PopupMenuItem<String>>(
+              find.byType(PopupMenuItem<String>),
+            )
+            .toList();
+        expect(items.last.value, 'version');
+        expect(items.last.enabled, isFalse);
+        final version = find.byKey(const Key('room-build-version'));
+        const stamp = String.fromEnvironment(
+          'MYTREE_BUILD_VERSION',
+          defaultValue: 'dev',
+        );
+        expect(tester.widget<SelectableText>(version).data, 'Версия: $stamp');
+        expect(
+          tester.getRect(version).bottom,
+          greaterThan(tester.getRect(find.text('Выход в меню')).bottom),
+        );
+        await tester.longPress(version);
+        await tester.pumpAndSettle();
+        final editable = find.descendant(
+          of: version,
+          matching: find.byType(EditableText),
+        );
+        expect(
+          tester
+              .widget<EditableText>(editable)
+              .controller
+              .selection
+              .isCollapsed,
+          isFalse,
+        );
+        final state = tester.state<EditableTextState>(editable);
+        state.selectAll(SelectionChangedCause.keyboard);
+        state.copySelection(SelectionChangedCause.keyboard);
+        await tester.pumpAndSettle();
+        expect(clipboard.last, 'Версия: $stamp');
+        expect(find.byKey(const Key('room-build-version')), findsOneWidget);
+        expect(await store.loadHistory(roomId), history);
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+      },
+    );
+  }
+
   testWidgets(
-    'title menu has exactly settings, history, own name and exit; settings rename',
+    'title menu has settings, history, own name, exit and version last; settings rename',
     (tester) async {
       await store.saveMembership(roomId);
       await mount(tester);
@@ -2491,12 +2562,12 @@ void main() {
       semantics.dispose();
       await tester.pumpAndSettle();
       final menuItems = find.byType(PopupMenuItem<String>);
-      expect(menuItems, findsNWidgets(4));
+      expect(menuItems, findsNWidgets(5));
       expect(
         tester
             .widgetList<PopupMenuItem<String>>(menuItems)
             .map((item) => item.value),
-        ['settings', 'history', 'name', 'menu'],
+        ['settings', 'history', 'name', 'menu', 'version'],
       );
       expect(
         tester

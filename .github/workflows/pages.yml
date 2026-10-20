@@ -31,7 +31,9 @@ jobs:
         run: flutter pub get
 
       - name: Build web
-        run: flutter build web --release --no-web-resources-cdn --base-href "/MyTree/"
+        run: |
+          BUILD_VERSION="$(date -u '+%Y.%m.%d-%H%M%S UTC')"
+          flutter build web --release --no-web-resources-cdn --base-href "/MyTree/" --dart-define="MYTREE_BUILD_VERSION=$BUILD_VERSION"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
