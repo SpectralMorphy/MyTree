@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mytree_webrtc_demo/cloud/yandex_disk_client.dart';
+import 'package:mytree_webrtc_demo/local/room_tabs.dart';
 import 'package:mytree_webrtc_demo/room_document.dart';
 import 'package:mytree_webrtc_demo/room_identity.dart';
 import 'package:mytree_webrtc_demo/room_protocol.dart';
@@ -35,6 +36,23 @@ mixin _Events {
       await controller.close();
     }
   }
+}
+
+class _Tabs with _Events implements RoomTabs {
+  @override
+  bool isLeader = true;
+  @override
+  Stream<void> get onRoleChanged => on<void>('role');
+  @override
+  Stream<RoomTabState> get onState => on<RoomTabState>('state');
+  @override
+  Future<void> start() async {}
+  @override
+  void publish(RoomTabState state) {}
+  @override
+  void requestState() {}
+  @override
+  void dispose() => unawaited(closeEvents());
 }
 
 class _Network {
@@ -547,6 +565,7 @@ void main() {
     bool creator = false,
     bool follower = false,
     MemoryDiskClient? diskClient,
+    RoomTabs? tabs,
     RoomDiskAccess? access,
     String? name,
     DateTime Function() now = DateTime.now,
@@ -565,6 +584,7 @@ void main() {
       peerFactory: (id, configuration) =>
           network.create(actor, id, configuration),
       diskClient: diskClient ?? MemoryDiskClient(cloud),
+      roomTabs: tabs,
     );
     sessions.add(result);
     return result;
@@ -726,6 +746,185 @@ void main() {
         ).any((edit) => edit.sameContentAs(later)),
         isTrue,
       );
+    });
+  }
+
+  diskTest('accepted re-entry can finish RTC while its Disk read is stalled', (
+    tester,
+  ) async {
+    seedCloud();
+    final ownerStore = _Store();
+    await ownerStore.appendHistory(
+      _roomId,
+      _diskEntryHistory().map((edit) => edit.toJson()).toList(),
+    );
+    final owner = session(actor: 'owner', store: ownerStore);
+    await owner.start();
+    await _settleRoom(tester);
+    await owner.edit('A fresh peer-only change');
+
+    final store = _Store();
+    await store.saveMembership(_roomId);
+    await store.appendHistory(
+      _roomId,
+      _diskEntryHistory().map((edit) => edit.toJson()).toList(),
+    );
+    await store.saveDiskCredentials(
+      _roomId,
+      _entryAccess(RoomRole.editor).toJson(),
+    );
+    final read = Completer<void>();
+    cloud.beforeRead = (_) async {
+      await read.future;
+      throw StateError('Late cloud failure');
+    };
+    final reopened = session(actor: 'reader', store: store, follower: true);
+    final starting = reopened.start();
+    await _settleRoom(tester);
+    await _settleRoom(tester);
+    expect(cloud.read, isNotEmpty);
+    expect(read.isCompleted, isFalse);
+    expect(reopened.hasValidatedOnlinePeer, isTrue);
+    expect(reopened.initialSyncComplete, isTrue);
+    expect(reopened.initialSyncStatus, isNot(contains('с Диска')));
+    expect(reopened.text, 'A fresh peer-only change');
+    expect(reopened.localCopyOpened, isFalse);
+
+    // A late cloud failure cannot undo the completed durable peer exchange.
+    read.complete();
+    await starting;
+    expect(reopened.initialSyncComplete, isTrue);
+    expect(reopened.initialSyncError, isNull);
+    expect(reopened.text, 'A fresh peer-only change');
+  });
+
+  diskTest('a pending Disk check cannot infer readiness from solo discovery', (
+    tester,
+  ) async {
+    seedCloud();
+    final store = _Store();
+    await store.appendHistory(
+      _roomId,
+      _diskEntryHistory().map((edit) => edit.toJson()).toList(),
+    );
+    await store.saveDiskCredentials(
+      _roomId,
+      _entryAccess(RoomRole.editor).toJson(),
+    );
+    final read = Completer<void>();
+    cloud.beforeRead = (_) => read.future;
+    final room = session(actor: 'owner', store: store);
+    final starting = room.start();
+    await _settleRoom(tester);
+    await tester.pump(const Duration(seconds: 2));
+    await _settle(tester);
+    expect(network.peers, isNotEmpty);
+    expect(room.initialSyncComplete, isFalse);
+    expect(room.hasValidatedOnlinePeer, isFalse);
+    read.complete();
+    await starting;
+    expect(room.initialSyncComplete, isTrue);
+    expect(room.initialSyncStatus, contains('с Диска'));
+  });
+
+  diskTest(
+    'entry revalidates a Disk snapshot against changes made during HTTP',
+    (tester) async {
+      network.autoRegister = false;
+      final original = _diskEntryHistory();
+      final cloudOnly = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'stale-cloud-only',
+          author: 'remote-editor',
+          clock: 20,
+          createdAt: 20,
+          text: 'Must not be imported after detach',
+        ),
+        original,
+      );
+      seedCloud(history: [...original, cloudOnly]);
+      final store = _Store();
+      await store.appendHistory(
+        _roomId,
+        original.map((edit) => edit.toJson()).toList(),
+      );
+      await store.saveDiskCredentials(
+        _roomId,
+        _entryAccess(RoomRole.editor).toJson(),
+      );
+      final read = Completer<void>();
+      cloud.beforeRead = (_) => read.future;
+      final room = session(actor: 'owner', store: store);
+      final starting = room.start();
+      await _settle(tester);
+      final disconnect = sequenceAuthoredEdit(
+        const RoomEdit(
+          id: 'current-local-disconnect',
+          author: 'owner',
+          clock: 30,
+          createdAt: 30,
+          text: '{"action":"disconnect","bindingId":"$_invitationBinding"}',
+          kind: RoomEditKind.diskConnection,
+        ),
+        original,
+      );
+      await store.appendHistory(_roomId, [disconnect.toJson()]);
+      await tester.pump(const Duration(milliseconds: 35));
+      await _settle(tester);
+      expect(room.diskBinding, isNull);
+      read.complete();
+      await starting;
+      expect(room.initialSyncComplete, isFalse);
+      expect(room.initialSyncError, isNotNull);
+      expect(
+        decodeRoomHistory(
+          await store.loadHistory(_roomId),
+        ).any((edit) => edit.id == cloudOnly.id),
+        isFalse,
+      );
+    },
+  );
+
+  for (final leader in [false, true]) {
+    diskTest('tab term change restarts pending Disk entry: leader=$leader', (
+      tester,
+    ) async {
+      network.autoRegister = false;
+      seedCloud();
+      final store = _Store();
+      await store.appendHistory(
+        _roomId,
+        _diskEntryHistory().map((edit) => edit.toJson()).toList(),
+      );
+      await store.saveDiskCredentials(
+        _roomId,
+        _entryAccess(RoomRole.editor).toJson(),
+      );
+      final oldRead = Completer<void>();
+      var lists = 0;
+      cloud.beforeList = (_) async {
+        if (++lists == 1) await oldRead.future;
+      };
+      final tabs = _Tabs();
+      final room = session(actor: 'owner', store: store, tabs: tabs);
+      final starting = room.start();
+      await _settle(tester);
+      expect(lists, 1);
+      tabs.isLeader = leader;
+      tabs.emit<void>('role', null);
+      await _settle(tester);
+      expect(lists, 2);
+      expect(oldRead.isCompleted, isFalse);
+      expect(room.initialSyncComplete, isTrue);
+      expect(room.canDisconnectDisk, isTrue);
+      expect(room.initialSyncStatus, contains('с Диска'));
+      if (!leader) {
+        expect(network.peers.where((peer) => !peer.disposed), isEmpty);
+      }
+      oldRead.complete();
+      await starting;
+      expect(room.initialSyncComplete, isTrue);
+      expect(room.diskSyncError, isNull);
     });
   }
 
@@ -1176,7 +1375,10 @@ void main() {
       network.autoRegister = false;
       seedCloud();
       final release = Completer<void>();
-      cloud.beforeList = (_) => release.future;
+      var lists = 0;
+      cloud.beforeList = (_) async {
+        if (++lists == 1) await release.future;
+      };
       final store = _Store();
       final room = session(
         actor: 'newcomer',
@@ -1186,14 +1388,15 @@ void main() {
       );
       final starting = room.start();
       await _settle(tester);
-      final retrying = room.retry();
-      await _settle(tester);
-      expect(store.membershipSaveAttempts, 0);
-      cloud.beforeList = null;
-      release.complete();
-      await Future.wait([starting, retrying]);
+      await room.retry();
+      expect(release.isCompleted, isFalse);
+      expect(lists, 2);
       expect(room.joined, isTrue);
       expect(room.initialSyncComplete, isTrue);
+      expect(store.membershipSaveAttempts, 1);
+      expect(cloud.read, hasLength(1));
+      release.complete();
+      await starting;
       expect(store.membershipSaveAttempts, 1);
       expect(cloud.read, hasLength(1));
     },
@@ -2184,6 +2387,7 @@ void main() {
       expect(reopened.canDisconnectDisk, isTrue);
       expect(reopened.text, 'Durable before restart');
       await reopened.syncDisk();
+      await _settle(tester);
       expect(reopened.diskSyncError, isNull);
       expect(reopened.diskSyncStatus, contains('подтверждена'));
       expect(

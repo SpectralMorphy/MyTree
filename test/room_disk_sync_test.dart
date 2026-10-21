@@ -282,7 +282,7 @@ class _Replica {
   }
 }
 
-List<RoomEdit> _diskAdmissionHistory() {
+List<RoomEdit> _diskAdmissionHistory({int extraEdits = 0}) {
   final history = <RoomEdit>[];
   void append(RoomEdit edit) {
     history.add(sequenceAuthoredEdit(edit, history));
@@ -318,6 +318,17 @@ List<RoomEdit> _diskAdmissionHistory() {
       text: 'Cloud history',
     ),
   );
+  for (var index = 0; index < extraEdits; index++) {
+    append(
+      RoomEdit(
+        id: 'cloud-extra-$index',
+        author: 'owner',
+        clock: 4 + index,
+        createdAt: 4 + index,
+        text: 'Cloud edit $index',
+      ),
+    );
+  }
   return history;
 }
 
@@ -462,6 +473,246 @@ void main() {
           );
         },
       );
+
+      testWidgets(
+        'downloads at most four batches and preserves the out-of-order union',
+        (tester) async {
+          history = _diskAdmissionHistory(extraEdits: 6);
+          for (final edit in history.reversed) {
+            backend.addBatch([edit]);
+          }
+          final paths = backend.files.keys.toList()..sort();
+          final gates = {for (final path in paths) path: Completer<void>()};
+          var active = 0;
+          var peak = 0;
+          var finished = false;
+          backend.beforeRead = (path) async {
+            active++;
+            if (active > peak) peak = active;
+            try {
+              await gates[path]!.future;
+            } finally {
+              active--;
+            }
+          };
+          final pending = read().then((result) {
+            finished = true;
+            return result;
+          });
+          await tester.pump();
+          expect(getReads(), hasLength(4));
+          expect(active, 4);
+          // Keep the first sorted batch blocked while the other slots progress.
+          for (var index = 3; index < paths.length; index++) {
+            gates[paths[index]]!.complete();
+            await tester.pump();
+            expect(
+              getReads(),
+              hasLength(index + 2 < paths.length ? index + 2 : paths.length),
+            );
+            expect(active, lessThanOrEqualTo(4));
+            expect(finished, isFalse);
+          }
+          for (final path in paths.take(3).toList().reversed) {
+            gates[path]!.complete();
+            await tester.pump();
+          }
+          final result = await pending;
+          expect(peak, 4);
+          expect(active, 0);
+          expect(result.map((edit) => edit.id), history.map((edit) => edit.id));
+          expect(roomHistoryDigest(result), roomHistoryDigest(history));
+          expect(
+            getReads(),
+            paths.map(
+              (path) => public ? '/batches/${path.split('/').last}' : path,
+            ),
+          );
+          final guard = backend.requestGuards.first!;
+          final deadline = backend.requestDeadlines.first!;
+          expect(backend.requestGuards, hasLength(1 + paths.length));
+          expect(backend.requestGuards, everyElement(same(guard)));
+          expect(backend.requestDeadlines, everyElement(same(deadline)));
+          expect(guard(), isFalse);
+        },
+      );
+
+      test('every snapshot freshly reads the immutable batches', () async {
+        final path = backend.addBatch(history);
+        await read();
+        await read();
+        expect(getReads(), hasLength(2));
+        backend.files[path] = Uint8List.fromList([...backend.files[path]!, 32]);
+        await expectLater(read(), throwsStateError);
+        expect(getReads(), hasLength(3));
+      });
+
+      for (final invalidName in ['not-a-digest.json', '../${'f' * 64}.json']) {
+        test(
+          'validates even the last candidate before any download: $invalidName',
+          () async {
+            history = _diskAdmissionHistory(extraEdits: 5);
+            for (final edit in history) {
+              backend.addBatch([edit]);
+            }
+            backend.listing = [
+              ...backend.files.keys.map((path) => path.split('/').last),
+              invalidName,
+            ];
+            await expectLater(read(), throwsStateError);
+            expect(getReads(), isEmpty);
+          },
+        );
+      }
+
+      for (final failure in [
+        'transport',
+        'hash',
+        'json',
+        'utf8',
+        'version',
+        'room',
+        'binding',
+        'record',
+        'per-file-budget',
+      ]) {
+        testWidgets(
+          '$failure stops queued downloads and observes late failures',
+          (tester) async {
+            final corruptExisting = failure == 'transport' || failure == 'hash';
+            history = _diskAdmissionHistory(
+              extraEdits: corruptExisting ? 1 : 0,
+            );
+            for (final edit in history) {
+              backend.addBatch([edit]);
+            }
+            late final String badPath;
+            if (corruptExisting) {
+              badPath = (backend.files.keys.toList()..sort()).first;
+            } else {
+              final payload = {
+                'v': failure == 'version' ? 2 : 1,
+                'roomId': failure == 'room' ? 'f' * 32 : _roomId,
+                'bindingId': failure == 'binding'
+                    ? 'other-binding'
+                    : _bindingId,
+                'history': [
+                  {
+                    ...history.last.toJson(),
+                    if (failure == 'record') 'clock': -1,
+                  },
+                ],
+              };
+              final bytes = failure == 'per-file-budget'
+                  ? Uint8List(maxRoomTransferBytes + 1)
+                  : Uint8List.fromList(
+                      failure == 'utf8'
+                          ? [0xff]
+                          : utf8.encode(
+                              failure == 'json'
+                                  ? '{bad JSON'
+                                  : jsonEncode(payload),
+                            ),
+                    );
+              badPath = backend.addRawBatch(bytes);
+            }
+            // This correctly named queued candidate must never be requested.
+            final queuedName = '${'f' * 64}.json';
+            backend.listing = [
+              ...backend.files.keys.map((path) => path.split('/').last),
+              queuedName,
+            ];
+            expect(backend.files, hasLength(4));
+            expect(badPath.split('/').last.compareTo(queuedName), lessThan(0));
+            if (failure == 'hash') {
+              backend.files[badPath] = Uint8List.fromList([
+                ...backend.files[badPath]!,
+                32,
+              ]);
+            }
+            final releaseBad = Completer<void>();
+            final releaseOthers = Completer<void>();
+            backend.beforeRead = (path) async {
+              if (path == badPath) {
+                await releaseBad.future;
+                if (failure == 'transport') {
+                  throw StateError('Transport $_token');
+                }
+              } else {
+                await releaseOthers.future;
+                throw StateError('Late transport failure $_token');
+              }
+            };
+            final failed = expectLater(read(), throwsStateError);
+            await tester.pump();
+            expect(getReads(), hasLength(4));
+            releaseBad.complete();
+            await tester.pump();
+            await failed;
+            for (final guard in backend.requestGuards) {
+              expect(guard!(), isFalse);
+            }
+            expect(getReads(), hasLength(4));
+            releaseOthers.complete();
+            await tester.pump();
+            expect(getReads(), hasLength(4));
+          },
+        );
+      }
+
+      testWidgets('cumulative raw budget stops queued downloads', (
+        tester,
+      ) async {
+        final original = backend.addBatch(history);
+        final payload = backend.files.remove(original)!;
+        final size = maxRoomTransferBytes ~/ 2 + 1;
+        final padded = Uint8List(size)..fillRange(0, size, 32);
+        padded.setRange(0, payload.length, payload);
+        final firstLarge = backend.addRawBatch(padded);
+        final second = Uint8List.fromList(padded);
+        second[second.length - 1] = 10;
+        final secondLarge = backend.addRawBatch(second);
+        backend.addBatch([history.first]);
+        backend.addBatch([history.last]);
+        final queuedNames = ['${'f' * 63}e.json', '${'f' * 64}.json'];
+        expect(
+          backend.files.keys.every(
+            (path) => path.split('/').last.compareTo(queuedNames.first) < 0,
+          ),
+          isTrue,
+        );
+        backend.listing = [
+          ...backend.files.keys.map((path) => path.split('/').last),
+          ...queuedNames,
+        ];
+        final gates = {
+          for (final name in backend.listing!)
+            '$_directory/$name': Completer<void>(),
+        };
+        backend.beforeRead = (path) => gates[path]!.future;
+        final failed = expectLater(read(), throwsStateError);
+        await tester.pump();
+        expect(getReads(), hasLength(4));
+        gates[firstLarge]!.complete();
+        await tester.pump();
+        expect(getReads(), hasLength(5));
+        gates[secondLarge]!.complete();
+        await tester.pump();
+        await failed;
+        expect(
+          getReads(),
+          hasLength(5),
+          reason: 'No sixth read after budget failure',
+        );
+        for (final guard in backend.requestGuards) {
+          expect(guard!(), isFalse);
+        }
+        for (final gate in gates.values) {
+          if (!gate.isCompleted) gate.complete();
+        }
+        await tester.pump();
+        expect(getReads(), hasLength(5));
+      });
 
       test(
         'terminal disconnect is not fresh admission or private access',
@@ -870,12 +1121,14 @@ void main() {
 
       for (final stage in ['list', 'read']) {
         test('cancellation during $stage cannot continue or succeed', () async {
-          backend.addBatch(history.take(2).toList());
-          backend.addBatch([history.last]);
+          history = _diskAdmissionHistory(extraEdits: 4);
+          for (final edit in history) {
+            backend.addBatch([edit]);
+          }
           final entered = Completer<void>();
           final release = Completer<void>();
           Future<void> gate(String _) async {
-            entered.complete();
+            if (!entered.isCompleted) entered.complete();
             await release.future;
           }
 
@@ -893,14 +1146,16 @@ void main() {
           release.complete();
           await failed;
           expect(getListings(), hasLength(1));
-          expect(getReads(), hasLength(stage == 'list' ? 0 : 1));
+          expect(getReads(), hasLength(stage == 'list' ? 0 : 4));
         });
 
         testWidgets('overall deadline stops late $stage continuation', (
           tester,
         ) async {
-          backend.addBatch(history.take(2).toList());
-          backend.addBatch([history.last]);
+          history = _diskAdmissionHistory(extraEdits: 4);
+          for (final edit in history) {
+            backend.addBatch([edit]);
+          }
           final release = Completer<void>();
           if (stage == 'list') {
             backend.beforeList = (_) => release.future;
@@ -914,14 +1169,14 @@ void main() {
           });
           await tester.pump();
           expect(getListings(), hasLength(1));
-          expect(getReads(), hasLength(stage == 'list' ? 0 : 1));
+          expect(getReads(), hasLength(stage == 'list' ? 0 : 4));
           await tester.pump(const Duration(seconds: 1));
           expect(finished, isTrue, reason: 'The overall wait is bounded');
           await failed;
           expect(backend.requestGuards.last!(), isFalse);
           release.complete();
           await tester.pump();
-          expect(getReads(), hasLength(stage == 'list' ? 0 : 1));
+          expect(getReads(), hasLength(stage == 'list' ? 0 : 4));
         });
       }
 
@@ -1197,6 +1452,62 @@ void main() {
         expect(sync.error, isNull);
         expect(merges, 1);
         expect(sync.status, 'История прочитана с Диска');
+      },
+    );
+
+    testWidgets(
+      'partial parallel reads never merge or claim a valid snapshot',
+      (tester) async {
+        cloud = _diskAdmissionHistory(extraEdits: 5);
+        backend.files.clear();
+        for (final edit in cloud) {
+          backend.addBatch([edit]);
+        }
+        final paths = backend.files.keys.toList()..sort();
+        final gates = {for (final path in paths) path: Completer<void>()};
+        backend.beforeRead = (path) async {
+          await gates[path]!.future;
+          if (path == paths[3]) throw StateError('Failed batch $_token');
+        };
+        sync.update(access: access, enabled: true);
+        var finished = false;
+        final failed = expectLater(sync.sync(), throwsStateError).then((_) {
+          finished = true;
+        });
+        await tester.pump();
+        expect(backend.publicRead, hasLength(4));
+        for (final path in paths.take(3)) {
+          gates[path]!.complete();
+        }
+        await tester.pump();
+        expect(backend.publicRead, hasLength(7));
+        expect(finished, isFalse);
+        expect(sync.busy, isTrue);
+        expect(merges, 0);
+        expect(local, isEmpty);
+        expect(sync.status, isNot('История прочитана с Диска'));
+        gates[paths[3]]!.complete();
+        await tester.pump();
+        await failed;
+        expect(sync.busy, isFalse);
+        expect(merges, 0);
+        expect(local, isEmpty);
+        expect(sync.error, isNotNull);
+        expect(sync.error, isNot(contains(_token)));
+        expect(sync.status, isNot('История прочитана с Диска'));
+        for (final gate in gates.values) {
+          if (!gate.isCompleted) gate.complete();
+        }
+        await tester.pump();
+        expect(backend.publicRead, hasLength(7));
+        expect(merges, 0);
+        backend.beforeRead = null;
+        await sync.sync();
+        expect(backend.publicRead, hasLength(7 + paths.length));
+        expect(merges, 1);
+        expect(roomHistoryDigest(local), roomHistoryDigest(cloud));
+        expect(sync.status, 'История прочитана с Диска');
+        sync.update(access: access, enabled: false);
       },
     );
 

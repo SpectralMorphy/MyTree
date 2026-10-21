@@ -61,6 +61,16 @@ flutter build web --release --no-web-resources-cdn
 
 Run real browser checks **headless** for UI/network changes, as required by [CLAUDE.md](../../CLAUDE.md). Do not open browser windows or take over the user's desktop. A skipped, compiled-only, or failed test is not a passing test; retain that distinction in reports.
 
+## Read-only live Disk re-entry benchmark
+
+[check_disk_reentry.cjs](../../tool/check_disk_reentry.cjs) measures a served release in headless Chrome using an explicitly supplied local token file:
+
+```text
+node tool/check_disk_reentry.cjs <playwright-module> <token-file> <base-url> <new-artifacts-directory> [room-id]
+```
+
+It reads existing cloud batches, seeds an isolated accepted local profile, then performs repeated same-profile reloads (`DISK_REENTRY_REPEATS`, default three). It checks complete journal equality/digests and fresh successful provider reads, recording tree-entry readiness separately from subsequent cloud-copy acknowledgment. It never clicks Retry or Open Local Copy. Provider mutations, upload/publication endpoints, and all WebSockets are blocked; this isolates Disk entry rather than claiming public RTC verification. Reports contain counts, sanitized request categories/timings and hashes, not credentials, signed URLs or journal bodies. Readiness failures remain recorded failures, not timings for a successful entry. Use a fixed room ID for before/after comparison; live account/network latency is dated evidence, not a guarantee.
+
 ## Real Application Driver
 
 [check_tree_ui.cjs](../../tool/check_tree_ui.cjs) drives the current production tree UI through Playwright/installed Chrome:

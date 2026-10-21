@@ -248,6 +248,7 @@ class RoomSession extends ChangeNotifier {
   Timer? _initialTimer;
   Timer? _soloTimer;
   int _entryAttempt = 0;
+  bool _entryExpired = false;
   bool _initialSyncComplete = false;
   bool _resumeVerification = false;
   bool _resumeRecoveryPending = false;
@@ -572,8 +573,8 @@ class RoomSession extends ChangeNotifier {
         _diskCredentials?['token'] == access.token;
     _diskRecoveryReading = true;
     // A background replica ACK alone is not admission/entry proof. Re-read the
-    // exact binding with the stricter bounded entry validator before opening it.
-    final result = _messages.then((_) async {
+    // exact binding, outside the RTC queue, before a serialized durable commit.
+    final result = () async {
       if (!current() || _initialSyncComplete) return;
       _diskEntryReading = true;
       _changed();
@@ -587,15 +588,23 @@ class RoomSession extends ChangeNotifier {
           timeout: _joinDeadline,
         );
         if (!current()) return;
-        _validateDiskEntryHistory(history, access);
-        if (await _history.merge(history) == null) {
-          throw StateError('История с Диска не сохранена');
-        }
-        await _history.flush();
-        if (!current()) return;
-        _validateDiskEntryHistory(_history.durableHistory, access);
-        _diskEntryError = null;
-        _completeInitialSync(fromDisk: true);
+        final commit = _messages.then((_) async {
+          if (!current()) return;
+          _validateDiskEntryHistory(
+            validateAuthorHistory([..._history.durableHistory, ...history]),
+            access,
+          );
+          if (await _history.merge(history) == null) {
+            throw StateError('История с Диска не сохранена');
+          }
+          await _history.flush();
+          if (!current()) return;
+          _validateDiskEntryHistory(_history.durableHistory, access);
+          _diskEntryError = null;
+          _completeInitialSync(fromDisk: true);
+        });
+        _messages = commit.catchError((Object _) {});
+        await commit;
       } catch (_) {
         if (current()) {
           _diskEntryError =
@@ -603,15 +612,17 @@ class RoomSession extends ChangeNotifier {
           _failInitialSync(_history.error ?? _diskEntryError!);
         }
       } finally {
-        _diskEntryReading = false;
+        if (!_disposed && attempt == _entryAttempt) _diskEntryReading = false;
       }
-    });
-    _messages = result
-        .whenComplete(() {
-          _diskRecoveryReading = false;
-          if (!_disposed) _changed();
-        })
-        .catchError((Object _) {});
+    }();
+    unawaited(
+      result
+          .whenComplete(() {
+            _diskRecoveryReading = false;
+            if (!_disposed) _changed();
+          })
+          .catchError((Object _) {}),
+    );
   }
 
   Future<void> _mergeDiskHistory(List<RoomEdit> edits) {
@@ -1434,12 +1445,36 @@ class RoomSession extends ChangeNotifier {
     if (!_admissionHistoryLoaded && (_joined || invitationRole != null)) {
       if (!await _loadEntryHistory()) return;
     }
-    if (!await _enterFromDisk(attempt)) return;
-    if (_disposed || attempt != _entryAttempt) return;
-    if (_joined && _needsEntryProfile && !await _ensureEntryProfile()) return;
+    final accepted = _joined;
+    if (accepted) {
+      if (invitationDiskAccess == null &&
+          _needsEntryProfile &&
+          !await _ensureEntryProfile()) {
+        return;
+      }
+      if (newlyCreated) _completeInitialSync();
+      await _startEntryNetwork();
+    }
+    if (!await _finishDiskEntry(attempt)) return;
+    if (!accepted) await _startEntryNetwork();
+  }
+
+  Future<bool> _finishDiskEntry(int attempt) async {
+    if (!await _enterFromDisk(attempt)) return false;
+    if (_disposed || attempt != _entryAttempt) return false;
+    if (_joined && _needsEntryProfile && !await _ensureEntryProfile()) {
+      return false;
+    }
     if (_joined) unawaited(_loadDiskCredentials());
-    if (newlyCreated && _joined) _completeInitialSync();
-    if (_joined && roomTabs != null) {
+    return true;
+  }
+
+  Future<void> _startEntryNetwork() async {
+    if (_isTabFollower) {
+      _tabState = null;
+      _verifiedTabState = null;
+      _requestTabState();
+    } else if (!_tabsActive && _joined && roomTabs != null) {
       await _activateTabs();
     } else {
       _startNetwork();
@@ -1499,67 +1534,71 @@ class RoomSession extends ChangeNotifier {
     }
   }
 
-  /// Shares the journal/admission queue with RTC and storage refreshes, but runs
-  /// before starting either network or the write-capable Disk replica.
-  Future<bool> _enterFromDisk(int attempt) {
-    bool current() =>
-        !_disposed && attempt == _entryAttempt && _initialSyncError == null;
-    final result = _messages.then((_) async {
-      if (!current()) return false;
-      RoomDiskAccess? access = invitationDiskAccess;
-      try {
-        final binding = diskBinding;
-        final acceptedGuest = _joined && ownRole == RoomRole.guest;
-        if (access == null && _joined && binding != null) {
-          if (ownRole == RoomRole.editor) {
-            final saved = await store.loadDiskCredentials(
-              roomId,
-              bindingId: binding.id,
-            );
-            if (!current()) return false;
-            if (saved != null) {
-              final stored = RoomDiskAccess.fromJson(saved);
-              if (stored.isEditor && stored.bindingId == binding.id) {
-                access = stored;
-              }
-            }
-          }
-          if (access == null) {
-            final saved = await store.loadDiskPublicAccess(roomId);
-            if (!current()) return false;
-            if (saved != null) {
-              final stored = RoomDiskAccess.fromJson(saved);
-              if (!stored.isEditor && stored.bindingId == binding.id) {
-                access = stored;
-              }
+  /// Cloud I/O must not hold the journal/admission queue: accepted members can
+  /// obtain a fresh RTC checkpoint while a Disk request is still pending.
+  Future<bool> _enterFromDisk(int attempt) async {
+    bool current() => !_disposed && attempt == _entryAttempt && !_entryExpired;
+    if (!current()) return false;
+    RoomDiskAccess? access = invitationDiskAccess;
+    try {
+      final binding = diskBinding;
+      final acceptedGuest = _joined && ownRole == RoomRole.guest;
+      if (access == null && _joined && binding != null) {
+        if (ownRole == RoomRole.editor) {
+          final saved = await store.loadDiskCredentials(
+            roomId,
+            bindingId: binding.id,
+          );
+          if (!current()) return false;
+          if (saved != null) {
+            final stored = RoomDiskAccess.fromJson(saved);
+            if (stored.isEditor && stored.bindingId == binding.id) {
+              access = stored;
             }
           }
         }
-        if (access == null) return true;
-        _diskEntryReading = true;
-        _changed();
-        final entryAccess = access;
-        final allowFinalDisconnect =
-            acceptedGuest &&
-            !entryAccess.isEditor &&
-            binding?.id == entryAccess.bindingId;
-        void validateEntryHistory(List<RoomEdit> edits) =>
-            _validateDiskEntryHistory(
-              edits,
-              entryAccess,
-              allowFinalDisconnect: allowFinalDisconnect,
-            );
-        final history = await readDiskRoomHistory(
-          client: _diskClient,
-          roomId: roomId,
-          access: entryAccess,
-          localHistory: _history.durableHistory,
-          isCurrent: current,
-          timeout: _joinDeadline,
-          allowFinalDisconnect: allowFinalDisconnect,
-        );
+        if (access == null) {
+          final saved = await store.loadDiskPublicAccess(roomId);
+          if (!current()) return false;
+          if (saved != null) {
+            final stored = RoomDiskAccess.fromJson(saved);
+            if (!stored.isEditor && stored.bindingId == binding.id) {
+              access = stored;
+            }
+          }
+        }
+      }
+      if (access == null) return true;
+      _diskEntryReading = true;
+      _changed();
+      final entryAccess = access;
+      final allowFinalDisconnect =
+          acceptedGuest &&
+          !entryAccess.isEditor &&
+          binding?.id == entryAccess.bindingId;
+      void validateEntryHistory(List<RoomEdit> edits) =>
+          _validateDiskEntryHistory(
+            edits,
+            entryAccess,
+            allowFinalDisconnect: allowFinalDisconnect,
+          );
+      final history = await readDiskRoomHistory(
+        client: _diskClient,
+        roomId: roomId,
+        access: entryAccess,
+        localHistory: _history.durableHistory,
+        isCurrent: current,
+        timeout: _joinDeadline,
+        allowFinalDisconnect: allowFinalDisconnect,
+      );
+      if (!current()) return false;
+      final result = _messages.then((_) async {
         if (!current()) return false;
-        validateEntryHistory(history);
+        // RTC or shared storage may have added a detach/role change during HTTP.
+        // Validate the current union before persisting any part of this snapshot.
+        validateEntryHistory(
+          validateAuthorHistory([..._history.durableHistory, ...history]),
+        );
         final added = await _history.merge(history);
         if (!current()) return false;
         if (added == null) throw StateError('История с Диска не сохранена');
@@ -1611,31 +1650,30 @@ class RoomSession extends ChangeNotifier {
         _diskEntryError = null;
         _completeInitialSync(fromDisk: true);
         return true;
-      } catch (_) {
-        if (_disposed || attempt != _entryAttempt) return false;
-        // External failures can contain tokens, URLs, or raw JSON. Keep cloud
-        // errors safe and independent from the ordinary online admission path.
-        _diskEntryError =
-            'Не удалось открыть подтверждённую историю с Диска. '
-            'Можно повторить проверку или дождаться онлайн-участника.';
-        _failInitialSync(
-          _history.error ?? _initialSyncError ?? _diskEntryError!,
-        );
-        return true;
-      } finally {
-        if (!_disposed && attempt == _entryAttempt) {
-          _diskEntryReading = false;
-          _diskEntryPending = false;
-          _updateDiskSync();
-          _changed();
-        }
+      });
+      _messages = result.then<void>(
+        (_) {},
+        onError: (Object _, StackTrace __) {},
+      );
+      return await result;
+    } catch (_) {
+      if (_disposed || attempt != _entryAttempt) return false;
+      // External failures can contain tokens, URLs, or raw JSON. Keep cloud
+      // errors safe and independent from the ordinary online admission path.
+      _diskEntryError =
+          'Не удалось открыть подтверждённую историю с Диска. '
+          'Можно повторить проверку или дождаться онлайн-участника.';
+      _failInitialSync(_history.error ?? _initialSyncError ?? _diskEntryError!);
+      return true;
+    } finally {
+      if (!_disposed && attempt == _entryAttempt) {
+        _diskEntryReading = false;
+        _diskEntryPending = false;
+        _updateDiskSync();
+        _updateEntryBarrier();
+        _changed();
       }
-    });
-    _messages = result.then<void>(
-      (_) {},
-      onError: (Object _, StackTrace __) {},
-    );
-    return result;
+    }
   }
 
   bool get _needsEntryProfile =>
@@ -1756,7 +1794,8 @@ class RoomSession extends ChangeNotifier {
     _tabVerifyTimer = null;
     // A new local owner has no inherited remote proof. Ordinary snapshots in
     // the same term do not undo latched readiness; election/retry does.
-    if (!first || (_running && !_tabLeader)) {
+    final restartEntry = !first || (_running && !_tabLeader);
+    if (restartEntry) {
       _beginInitialWait(resuming: _resumeVerification);
     }
     if (_tabLeader) _tabResyncId = null;
@@ -1770,6 +1809,11 @@ class RoomSession extends ChangeNotifier {
       _stopNetwork();
       _requestTabState();
       _changed();
+    }
+    if (restartEntry && _diskEntryPending) {
+      // Ownership may change while the old attempt is awaiting HTTP. Its stale
+      // callback cannot clear pending state or finish this term's strict read.
+      unawaited(_finishDiskEntry(_entryAttempt));
     }
   }
 
@@ -1965,6 +2009,7 @@ class RoomSession extends ChangeNotifier {
   void _beginInitialWait({bool resuming = false}) {
     _resumeVerification = resuming;
     _entryAttempt++;
+    _entryExpired = false;
     _initialTimer?.cancel();
     _initialSyncComplete = false;
     _initialSyncFromDisk = false;
@@ -1975,6 +2020,7 @@ class RoomSession extends ChangeNotifier {
     final attempt = _entryAttempt;
     _initialTimer = Timer(_joinDeadline, () {
       if (_disposed || attempt != _entryAttempt || _initialSyncComplete) return;
+      _entryExpired = true;
       final detail =
           _networkIssue ?? 'Нет подтверждения сохранения от онлайн-участников.';
       _failInitialSync(
@@ -2003,7 +2049,7 @@ class RoomSession extends ChangeNotifier {
       return;
     }
     if (!fromDisk &&
-        _diskEntryError != null &&
+        (_diskEntryError != null || (_diskEntryPending && !newlyCreated)) &&
         !hasValidatedOnlinePeer &&
         !_isTabFollower) {
       return;
@@ -2215,21 +2261,17 @@ class RoomSession extends ChangeNotifier {
     if (!_admissionHistoryLoaded && (_joined || invitationRole != null)) {
       if (!await _loadEntryHistory()) return;
     }
-    if (!await _enterFromDisk(attempt)) return;
-    if (_disposed || attempt != _entryAttempt) return;
-    if (_joined && _needsEntryProfile && !await _ensureEntryProfile()) return;
-    if (_joined) unawaited(_loadDiskCredentials());
-    if (_isTabFollower) {
-      _tabState = null;
-      _verifiedTabState = null;
-      _requestTabState();
-      return;
+    final accepted = _joined;
+    if (accepted) {
+      if (invitationDiskAccess == null &&
+          _needsEntryProfile &&
+          !await _ensureEntryProfile()) {
+        return;
+      }
+      await _startEntryNetwork();
     }
-    if (!_tabsActive && _joined && roomTabs != null) {
-      await _activateTabs();
-    } else {
-      _startNetwork();
-    }
+    if (!await _finishDiskEntry(attempt)) return;
+    if (!accepted) await _startEntryNetwork();
   }
 
   void _startNetwork() {

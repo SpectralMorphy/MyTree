@@ -12,6 +12,7 @@ import 'yandex_disk_client.dart';
 
 final _diskBatchName = RegExp(r'^[0-9a-f]{64}\.json$');
 const _maxDiskHistoryBatches = 2048;
+const _diskHistoryDownloadConcurrency = 4;
 
 List<RoomEdit> _decodeDiskBatch(
   Uint8List bytes, {
@@ -108,37 +109,62 @@ Future<List<RoomEdit>> readDiskRoomHistory({
     if (candidates.any((name) => !_diskBatchName.hasMatch(name))) {
       throw const FormatException('Неверное имя облачного пакета');
     }
-    final remote = <RoomEdit>[];
+    final names = candidates.toSet().toList()..sort();
+    final batches = List<List<RoomEdit>?>.filled(names.length, null);
+    var nextBatch = 0;
     var downloadedBytes = 0;
-    for (final name in candidates.toSet().toList()..sort()) {
-      checkCurrent();
-      final bytes = access.isEditor
-          ? await client.readFile(
-              access.token!,
-              '$directory/$name',
-              isCurrent: requestIsCurrent,
-              deadline: deadline,
-            )
-          : await client.readPublicFile(
-              access.publicUrl!,
-              '/batches/$name',
-              isCurrent: requestIsCurrent,
-              deadline: deadline,
-            );
-      checkCurrent();
-      downloadedBytes += bytes.length;
-      if (downloadedBytes > maxRoomTransferBytes) {
-        throw const FormatException('Облачная история превышает 8 МиБ');
+    Future<void> download() async {
+      try {
+        while (!stopped && nextBatch < names.length) {
+          checkCurrent();
+          final index = nextBatch++;
+          final name = names[index];
+          final bytes = access.isEditor
+              ? await client.readFile(
+                  access.token!,
+                  '$directory/$name',
+                  isCurrent: requestIsCurrent,
+                  deadline: deadline,
+                )
+              : await client.readPublicFile(
+                  access.publicUrl!,
+                  '/batches/$name',
+                  isCurrent: requestIsCurrent,
+                  deadline: deadline,
+                );
+          checkCurrent();
+          // Charge all completed downloads before decoding or scheduling more.
+          // Only this fixed worker set can retain additional in-flight bodies.
+          downloadedBytes += bytes.length;
+          if (downloadedBytes > maxRoomTransferBytes) {
+            throw const FormatException('Облачная история превышает 8 МиБ');
+          }
+          batches[index] = _decodeDiskBatch(
+            bytes,
+            name: name,
+            roomId: roomId,
+            bindingId: access.bindingId,
+          );
+        }
+      } catch (_) {
+        // Also invalidates the guard used by other workers' link/body requests.
+        stopped = true;
+        rethrow;
       }
-      remote.addAll(
-        _decodeDiskBatch(
-          bytes,
-          name: name,
-          roomId: roomId,
-          bindingId: access.bindingId,
-        ),
-      );
     }
+
+    // Eager failure still observes every worker, including late client errors.
+    await Future.wait([
+      for (
+        var worker = 0;
+        worker < _diskHistoryDownloadConcurrency && worker < names.length;
+        worker++
+      )
+        download(),
+    ], eagerError: true);
+    checkCurrent();
+    // Completion order must not change the validated union's input ordering.
+    final remote = [for (final batch in batches) ...batch!];
     if (remote.isEmpty) {
       throw const FormatException('Облачная история пуста');
     }
