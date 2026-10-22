@@ -741,9 +741,8 @@ void main() {
       expect(cloud.written, isEmpty);
       expect(cloud.published, isEmpty);
       expect(
-        decodeRoomHistory(
-          await store.loadHistory(_roomId),
-        ).any((edit) => edit.sameContentAs(later)),
+        decodeRoomHistory(await store.loadHistory(_roomId))
+            .any((edit) => edit.sameContentAs(later)),
         isTrue,
       );
     });
@@ -877,9 +876,8 @@ void main() {
       expect(room.initialSyncComplete, isFalse);
       expect(room.initialSyncError, isNotNull);
       expect(
-        decodeRoomHistory(
-          await store.loadHistory(_roomId),
-        ).any((edit) => edit.id == cloudOnly.id),
+        decodeRoomHistory(await store.loadHistory(_roomId))
+            .any((edit) => edit.id == cloudOnly.id),
         isFalse,
       );
     },
@@ -929,6 +927,41 @@ void main() {
   }
 
   for (final role in RoomRole.values) {
+    diskTest(
+      'healthy Disk-only ${role.name} focus return keeps verified room',
+      (tester) async {
+        network.autoRegister = false;
+        seedCloud();
+        var clock = DateTime.utc(2026, 10, 22);
+        final room = session(
+          actor: 'reader',
+          member: false,
+          role: role,
+          access: _entryAccess(role),
+          now: () => clock,
+        );
+        await room.start();
+        expect(room.initialSyncComplete, isTrue);
+        expect(room.networkAvailable, isFalse);
+        final ready = <bool>[];
+        room.addListener(() => ready.add(room.initialSyncComplete));
+        room.setForeground(false);
+        for (var tick = 0; tick < 6; tick++) {
+          clock = clock.add(const Duration(seconds: 5));
+          await tester.pump(const Duration(seconds: 5));
+          await _settle(tester);
+        }
+        room.setForeground(true);
+        await tester.pump(const Duration(milliseconds: 200));
+        await _settle(tester);
+        expect(room.initialSyncComplete, isTrue);
+        expect(room.verifyingAfterResume, isFalse);
+        expect(ready, everyElement(isTrue));
+      },
+    );
+  }
+
+  for (final role in RoomRole.values) {
     diskTest('resumed ${role.name} waits for a fresh durable Disk read', (
       tester,
     ) async {
@@ -965,7 +998,7 @@ void main() {
       store.beforeAppend = (edits) async {
         if (edits.any((edit) => edit['id'] == later.id)) await saveGate.future;
       };
-      clock = clock.add(const Duration(seconds: 4));
+      clock = clock.add(const Duration(seconds: 25));
       room.setForeground(true);
       expect(room.verifyingAfterResume, isTrue);
       await tester.pump(const Duration(milliseconds: 200));
@@ -980,9 +1013,8 @@ void main() {
       await _settle(tester);
       expect(room.initialSyncComplete, isFalse);
       expect(
-        decodeRoomHistory(
-          await store.loadHistory(_roomId),
-        ).any((edit) => edit.id == later.id),
+        decodeRoomHistory(await store.loadHistory(_roomId))
+            .any((edit) => edit.id == later.id),
         isFalse,
       );
       saveGate.complete();
@@ -1079,9 +1111,9 @@ void main() {
     await store.saveMembership(_roomId);
     await store.appendHistory(
       _roomId,
-      _diskEntryHistory(
-        ownerRole: RoomRole.guest,
-      ).map((edit) => edit.toJson()).toList(),
+      _diskEntryHistory(ownerRole: RoomRole.guest)
+          .map((edit) => edit.toJson())
+          .toList(),
     );
     await store.appendHistory(_roomId, [
       _role('reader', RoomRole.editor).toJson(),

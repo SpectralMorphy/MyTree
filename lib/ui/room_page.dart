@@ -110,6 +110,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive) return;
     _session?.setForeground(state == AppLifecycleState.resumed);
   }
 
@@ -370,9 +371,8 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       }
       final route = ModalRoute.of(context);
       if (route != null && !route.isCurrent) {
-        Navigator.of(
-          context,
-        ).popUntil((candidate) => identical(candidate, route));
+        Navigator.of(context)
+            .popUntil((candidate) => identical(candidate, route));
       }
       ++_generation;
       session.removeListener(_sessionChanged);

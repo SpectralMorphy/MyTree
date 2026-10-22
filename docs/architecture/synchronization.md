@@ -201,11 +201,15 @@ A final superseding hub checkpoint starts a new bounded ACK round. Completing a 
 
 ## Recovery and truthful UI
 
-Browser visibility/resume/pageshow events, Flutter lifecycle events, an online hint returning, or a heartbeat wall-clock gap
-over 20 seconds can trigger recovery. Initial foreground notification alone does not restart discovery. Returning after
-at least three seconds hidden, or with unavailable network state, requests a check; requests are coalesced for 200 ms.
+Browser visibility/resume/pageshow events, Flutter lifecycle events and an online hint returning can request a
+connectivity check. Elapsed hidden time (including an ordinary long Alt+Tab) is not suspension evidence: it uses the
+nondestructive 200 ms / six-second receive-progress probe while retaining readiness and healthy channels. Flutter's
+transient `inactive` state is not backgrounding. A session-wide five-second execution tick, including for local followers
+and Disk-only copies, detects an actual wall-clock execution gap over 20 seconds independently of network heartbeats.
 
-A qualifying wake of an already-confirmed accepted copy immediately clears readiness, retires the previous network
+A real execution gap, observed loss of the last verified connection/network during backgrounding, or a failed last-peer
+receive probe qualifies for fresh verification. A qualifying wake of an already-confirmed accepted copy immediately
+clears readiness, retires the previous network
 generation and shows loading. After the coalesced 200 ms delay it starts fresh discovery/checkpoint exchange and, when
 matching access exists, a bounded validated Disk entry read. RTC starts before awaiting Disk. Old channel checkpoint/ACK
 flags cannot release this wait, and solo discovery is not a substitute for a fresh durable peer exchange or a freshly
