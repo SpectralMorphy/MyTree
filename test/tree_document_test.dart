@@ -79,6 +79,8 @@ List<Object?> _projection(TreeDocument doc) => [
       'surnameInheritedFrom': person.surnameInheritedFrom,
       'surname': person.surname,
       'fullName': person.fullName,
+      'patronymic': person.patronymic,
+      'fullNameWithPatronymic': person.fullNameWithPatronymic,
       'lifeYears': person.lifeYears,
       'facts': [
         for (final fact in person.facts) [fact.id, fact.text, fact.color],
@@ -89,6 +91,7 @@ List<Object?> _projection(TreeDocument doc) => [
       ],
     },
   doc.bindings,
+  doc.patronymicOverrides,
   doc.siblingGroupIds,
   [
     for (final link in doc.directSiblingLinks)
@@ -422,7 +425,61 @@ void main() {
         ).lifeYears,
         '1900–1980',
       );
+      expect(
+        TreePerson(
+          id: 'living',
+          birthDate: DateTime.utc(1980),
+          alive: false,
+        ).lifeYears,
+        '1980–?',
+      );
+      expect(TreePerson(id: 'living', alive: true).lifeYears, '?–н.в.');
+      expect(
+        TreePerson(
+          id: 'dated',
+          birthDate: DateTime.utc(1980),
+          deathDate: DateTime.utc(2000),
+          alive: true,
+        ).lifeYears,
+        '1980–2000',
+      );
     });
+
+    test(
+      'alive is an explicit nullable register distinct from a death date',
+      () {
+        final client = _Client('alice');
+        expect(
+          () => client.doc.setValue(root, 'alive', 'yes'),
+          throwsFormatException,
+        );
+        expect(
+          client.doc.setValue(root, 'alive', true).description,
+          'Отмечен как живой',
+        );
+        expect(
+          client.doc.setValue(root, 'alive', false).description,
+          'Дата смерти неизвестна',
+        );
+        expect(
+          client.doc.setValue(root, 'alive', null).description,
+          'Сброшена отметка о жизни',
+        );
+        client.commit(client.doc.setValue(root, 'birthDate', '1980-01-01'));
+        expect(client.doc.person(root)!.alive, isNull);
+        expect(client.doc.person(root)!.lifeYears, '1980–н.в.');
+        client.commit(client.doc.setValue(root, 'alive', false));
+        expect(client.doc.person(root)!.alive, isFalse);
+        expect(client.doc.person(root)!.lifeYears, '1980–?');
+        client.commit(client.doc.setValue(root, 'deathDate', '2001-02-03'));
+        expect(client.doc.person(root)!.lifeYears, '1980–2001');
+        client.commit(client.doc.setValue(root, 'alive', null));
+        client.commit(client.doc.setValue(root, 'deathDate', null));
+        expect(client.doc.person(root)!.alive, isNull);
+        expect(client.doc.person(root)!.lifeYears, '1980–н.в.');
+        _converges(client.events);
+      },
+    );
 
     test('full names preserve given text and put unnamed fallback first', () {
       const name = ' \tАнна  Ивановна\t ';
@@ -1100,6 +1157,774 @@ void main() {
         expect(doc.person('p00000')!.effectiveSurname!.text, 'Иванов');
         expect(doc.person('p00000')!.surnameInheritedFrom, 'p00001');
         expect(doc.person('p11999')!.surnameInheritedFrom, root);
+      },
+    );
+  });
+
+  group('derived patronymics', () {
+    test(
+      'name modes preserve stored names and legacy given-name-first fullName',
+      () {
+        final client = _Client('alice')..name('  Анна  Ивановна  ');
+        client.commit(client.doc.createPerson('z-father', name: '  ИВАН  '));
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.female));
+        client.commit(client.doc.setValue(root, 'fatherId', 'z-father'));
+        client.commit(
+          client.doc.setIndividualSurname(root, text: 'Сидоров', decline: true),
+        );
+        final count = client.events.length;
+        final encoded = jsonEncode([
+          for (final event in client.events) event.toJson(),
+        ]);
+        final snapshot = client.doc.textSnapshot(root, TreeTextField.name);
+        final person = client.doc.person(root)!;
+        expect(person.patronymic, 'Ивановна');
+        expect(person.fullName, 'Анна  Ивановна Сидорова');
+        expect(person.nameForMode(TreeNameMode.givenSurname), person.fullName);
+        expect(
+          person.nameForMode(TreeNameMode.surnameGivenPatronymic),
+          'Сидорова Анна  Ивановна Ивановна',
+          reason: 'Historical name text is not parsed or migrated',
+        );
+        expect(
+          person.fullNameWithPatronymic,
+          'Сидорова Анна  Ивановна Ивановна',
+        );
+        expect(person.name, '  Анна  Ивановна  ');
+        expect(snapshot.text, person.name);
+        expect(client.events.length, count);
+        expect(
+          jsonEncode([for (final event in client.events) event.toJson()]),
+          encoded,
+        );
+        final restoredEvents = [
+          for (final json in jsonDecode(encoded) as List)
+            StampedTreeOperation.fromJson(json),
+        ];
+        expect(
+          jsonEncode([for (final event in restoredEvents) event.toJson()]),
+          encoded,
+        );
+        final restored = TreeDocument()..merge(restoredEvents);
+        expect(_projection(restored), _projection(client.doc));
+        expect(
+          restored.textSnapshot(root, TreeTextField.name).atomIds,
+          snapshot.atomIds,
+        );
+        expect(
+          restored.editText(root, TreeTextField.name, person.name),
+          isNull,
+        );
+        _converges(client.events);
+      },
+    );
+
+    test(
+      'name modes omit missing components and retain the unnamed fallback',
+      () {
+        for (final blank in ['', ' \t\n ']) {
+          final unnamed = TreePerson(
+            id: 'unnamed',
+            name: blank,
+            sex: TreeSex.female,
+            individualSurname: const TreeSurname(text: 'Иванов', decline: true),
+          );
+          expect(unnamed.fullName, 'Без имени Иванова');
+          expect(unnamed.fullNameWithPatronymic, 'Иванова Без имени');
+          expect(unnamed.patronymic, '');
+          expect(
+            TreePerson(id: 'empty', name: blank).fullNameWithPatronymic,
+            'Без имени',
+          );
+        }
+        expect(
+          TreePerson(id: 'given', name: '  Анна  ').fullNameWithPatronymic,
+          'Анна',
+        );
+        final client = _Client('alice');
+        client.commit(client.doc.createPerson('father', name: 'Иван'));
+        client.commit(client.doc.setValue(root, 'fatherId', 'father'));
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.male));
+        expect(
+          client.doc.person(root)!.fullNameWithPatronymic,
+          'Без имени Иванович',
+        );
+        expect(client.doc.person(root)!.fullName, 'Без имени');
+        client.commit(client.doc.setIndividualSurname(root, text: 'Петров'));
+        expect(
+          client.doc.person(root)!.fullNameWithPatronymic,
+          'Петров Без имени Иванович',
+        );
+      },
+    );
+
+    test(
+      'sex, father rename, relink, unlink and deletion update derived forms',
+      () {
+        final client = _Client('alice')..name('Анна');
+        client.commit(
+          client.doc.createPerson('father', name: 'Иван', sex: TreeSex.female),
+        );
+        client.commit(client.doc.createPerson('other', name: ' ПЁТР '));
+        client.commit(client.doc.createPerson('mother', name: 'Павел'));
+        client.commit(client.doc.setValue(root, 'motherId', 'mother'));
+        client.commit(client.doc.setValue(root, 'fatherId', 'father'));
+        expect(
+          client.doc.person(root)!.patronymic,
+          '',
+          reason: 'Unknown child sex',
+        );
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.male));
+        expect(client.doc.person(root)!.patronymic, 'Иванович');
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.female));
+        expect(client.doc.person(root)!.patronymic, 'Ивановна');
+        final previousPerson = client.doc.person(root)!;
+        final count = client.events.length;
+        client.commit(client.doc.editText('father', TreeTextField.name, 'Лев'));
+        expect(
+          client.events.length,
+          count + 1,
+          reason: 'No synthetic child edits',
+        );
+        expect(client.doc.person(root)!.patronymic, 'Львовна');
+        expect(
+          previousPerson.patronymic,
+          'Ивановна',
+          reason: 'Immutable old snapshot',
+        );
+        client.commit(client.doc.setValue(root, 'fatherId', null));
+        expect(
+          client.doc.person(root)!.patronymic,
+          '',
+          reason: 'Never use mother name',
+        );
+        client.commit(client.doc.setValue(root, 'fatherId', 'other'));
+        expect(client.doc.person(root)!.patronymic, 'Петровна');
+        client.commit(client.doc.deletePerson('other'));
+        expect(client.doc.person(root)!.fatherId, isNull);
+        expect(client.doc.person(root)!.patronymic, '');
+        client.commit(client.doc.setValue(root, 'fatherId', 'father'));
+        expect(client.doc.person(root)!.patronymic, 'Львовна');
+        expect(client.doc.person(root)!.name, 'Анна');
+        _converges(client.events);
+      },
+    );
+
+    test(
+      'unsupported father names stay empty, never use own name or ancestors',
+      () {
+        final client = _Client('alice')..name('Иван');
+        client.commit(client.doc.createPerson('grandfather', name: 'Павел'));
+        client.commit(client.doc.createPerson('father', name: 'Пётр'));
+        client.commit(client.doc.setValue('father', 'fatherId', 'grandfather'));
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.male));
+        client.commit(client.doc.setValue(root, 'fatherId', 'father'));
+        expect(client.doc.person('father')!.patronymic, '');
+        expect(client.doc.person(root)!.patronymic, 'Петрович');
+        for (final name in [
+          '',
+          ' \t ',
+          'John',
+          'Иван Иванович',
+          'Иван/Пётр',
+          'О',
+        ]) {
+          client.commit(
+            client.doc.editText('father', TreeTextField.name, name),
+          );
+          expect(
+            client.doc.person(root)!.patronymic,
+            '',
+            reason: 'Father name: $name',
+          );
+        }
+        client.commit(
+          client.doc.editText('father', TreeTextField.name, 'John'),
+        );
+        client.commit(
+          client.doc.setPatronymicOverride(
+            'John',
+            male: 'Джонович',
+            female: 'Джоновна',
+          ),
+        );
+        expect(client.doc.person(root)!.patronymic, 'Джонович');
+        _converges(client.events);
+      },
+    );
+
+    test(
+      'concurrent cycles use accepted father edges, not raw rejected registers',
+      () {
+        final initial = _Client('initial');
+        for (final (id, name, sex) in [
+          ('a', 'Иван', TreeSex.male),
+          ('b', 'Пётр', TreeSex.female),
+          ('c', 'Павел', TreeSex.male),
+        ]) {
+          initial.commit(initial.doc.createPerson(id, name: name, sex: sex));
+        }
+        final a = _Client('alice', initial.events);
+        final b = _Client('bob', initial.events);
+        final c = _Client('carol', initial.events);
+        a.commit(a.doc.setValue('a', 'fatherId', 'b'));
+        b.commit(b.doc.setValue('b', 'fatherId', 'c'));
+        c.commit(c.doc.setValue('c', 'fatherId', 'a'));
+        final events = [
+          ...initial.events,
+          ...a.events,
+          ...b.events,
+          ...c.events,
+        ];
+        final doc = TreeDocument()..merge(events);
+        expect(doc.person('a')!.fatherId, isNull);
+        expect(doc.person('a')!.patronymic, '');
+        expect(doc.person('b')!.fatherId, 'c');
+        expect(doc.person('b')!.patronymic, 'Павловна');
+        expect(doc.person('c')!.fatherId, 'a');
+        expect(doc.person('c')!.patronymic, 'Иванович');
+        _converges(events, expected: doc);
+      },
+    );
+
+    test(
+      'sibling propagation and quotient cycles derive only final accepted roles',
+      () {
+        final client = _Client('alice');
+        client.commit(client.doc.createPerson('father', name: 'Иван'));
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.male));
+        client.commit(
+          client.doc.createSibling(
+            root,
+            'sister',
+            name: 'Анна',
+            sex: TreeSex.female,
+          ),
+        );
+        client.commit(client.doc.setValue('sister', 'fatherId', 'father'));
+        expect(client.doc.person(root)!.patronymic, 'Иванович');
+        expect(client.doc.person('sister')!.patronymic, 'Ивановна');
+        client.commit(
+          TreeOperation.fromJson({
+            'type': 'setValue',
+            'personId': root,
+            'field': 'fatherId',
+            'value': 'sister',
+          }),
+        );
+        for (final id in [root, 'sister']) {
+          expect(client.doc.person(id)!.fatherId, isNull);
+          expect(client.doc.person(id)!.patronymic, '');
+        }
+        client.commit(client.doc.setValue(root, 'fatherId', 'father'));
+        client.commit(client.doc.unlinkSibling(root, 'sister'));
+        client.commit(client.doc.setValue(root, 'fatherId', null));
+        expect(client.doc.person(root)!.patronymic, '');
+        expect(client.doc.person('sister')!.patronymic, 'Ивановна');
+        client.commit(client.doc.deletePerson('father'));
+        expect(client.doc.person('sister')!.patronymic, '');
+        _converges(client.events);
+      },
+    );
+  });
+
+  group('room patronymic overrides', () {
+    test(
+      'canonical atomic payload, exports, immutable dictionary and reset',
+      () {
+        final client = _Client('alice');
+        expect(basePatronymicDictionary['петр']!.male, 'Петрович');
+        expect(normalizePatronymicName(' ПЁТР '), 'петр');
+        expect(generatePatronymicForms('Иван')!.female, 'Ивановна');
+        final operation = client.doc.setPatronymicOverride(
+          ' ПЁТР ',
+          male: '  Петрыч  ',
+          female: ' Петрычна ',
+        );
+        expect(operation.toJson(), {
+          'type': 'setPatronymicOverride',
+          'name': 'петр',
+          'male': 'Петрыч',
+          'female': 'Петрычна',
+        });
+        expect(operation.isRoomScoped, isTrue);
+        expect(operation.personId, '');
+        expect(operation.itemId, isNull);
+        expect(operation.fieldKey, 'patronymic:петр');
+        expect(operation.description, 'Изменены отчества для имени «петр»');
+        expect(
+          client.doc.patronymicOverrides,
+          isEmpty,
+          reason: 'Command does not mutate',
+        );
+        final emptySnapshot = client.doc.patronymicOverrides;
+        final copy = TreeOperation.fromJson(
+          jsonDecode(jsonEncode(operation.toJson())),
+        );
+        expect(copy.toJson(), operation.toJson());
+        expect(TreeOperation.isValid(copy.toJson()), isTrue);
+        expect(() => copy.toJson().clear(), throwsUnsupportedError);
+        client.commit(copy);
+        const forms = TreePatronymicForms(male: 'Петрыч', female: 'Петрычна');
+        final dictionary = client.doc.patronymicOverrides;
+        expect(dictionary, {'петр': forms});
+        expect(emptySnapshot, isEmpty);
+        expect(() => dictionary.clear(), throwsUnsupportedError);
+        expect(() => dictionary['иван'] = forms, throwsUnsupportedError);
+        final reset = client.doc.setPatronymicOverride(
+          'Пётр',
+          male: null,
+          female: null,
+        );
+        expect(reset.toJson(), {
+          'type': 'setPatronymicOverride',
+          'name': 'петр',
+          'male': null,
+          'female': null,
+        });
+        expect(reset.description, 'Сброшены отчества для имени «петр»');
+        client.commit(reset);
+        expect(client.doc.patronymicOverrides, isEmpty);
+        expect(dictionary, {
+          'петр': forms,
+        }, reason: 'Published maps are snapshots');
+        _converges(client.events);
+      },
+    );
+
+    test(
+      'one room override updates all children, empty forms intentionally suppress',
+      () {
+        final client = _Client('alice');
+        client.commit(client.doc.createPerson('father', name: ' ПЁТР '));
+        client.commit(
+          client.doc.createPerson('son', name: 'Иван', sex: TreeSex.male),
+        );
+        client.commit(client.doc.setValue(root, 'sex', TreeSex.female));
+        for (final id in [root, 'son']) {
+          client.commit(client.doc.setValue(id, 'fatherId', 'father'));
+        }
+        final before = client.events.length;
+        client.commit(
+          client.doc.setPatronymicOverride(
+            'петр',
+            male: 'Петрыч',
+            female: 'Петрычна',
+          ),
+        );
+        expect(client.events.length, before + 1);
+        expect(client.doc.person(root)!.patronymic, 'Петрычна');
+        expect(client.doc.person('son')!.patronymic, 'Петрыч');
+        client.commit(
+          client.doc.setPatronymicOverride('Пётр', male: '', female: ''),
+        );
+        expect(client.doc.person(root)!.patronymic, '');
+        expect(client.doc.person('son')!.patronymic, '');
+        expect(
+          client.doc.patronymicOverrides['петр'],
+          const TreePatronymicForms(male: '', female: ''),
+        );
+        client.commit(
+          client.doc.setPatronymicOverride(
+            'петр',
+            male: '',
+            female: 'Петровна',
+          ),
+        );
+        expect(client.doc.person(root)!.patronymic, 'Петровна');
+        expect(client.doc.person('son')!.patronymic, '');
+        client.commit(
+          client.doc.setPatronymicOverride('ПЁТР', male: null, female: null),
+        );
+        expect(client.doc.person(root)!.patronymic, 'Петровна');
+        expect(client.doc.person('son')!.patronymic, 'Петрович');
+        client.commit(
+          client.doc.editText('father', TreeTextField.name, 'Иван'),
+        );
+        client.commit(
+          client.doc.setPatronymicOverride(
+            'Иван',
+            male: 'Особый',
+            female: 'Особая',
+          ),
+        );
+        client.commit(
+          client.doc.setPatronymicOverride('Иван', male: null, female: null),
+        );
+        expect(
+          client.doc.person('son')!.patronymic,
+          'Иванович',
+          reason: 'Algorithm restored too',
+        );
+        _converges(client.events);
+      },
+    );
+
+    test(
+      'strict schema rejects invalid names, forms, mixed nulls and fake targets',
+      () {
+        final doc = TreeDocument();
+        final valid = doc
+            .setPatronymicOverride('Иван', male: 'Иванович', female: 'Ивановна')
+            .toJson();
+        final invalidNames = <Object?>[
+          null,
+          1,
+          '',
+          ' ',
+          'иван ',
+          ' Иван',
+          'ИВАН',
+          'пётр',
+          'а\nб',
+          'а\u0000б',
+          'а\u007fб',
+          'а\u0085б',
+          'а\u009fб',
+          '\ud800',
+          '\udc00',
+          'а' * 201,
+        ];
+        final invalidForms = <Object?>[
+          null,
+          1,
+          false,
+          [],
+          {},
+          ' Иванович',
+          'Иванович ',
+          'а\tб',
+          'а\nб',
+          'а\u0000б',
+          'а\u007fб',
+          'а\u0085б',
+          'а\u009fб',
+          '\ud800',
+          '\udc00',
+          'а' * 201,
+        ];
+        final malformed = <Map<String, Object?>>[
+          for (final name in invalidNames) {...valid, 'name': name},
+          for (final value in invalidForms) ...[
+            {...valid, 'male': value},
+            {...valid, 'female': value},
+          ],
+          {...valid, 'personId': root},
+          {...valid, 'personId': ''},
+          {...valid, 'extra': true},
+          for (final key in ['type', 'name', 'male', 'female'])
+            {...valid}..remove(key),
+        ];
+        for (final json in malformed) {
+          expect(
+            () => TreeOperation.fromJson(json),
+            throwsFormatException,
+            reason: '$json',
+          );
+          expect(TreeOperation.isValid(json), isFalse, reason: '$json');
+        }
+        for (final (male, female) in [('x', null), (null, 'x')]) {
+          expect(
+            () => doc.setPatronymicOverride('Иван', male: male, female: female),
+            throwsFormatException,
+          );
+        }
+        for (final name in ['', ' \t ', 'а' * 201, 'а\nб', '\ud800']) {
+          expect(
+            () => doc.setPatronymicOverride(name, male: null, female: null),
+            throwsFormatException,
+          );
+        }
+        for (final value in ['а' * 201, 'а\nб', 'а\u0085б', '\ud800']) {
+          expect(
+            () => doc.setPatronymicOverride('Иван', male: value, female: value),
+            throwsFormatException,
+          );
+        }
+        final astral = '🌳' * maxTreePatronymicLength;
+        final operation = doc.setPatronymicOverride(
+          astral,
+          male: astral,
+          female: '',
+        );
+        expect(TreeOperation.isValid(operation.toJson()), isTrue);
+        expect(
+          () => doc.setPatronymicOverride('$astral🌳', male: '', female: ''),
+          throwsFormatException,
+        );
+        expect(
+          () =>
+              doc.setPatronymicOverride('Иван', male: '$astral🌳', female: ''),
+          throwsFormatException,
+        );
+        expect(
+          () =>
+              doc.setPatronymicOverride('Иван', male: '', female: '$astral🌳'),
+          throwsFormatException,
+        );
+        expect(
+          () => doc.setValue(root, 'patronymic', 'Записанное'),
+          throwsFormatException,
+        );
+        expect(
+          () => TreeOperation.fromJson({
+            'type': 'createPerson',
+            'personId': 'new',
+            'name': 'Имя',
+            'sex': 'male',
+            'patronymic': 'Нет',
+          }),
+          throwsFormatException,
+        );
+      },
+    );
+
+    test(
+      'dictionary survives deleting every identity and works without person guards',
+      () {
+        final client = _Client('alice');
+        client.commit(
+          client.doc.setPatronymicOverride(
+            'Иван',
+            male: 'Первый',
+            female: 'Первая',
+          ),
+        );
+        client.commit(client.doc.deletePerson(root));
+        expect(client.doc.people, isEmpty);
+        client.commit(
+          client.doc.setPatronymicOverride(
+            'ПЁТР',
+            male: 'Петрыч',
+            female: 'Петрычна',
+          ),
+        );
+        client.commit(
+          client.doc.setPatronymicOverride('Иван', male: null, female: null),
+        );
+        expect(client.doc.people, isEmpty);
+        expect(client.doc.patronymicOverrides, {
+          'петр': const TreePatronymicForms(male: 'Петрыч', female: 'Петрычна'),
+        });
+        for (final id in [root, '', 'missing']) {
+          expect(
+            () => client.doc.setValue(id, 'sex', TreeSex.male),
+            throwsArgumentError,
+          );
+          expect(
+            () => client.doc.setIndividualSurname(id, text: 'x'),
+            throwsArgumentError,
+          );
+          expect(
+            () => client.doc.editText(id, TreeTextField.name, 'x'),
+            throwsArgumentError,
+          );
+          expect(() => client.doc.deletePerson(id), throwsArgumentError);
+        }
+        final emptyReplay = TreeDocument()..merge(client.events.reversed);
+        expect(_projection(emptyReplay), _projection(client.doc));
+        _converges(client.events);
+        client.commit(client.doc.createPerson('father', name: 'Пётр'));
+        client.commit(client.doc.createPerson('child', sex: TreeSex.female));
+        client.commit(client.doc.setValue('child', 'fatherId', 'father'));
+        expect(client.doc.person('child')!.patronymic, 'Петрычна');
+        client.commit(client.doc.deletePerson('father'));
+        client.commit(client.doc.deletePerson('child'));
+        expect(client.doc.people, isEmpty);
+        expect(client.doc.patronymicOverrides['петр']!.male, 'Петрыч');
+        _converges(client.events);
+      },
+    );
+
+    test(
+      'reset delivered first suppresses delayed older values and replay is byte-stable',
+      () {
+        final builder = TreeDocument();
+        StampedTreeOperation event(
+          String id,
+          int clock,
+          TreeOperation operation,
+        ) => StampedTreeOperation(
+          id: id,
+          author: 'alice',
+          clock: clock,
+          createdAt: DateTime.utc(2026),
+          operation: operation,
+        );
+        final old = event(
+          'old',
+          1,
+          builder.setPatronymicOverride(
+            'Иван',
+            male: 'Старый',
+            female: 'Старая',
+          ),
+        );
+        final reset = event(
+          'reset',
+          3,
+          builder.setPatronymicOverride('Иван', male: null, female: null),
+        );
+        final delayed = event(
+          'delayed',
+          2,
+          builder.setPatronymicOverride(
+            'Иван',
+            male: 'Поздно',
+            female: 'Поздняя',
+          ),
+        );
+        final doc = TreeDocument()..merge([reset]);
+        doc.merge([old, delayed]);
+        expect(doc.patronymicOverrides, isEmpty);
+        _converges([old, delayed, reset], expected: doc);
+        final newer = event(
+          'newer',
+          4,
+          builder.setPatronymicOverride('Иван', male: 'Новый', female: 'Новая'),
+        );
+        doc.merge([newer]);
+        expect(
+          doc.patronymicOverrides['иван'],
+          const TreePatronymicForms(male: 'Новый', female: 'Новая'),
+        );
+        final all = [old, delayed, reset, newer];
+        final encoded = jsonEncode([for (final value in all) value.toJson()]);
+        final restored = [
+          for (final json in jsonDecode(encoded) as List)
+            StampedTreeOperation.fromJson(json),
+        ];
+        expect(
+          jsonEncode([for (final value in restored) value.toJson()]),
+          encoded,
+        );
+        expect(_projection(TreeDocument()..merge(restored)), _projection(doc));
+        _converges(all, expected: doc);
+      },
+    );
+
+    test(
+      'concurrent overrides are atomic per normalized name and use clock, author, id',
+      () {
+        final initial = _Client('initial');
+        initial.commit(initial.doc.createPerson('father', name: 'Пётр'));
+        initial.commit(initial.doc.setValue(root, 'sex', TreeSex.female));
+        initial.commit(initial.doc.setValue(root, 'fatherId', 'father'));
+        final a = _Client('alice', initial.events);
+        final b = _Client('bob', initial.events);
+        a.commit(
+          a.doc.setPatronymicOverride(
+            'ПЁТР',
+            male: 'Мужская А',
+            female: 'Женская А',
+          ),
+        );
+        b.commit(
+          b.doc.setPatronymicOverride(
+            'петр',
+            male: 'Мужская Б',
+            female: 'Женская Б',
+          ),
+        );
+        a.commit(
+          a.doc.setPatronymicOverride('Иван', male: 'Другой', female: 'Другая'),
+        );
+        a.receive(b.events);
+        expect(
+          a.doc.patronymicOverrides['петр'],
+          const TreePatronymicForms(male: 'Мужская Б', female: 'Женская Б'),
+        );
+        expect(a.doc.patronymicOverrides['иван']!.male, 'Другой');
+        expect(a.doc.person(root)!.patronymic, 'Женская Б');
+        final all = [...initial.events, ...a.events, ...b.events];
+        _converges(all, expected: a.doc);
+        final lowerClock = StampedTreeOperation(
+          id: 'zz-lower-clock',
+          author: 'zzzz',
+          clock: 0,
+          createdAt: DateTime.utc(2099),
+          operation: a.doc.setPatronymicOverride(
+            'петр',
+            male: 'Не победит',
+            female: 'Не победит',
+          ),
+        );
+        final value = StampedTreeOperation(
+          id: 'a-value',
+          author: 'same',
+          clock: 100,
+          createdAt: DateTime.utc(2099),
+          operation: a.doc.setPatronymicOverride(
+            'петр',
+            male: 'Поздний',
+            female: 'Поздняя',
+          ),
+        );
+        final reset = StampedTreeOperation(
+          id: 'z-reset',
+          author: 'same',
+          clock: 100,
+          createdAt: DateTime.utc(1900),
+          operation: a.doc.setPatronymicOverride(
+            'петр',
+            male: null,
+            female: null,
+          ),
+        );
+        final events = [...all, lowerClock, value, reset];
+        final doc = TreeDocument()..merge(events.reversed);
+        expect(doc.patronymicOverrides.containsKey('петр'), isFalse);
+        expect(doc.patronymicOverrides['иван']!.female, 'Другая');
+        expect(doc.person(root)!.patronymic, 'Петровна');
+        _converges(events, expected: doc);
+      },
+    );
+
+    test(
+      'ordinary operations retain their targets and encoded historical payloads',
+      () {
+        const historical = [
+          '{"name":"  Иван Иванович  ","personId":"father","sex":"male","type":"createPerson"}',
+          '{"field":"fatherId","personId":"root","type":"setValue","value":"father"}',
+          '{"field":"sex","personId":"root","type":"setValue","value":"female"}',
+          '{"decline":true,"familyKey":"person:4:root","personId":"root","scope":"family","text":"Иванов","type":"setSurname"}',
+        ];
+        final operations = [
+          for (final encoded in historical)
+            TreeOperation.fromJson(jsonDecode(encoded)),
+        ];
+        for (var index = 0; index < operations.length; index++) {
+          expect(jsonEncode(operations[index].toJson()), historical[index]);
+          expect(operations[index].isRoomScoped, isFalse);
+          expect(operations[index].personId, index == 0 ? 'father' : root);
+        }
+        final events = [
+          for (var index = 0; index < operations.length; index++)
+            StampedTreeOperation(
+              id: 'historical-$index',
+              author: 'alice',
+              clock: index,
+              createdAt: DateTime.utc(2026),
+              operation: operations[index],
+            ),
+        ];
+        final doc = TreeDocument()..merge(events);
+        expect(doc.person('father')!.name, '  Иван Иванович  ');
+        expect(
+          doc.person(root)!.patronymic,
+          '',
+          reason: 'No splitting of historical father names',
+        );
+        expect(doc.patronymicOverrides, isEmpty);
+        for (var index = 0; index < operations.length; index++) {
+          expect(jsonEncode(operations[index].toJson()), historical[index]);
+        }
+        expect(TreeOperation.isValid({'type': 'deletePerson'}), isFalse);
+        expect(
+          TreeOperation.isValid({'type': 'deletePerson', 'personId': ''}),
+          isFalse,
+        );
+        _converges(events);
       },
     );
   });

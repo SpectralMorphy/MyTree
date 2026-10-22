@@ -6,7 +6,8 @@ import 'package:flutter/services.dart';
 
 import '../tree/tree_document.dart';
 
-/// Searches full birth names and years, with unknown birth dates oldest/first.
+/// Searches surname/given name/computed patronymic and years in every UI mode.
+/// Unknown birth dates are oldest/first.
 /// Equal/missing dates use normalized given name (trim, lowercase, ё = е), then ID.
 List<TreePerson> searchTreePeople(
   Map<String, TreePerson> people,
@@ -16,7 +17,9 @@ List<TreePerson> searchTreePeople(
   if (normalized.isEmpty) return [];
   final tokens = normalized.split(RegExp(r'\s+', unicode: true));
   final matches = people.values.where((person) {
-    final text = _normalize('${person.fullName} ${person.lifeYears}');
+    final text = _normalize(
+      '${person.fullNameWithPatronymic} ${person.lifeYears}',
+    );
     return tokens.every(text.contains);
   }).toList();
   matches.sort(compareTreePeopleByBirth);
@@ -267,7 +270,7 @@ class _TreePersonSearchState extends State<TreePersonSearch> {
       key: ValueKey('tree-search-option-${person.id}'),
       button: true,
       selected: highlighted,
-      label: '${person.fullName}, $details',
+      label: '${person.fullNameWithPatronymic}, $details',
       excludeSemantics: true,
       onTap: () => _select(person.id),
       child: InkWell(
@@ -283,7 +286,7 @@ class _TreePersonSearchState extends State<TreePersonSearch> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                person.fullName,
+                person.fullNameWithPatronymic,
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: theme.textTheme.bodyMedium,

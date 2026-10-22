@@ -13,6 +13,8 @@ import '../signaling/fallback_signaling.dart';
 import '../signaling/signaling.dart';
 import '../storage/create_room_store.dart';
 import '../storage/room_store.dart';
+import '../tree/tree_document.dart';
+import 'patronymic_dictionary_dialog.dart';
 import 'room_dialogs.dart';
 import 'tree_brand.dart';
 import 'tree_editor.dart';
@@ -82,6 +84,7 @@ class RoomPage extends StatefulWidget {
 
 class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   final _recentlyOnlineRooms = <String, DateTime>{};
+  final _nameMode = ValueNotifier(TreeNameMode.givenSurname);
   late final RoomStore _store;
   late final Uri _applicationUri;
   String _actorId = '';
@@ -371,8 +374,9 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       }
       final route = ModalRoute.of(context);
       if (route != null && !route.isCurrent) {
-        Navigator.of(context)
-            .popUntil((candidate) => identical(candidate, route));
+        Navigator.of(
+          context,
+        ).popUntil((candidate) => identical(candidate, route));
       }
       ++_generation;
       session.removeListener(_sessionChanged);
@@ -405,7 +409,10 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     if (session == null || !session.joined || !_roomActionsEnabled) return;
     final invite = await showDialog<bool>(
       context: context,
-      builder: (_) => RoomParticipantsDialog(session: session),
+      builder: (_) => RoomParticipantsDialog(
+        session: session,
+        nameMode: _nameMode.value,
+      ),
     );
     if (mounted &&
         identical(_session, session) &&
@@ -425,6 +432,11 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
         context: context,
         builder: (_) => RoomSettingsDialog(session: session),
       );
+    } else if (value == 'patronymics') {
+      showDialog<void>(
+        context: context,
+        builder: (_) => PatronymicDictionaryDialog(session: session),
+      );
     } else if (value == 'history') {
       showDialog<void>(
         context: context,
@@ -438,7 +450,9 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
           builder: (_, _) => ParticipantNameDialog(
             initialName: session.participantName,
             onSave: session.setParticipantName,
-            boundPersonName: session.boundPersonFullName,
+            boundPersonName: session.durableTree
+                .person(session.boundPersonId ?? '')
+                ?.nameForMode(_nameMode.value),
             onUnbind: session.canUnbindFromPerson
                 ? session.unbindFromPerson
                 : null,
@@ -485,6 +499,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     ++_generation;
     _session?.removeListener(_sessionChanged);
     _session?.dispose();
+    _nameMode.dispose();
     super.dispose();
   }
 
@@ -508,6 +523,10 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
                     PopupMenuItem(
                       value: 'settings',
                       child: Text('Настройки комнаты'),
+                    ),
+                    PopupMenuItem(
+                      value: 'patronymics',
+                      child: Text('Словарь отчеств'),
                     ),
                     PopupMenuItem(
                       value: 'history',
@@ -649,7 +668,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       absorbing: blocked,
       child: ExcludeFocus(
         excluding: blocked,
-        child: customEditor ?? TreeEditor(session: session),
+        child: customEditor ?? TreeEditor(session: session, nameMode: _nameMode),
       ),
     );
     if (customEditor != null) {

@@ -2,16 +2,17 @@
 
 The current domain model is [tree_document.dart](../../lib/tree/tree_document.dart).
 It has no Flutter, storage, or transport dependency. `TreeDocument` owns a mutable set of immutable
-operations and rebuilds immutable `people` and `bindings` projections from that set.
+operations and rebuilds immutable `people`, `bindings`, and room `patronymicOverrides` projections from that set.
 
 Related: [tree layout](tree-layout.md), [UI](ui.md),
 [history and storage](history-and-storage.md), [rooms and identity](rooms-and-identity.md).
 
 ## Domain and virtual root
 
-- `TreePerson` contains an ID, name, biography, `TreeSex`, optional birth/death dates, independent
+- `TreePerson` contains an ID, name, biography, `TreeSex`, optional birth/death dates, an optional explicit `alive` mark, independent
   `fatherId`/`motherId` references, ordered facts/photos, an optional `avatarPhotoId`, and explicit and
-  effective surname configurations with an optional immediate-father inheritance source.
+  effective surname configurations with an optional immediate-father inheritance source. Its read-only
+  `patronymic` is derived from the accepted father's name and the child's sex; it is not editable person data.
 - `TreeFact` has a stable ID, text, and color. `TreePhoto` has a stable ID, immutable image data URL,
   and editable caption. Person collections and the document's public maps are unmodifiable.
 - `TreeSex` is `unknown`, `male`, or `female`; `TreeTextField` identifies name, biography, fact text,
@@ -38,7 +39,9 @@ or the identity-keyed public `people` map.
 
 `TreeOperation` is a validated, deeply frozen JSON payload. The schema rejects unknown operation
 names, extra/missing keys, wrong field types, malformed Unicode, and invalid IDs. Its `fieldKey` and
-`description` support history presentation; neither changes merge behavior.
+`description` support history presentation; neither changes merge behavior. Person operations retain
+all their existing required keys and nonempty `personId`. Room-scoped `setPatronymicOverride` has no
+serialized `personId`; its compatibility getter returns `''` and `isRoomScoped` returns `true`.
 
 `StampedTreeOperation` adds immutable `id`, `author`, logical `clock`, and `createdAt`. Tree ordering
 is lexicographic **(clock, author, id)**; wall time is display metadata, never a conflict tie-breaker.
@@ -62,9 +65,10 @@ sorted rebuild, not mutation in arrival order:
 1. Create the virtual root and gather person identities, then fact/photo identities.
 2. Seed new identities from the earliest create/add in total order; later duplicate creations do not
    replace them. Gathering identities first lets an edit/removal be replayed before its add arrives.
-3. Replay text edits, scalar registers, removals, placements, and actor claims using their own rules.
+3. Replay text edits, scalar registers, room patronymic overrides, removals, placements, and actor claims
+   using their own rules. Room registers are handled independently of person lookup or visibility.
 4. Collect permanent person tombstones, drop references to deleted people, resolve parent cycles,
-   order lists, and publish immutable visible snapshots.
+   derive surnames/patronymics from accepted father edges, order lists, and publish immutable visible snapshots.
 
 Events targeting identities not yet present stay in the event set; a later rebuild can apply them.
 Equal event sets therefore converge independently of delivery order or duplicate delivery.
@@ -145,8 +149,10 @@ payloads and do not propagate ordinary parent operations inside components.
 | --- | --- |
 | Name, biography, fact text, photo caption | Independent anchored text sequences, not whole-string LWW. |
 | Birth surname, legacy family/maiden surnames | Atomic nullable per-person LWW `(text, decline)` configuration. Historical family-keyed registers remain read-only fallback until any personal register exists; maiden stays independent and non-rendered. |
+| Room patronymic dictionary | Per-normalized-name LWW nullable `(male, female)` pair; null resets to the built-in dictionary/algorithm. Independent of any person. |
+| Person patronymic | Projection only, from the accepted father's given-name text, room overrides, and child's sex; unknown sex gives an empty string. |
 | Sex | Atomic last-writer-wins (LWW) register; clearing means `unknown`, not `null`. |
-| Birth/death date | Independent nullable LWW registers; strict valid `yyyy-MM-dd` calendar dates, exposed as UTC dates. |
+| Birth/death date | Independent nullable LWW registers; strict valid `yyyy-MM-dd` calendar dates, exposed as UTC dates. Nullable bool `alive` is a separate register: `true` is living (`н.в.`), `false` is an unknown death (`?`). Absent `alive` keeps the legacy display: `н.в.` only when a birth date exists and death does not; both missing stays `?–?`. A death date wins over `alive`. |
 | Father/mother | Independent nullable role registers; parent writes materialize across active direct-sibling components, followed by atomic quotient-DAG cycle projection. |
 | Avatar | Nullable LWW photo-ID register; exposed as `null` if that photo is not visible. |
 | Fact color | Independent LWW `#RRGGBB` register; the supplied palette is not a validation restriction. |
@@ -233,12 +239,71 @@ admission/history exchange; see [capability compatibility](synchronization.md#ca
 
 `TreePerson.surname` renders the effective configuration for sex. `fullName` puts the existing trimmed
 name first and appends that surname, using the unnamed fallback if needed. Existing name text may contain
-given name and patronymic; it is neither split nor migrated. This presentation order is shared by search,
-biography headings, relative pickers, inheritance hints, and bound-person full-name tooltips; stored fields
-and operation payloads are unchanged. `surnameForBlock` uses effective configurations: empty for
+given name and patronymic; it is neither split nor migrated. This compatibility property remains
+name-first without appending the derived patronymic; `nameForMode` supplies the alternate order described
+below. Stored fields and old operation payloads are unchanged. `surnameForBlock` uses effective configurations: empty for
 no members/all missing, the sex-specific form for one member, plural for several equal non-null
 configurations, and `разные фамилии` (“different surnames”) for mixed configurations, including a missing
 value among non-missing ones. Equality includes `decline`, not merely displayed text.
+
+## Derived patronymics and name modes
+
+The pure [patronymic.dart](../../lib/tree/patronymic.dart) module is imported and re-exported by
+`tree_document.dart`. Its public API includes immutable `TreePatronymicForms(male:, female:)`,
+`normalizePatronymicName`, `basePatronymicDictionary`, and nullable `generatePatronymicForms`.
+Normalization trims, lowercases, and equates `ё` with `е`. Room overrides take precedence over built-in
+exceptions and algorithmic generation; unsupported names return no forms unless explicitly overridden.
+The fallback handles single Cyrillic names: hard consonants take `-ович/-овна`, sibilants/`ц` take
+`-евич/-евна`, final `й/ь` is replaced with `-евич/-евна`, and `-ий` normally becomes `-ьевич/-ьевна`
+(but after `г/к/х`, `-иевич/-иевна`). Final `а/я` uses the corresponding stem with `-ович/-овна` or
+`-евич/-евна`; irregular common names use the built-in dictionary. Hyphenated names derive each part,
+omitting deliberately blank room forms without leaving dangling separators. Original `ё` is retained
+in generated stems. This is a bounded fallback plus exceptions, not universal morphology for every language.
+
+`TreePerson.patronymic` selects the male/female generated form using the **child's** sex. Unknown sex,
+a missing/deleted father, a cycle-rejected father edge, or an unsupported/empty father name gives `''`.
+Only the final accepted `fatherId` is used: not the mother, an older rejected register, the person's own
+name, or a more distant ancestor. The father's sex does not constrain the relationship. Projection uses
+the father's complete current name text without parsing historical full names. Renaming/relinking or
+deleting a father, changing the child's sex, and editing the dictionary update the projection without
+synthetic person operations, name migration, or changes to text atom identities. The forms supplied to
+`TreePerson` construction are projection input, not a persisted/editable patronymic field.
+
+`TreeNameMode` has `givenSurname` and `surnameGivenPatronymic`:
+
+- `person.nameForMode(givenSurname)` returns the existing `fullName`: trimmed name, then rendered surname.
+- `person.nameForMode(surnameGivenPatronymic)` returns rendered surname, trimmed name, then derived
+  patronymic (ФИО). `fullNameWithPatronymic` is an alias to this mode for search and other consumers.
+- Missing surname/patronymic components are omitted. A blank given name uses the existing `displayName`
+  fallback (`Без имени`). Internal spacing and historical name contents are preserved; no deduplication,
+  splitting, or migration of an already recorded patronymic occurs.
+
+### Room dictionary operations
+
+`TreeDocument.patronymicOverrides` is an unmodifiable snapshot map keyed by normalized father names;
+values are immutable `TreePatronymicForms`. It exposes only active room overrides, not built-in entries
+or reset tombstones. Previously published snapshots remain unchanged after another merge.
+
+`setPatronymicOverride(String name, {required String? male, required String? female})` returns exactly
+`{type: 'setPatronymicOverride', name: <normalized>, male: <String?>, female: <String?>}` without changing
+the document. It requires no person/root and works after deleting every person. There is no fake person
+ID in this payload. The history key is `patronymic:<normalized name>` and its description identifies
+both the dictionary name and whether the operation sets or resets it.
+
+- Both strings form one atomic override; either or both may be empty to intentionally omit a form.
+- Both null values reset that name to built-in/algorithmic behavior. Mixed null/string pairs are invalid.
+- Commands normalize the name and trim forms. The decoder requires canonical normalized nonempty names
+  and already-trimmed forms. Names and each form have a **200-rune** limit (`maxTreePatronymicLength`),
+  must be well-formed Unicode, and cannot contain C0/C1 control characters. Extra/missing keys and
+  `personId` in the room payload are rejected.
+- Each normalized name is an independent LWW register, choosing the greatest **(clock, author, id)**
+  stamp for the whole pair, including reset. Sorted rebuild retains every event, so a reset received
+  first still suppresses an older override delivered later; newer explicit overrides can replace it.
+  Person deletion, missing identities, or a completely empty tree never discard dictionary events.
+
+Old operations retain their exact schemas and encoded bytes. Opening/merging old journals does not
+append dictionary operations, rewrite stored name text, or manufacture person patronymic fields.
+Transport capability negotiation and local role guards are separate integration responsibilities.
 
 ## Anchored Unicode text
 
@@ -335,4 +400,6 @@ Convergence does not decide which genealogy assertion is factually correct or su
 [tree_document_test.dart](../../test/tree_document_test.dart) covers immutable operations and batch
 collisions, shuffled/duplicate replay, Unicode and stale snapshots, concurrent list edits, permanent
 removal, scalar ordering, per-person surname edits/clears, preserved legacy registers/frozen targets and long paternal
-inheritance, local/concurrent cycles, legacy first claims, exact-claim releases/rebinding, and image validation.
+inheritance, derived patronymics/name modes without name migration, room dictionary validation and atomic
+LWW overrides/resets (including empty-tree replay), local/concurrent cycles, legacy first claims,
+exact-claim releases/rebinding, and image validation.

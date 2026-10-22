@@ -572,8 +572,9 @@ Map<String, dynamic> _ackLocal(
   String actor = 'remote',
   bool roomReady = true,
 }) {
-  final checkpoint = _sentMessages(channel)
-      .lastWhere((message) => message.type == RoomMessageType.checkpoint);
+  final checkpoint = _sentMessages(
+    channel,
+  ).lastWhere((message) => message.type == RoomMessageType.checkpoint);
   return {
     ..._message('syncAck', const [], actor: actor),
     'syncId': checkpoint.syncId,
@@ -1537,15 +1538,17 @@ void main() {
       await settle(tester);
       expect(room.initialSyncComplete, isFalse);
       expect(
-        _sentMessages(channel)
-            .where((m) => m.type == RoomMessageType.checkpoint),
+        _sentMessages(
+          channel,
+        ).where((m) => m.type == RoomMessageType.checkpoint),
         isEmpty,
       );
       store.appendGate!.complete();
       await pending;
       await settle(tester);
-      final checkpoint = _sentMessages(channel)
-          .singleWhere((m) => m.type == RoomMessageType.checkpoint);
+      final checkpoint = _sentMessages(
+        channel,
+      ).singleWhere((m) => m.type == RoomMessageType.checkpoint);
       expect(
         checkpoint.syncDigest,
         roomHistoryDigest(decodeRoomHistory(await store.loadHistory(_roomId))),
@@ -1703,10 +1706,9 @@ void main() {
       expect(peer.discoveryComplete, isFalse);
       expect(room.initialSyncComplete, isTrue);
       expect(
-        _sentMessages(channel)
-            .where((m) => m.type == RoomMessageType.syncAck)
-            .last
-            .roomReady,
+        _sentMessages(
+          channel,
+        ).where((m) => m.type == RoomMessageType.syncAck).last.roomReady,
         isTrue,
       );
       room.dispose();
@@ -3070,6 +3072,7 @@ void main() {
           'familyTree': true,
           'familySurnames': true,
           'personalSurnames': true,
+        'patronymics': true,
           'explicitSiblings': true,
           'authorHistory': true,
           'durableSync': true,
@@ -3083,6 +3086,72 @@ void main() {
         expect(store.appendCalls, 0);
         expect(store.membershipCalls, 0);
         expect(await store.loadHistory(_roomId), isEmpty);
+      },
+    );
+  }
+
+  for (final incoming in [false, true]) {
+    testRoomWidgets(
+      'production patronymic gate rejects old ${incoming ? 'hello' : 'welcome'} with empty local history before admission',
+      (tester) async {
+        final store = _Store();
+        final room = session(
+          member: incoming,
+          store: store,
+          requireFamilyTree: true,
+        );
+        final _FakeConnection channel;
+        if (incoming) {
+          await room.start();
+          final peer = network.peers.single;
+          peer.register();
+          await settle(tester);
+          channel = _FakeConnection('old-runtime');
+          network.connections.add(channel);
+          peer.attached.add(channel);
+          peer.emit<DataConnection>('connection', channel);
+        } else {
+          channel = await standaloneFollower(tester, room);
+        }
+        channel.openChannel();
+        await settle(tester);
+        expect(room.changes, isEmpty);
+        if (!incoming) {
+          final hello = _sentMessages(channel).single;
+          expect(hello.patronymics, isTrue);
+          expect(hello.history, isEmpty);
+        }
+        final packetsBefore = channel.sent.length;
+        channel.receive({
+          ..._message(incoming ? 'hello' : 'welcome', [
+            _edit('must-not-save', 'Private old history'),
+          ]),
+          'roomMetadata': true,
+          'roomRoles': true,
+          'familyTree': true,
+          'familySurnames': true,
+          'personalSurnames': true,
+          'explicitSiblings': true,
+          'authorHistory': true,
+          'participantIdentity': true,
+          'durableSync': true,
+        });
+        await settle(tester);
+        expect(channel.disposed, isTrue);
+        expect(channel.sent, hasLength(packetsBefore));
+        expect(room.joined, incoming);
+        expect(room.changes, isEmpty);
+        expect(room.initialSyncError, contains('отчества'));
+        expect(room.initialSyncError, contains('Обновите страницу на обоих'));
+        expect(store.appendCalls, 0);
+        expect(store.membershipCalls, 0);
+        expect(await store.loadHistory(_roomId), isEmpty);
+        if (incoming) {
+          await tester.pump(const Duration(seconds: 31));
+          await settle(tester);
+          expect(room.initialSyncComplete, isFalse);
+          expect(room.initialSyncError, contains('отчества'));
+        }
       },
     );
   }
@@ -3109,6 +3178,7 @@ void main() {
         'familyTree': true,
         'familySurnames': true,
         'personalSurnames': true,
+        'patronymics': true,
         'explicitSiblings': true,
         'participantIdentity': true,
         'durableSync': true,
@@ -3144,6 +3214,7 @@ void main() {
         'familyTree': true,
         'familySurnames': true,
         'personalSurnames': true,
+        'patronymics': true,
         'explicitSiblings': true,
         'participantIdentity': true,
         'durableSync': true,
@@ -3296,8 +3367,9 @@ void main() {
       channel.receive(_checkpoint(rows));
       await settle(tester);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.syncAck),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.syncAck),
         isEmpty,
       );
       channel.receive(_message('edits', [edits.last.toJson()]));
@@ -3307,8 +3379,9 @@ void main() {
       expect(await store.loadHistory(_roomId), isEmpty);
       expect(room.historyLength, 0);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.syncAck),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.syncAck),
         isEmpty,
       );
     },
@@ -3358,8 +3431,9 @@ void main() {
       await settle(tester);
       expect(room.onlineCount, 2);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.checkpoint),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.checkpoint),
         isEmpty,
       );
       final laterSave = room.edit('later typing');
@@ -3412,8 +3486,9 @@ void main() {
       await settle(tester);
       expect(room.historyLength, 1);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.checkpoint),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.checkpoint),
         isEmpty,
       );
       final predecessor = _authorChain('local', ['another tab']).single;
@@ -3471,8 +3546,9 @@ void main() {
         'historyDigest': roomHistoryDigest([edits.first]),
       });
       await settle(tester);
-      final welcome = _sentMessages(channel)
-          .singleWhere((message) => message.type == RoomMessageType.welcome);
+      final welcome = _sentMessages(
+        channel,
+      ).singleWhere((message) => message.type == RoomMessageType.welcome);
       expect(welcome.authorHistory, isTrue);
       expect(welcome.history, isEmpty);
       channel.receive({
@@ -3480,8 +3556,9 @@ void main() {
         'inventory': roomHistoryInventory([edits.first]),
       });
       await settle(tester);
-      final sent = _sentMessages(channel)
-          .where((message) => message.type == RoomMessageType.edits);
+      final sent = _sentMessages(
+        channel,
+      ).where((message) => message.type == RoomMessageType.edits);
       expect(sent, hasLength(1));
       expect(sent.single.history.map((edit) => edit.id), [
         'author-1',
@@ -3716,8 +3793,9 @@ void main() {
       expect(await store.loadHistory(_roomId), before);
       expect(room.text, 'unchanged latest');
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.edits),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.edits),
         isEmpty,
       );
     },
@@ -3749,8 +3827,9 @@ void main() {
         'historyDigest': 'a' * 64,
       });
       await settle(tester);
-      final inventory = _sentMessages(channel)
-          .singleWhere((message) => message.type.name == 'inventory');
+      final inventory = _sentMessages(
+        channel,
+      ).singleWhere((message) => message.type.name == 'inventory');
       expect(inventory.inventory!.keys, ['durable']);
       expect(room.text, 'unsaved draft');
       channel.receive({
@@ -3767,8 +3846,9 @@ void main() {
       expect(room.storageError, isNotNull);
       expect((await store.loadHistory(_roomId)).length, 1);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.edits),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.edits),
         isEmpty,
       );
     },
@@ -3796,8 +3876,9 @@ void main() {
       });
       await settle(tester);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type.name == 'inventory'),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type.name == 'inventory'),
         hasLength(1),
       );
       channel.receive({
@@ -3838,8 +3919,9 @@ void main() {
       });
       await settle(tester);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type == RoomMessageType.edits),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type == RoomMessageType.edits),
         isEmpty,
       );
       store.appendGate!.complete();
@@ -3877,8 +3959,9 @@ void main() {
       });
       await settle(tester);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type.name == 'inventory'),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type.name == 'inventory'),
         isEmpty,
       );
       channel.receive({
@@ -3891,8 +3974,9 @@ void main() {
         ),
       });
       await settle(tester);
-      final inventories = _sentMessages(channel)
-          .where((message) => message.type.name == 'inventory');
+      final inventories = _sentMessages(
+        channel,
+      ).where((message) => message.type.name == 'inventory');
       expect(inventories, hasLength(1));
       expect(inventories.single.inventory!.keys, ['common']);
       channel.receive(
@@ -3923,8 +4007,9 @@ void main() {
           .expand((message) => message.history);
       expect(edits.map((edit) => edit.id), ['older', 'latest']);
       expect(
-        _sentMessages(channel)
-            .where((message) => message.type.name == 'inventory'),
+        _sentMessages(
+          channel,
+        ).where((message) => message.type.name == 'inventory'),
         isEmpty,
       );
     },
@@ -4719,144 +4804,120 @@ void main() {
     },
   );
 
-  testRoomWidgets(
-    'fresh verification completed while hidden is not repeated on foreground',
-    (tester) async {
-      network.autoRegister = true;
-      var clock = DateTime.utc(2026, 10, 22);
-      final host = session(actor: 'host');
-      await host.start();
-      await settle(tester);
-      final member = session(
-        actor: 'member',
-        preferExistingHost: true,
-        now: () => clock,
-      );
-      await member.start();
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      member.setForeground(false);
-      clock = clock.add(const Duration(seconds: 25));
-      await tester.pump(const Duration(seconds: 5));
-      await settle(tester);
-      expect(member.initialSyncComplete, isFalse);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      expect(member.initialSyncComplete, isTrue);
-      final peers = network.peers.toList();
-      member.setForeground(true);
-      expect(member.initialSyncComplete, isTrue);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      expect(network.peers, orderedEquals(peers));
-    },
-  );
+  testRoomWidgets('fresh verification completed while hidden is not repeated on foreground', (tester) async {
+    network.autoRegister = true;
+    var clock = DateTime.utc(2026, 10, 22);
+    final host = session(actor: 'host');
+    await host.start();
+    await settle(tester);
+    final member = session(actor: 'member', preferExistingHost: true, now: () => clock);
+    await member.start();
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    member.setForeground(false);
+    clock = clock.add(const Duration(seconds: 25));
+    await tester.pump(const Duration(seconds: 5));
+    await settle(tester);
+    expect(member.initialSyncComplete, isFalse);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    expect(member.initialSyncComplete, isTrue);
+    final peers = network.peers.toList();
+    member.setForeground(true);
+    expect(member.initialSyncComplete, isTrue);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settle(tester);
+    expect(network.peers, orderedEquals(peers));
+  });
 
-  testRoomWidgets(
-    'last peer closing during the focus probe cannot keep stale readiness',
-    (tester) async {
-      network.autoRegister = true;
-      var clock = DateTime.utc(2026, 10, 22);
-      final host = session(actor: 'host');
-      await host.start();
-      await settle(tester);
-      final storage = _Store();
-      final member = session(
-        actor: 'member',
-        store: storage,
-        preferExistingHost: true,
-        now: () => clock,
-      );
-      await member.start();
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      final old = network.peers.last.outbound.single;
-      old.dropData = true;
-      old.other!.dropData = true;
-      member.setForeground(false);
-      await host.edit('missed before deferred close');
-      await settle(tester);
-      clock = clock.add(const Duration(seconds: 4));
-      member.setForeground(true);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      expect(member.initialSyncComplete, isTrue);
-      final gate = storage.appendGate = Completer<void>();
-      old.open = false;
-      old.emit<void>('close', null);
-      await settle(tester);
-      expect(member.initialSyncComplete, isFalse);
-      expect(member.verifyingAfterResume, isTrue);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      expect(member.initialSyncComplete, isFalse);
-      gate.complete();
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      expect(member.initialSyncComplete, isTrue);
-      expect(member.text, 'missed before deferred close');
-    },
-  );
+  testRoomWidgets('last peer closing during the focus probe cannot keep stale readiness', (tester) async {
+    network.autoRegister = true;
+    var clock = DateTime.utc(2026, 10, 22);
+    final host = session(actor: 'host');
+    await host.start();
+    await settle(tester);
+    final storage = _Store();
+    final member = session(actor: 'member', store: storage,
+      preferExistingHost: true, now: () => clock);
+    await member.start();
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    final old = network.peers.last.outbound.single;
+    old.dropData = true;
+    old.other!.dropData = true;
+    member.setForeground(false);
+    await host.edit('missed before deferred close');
+    await settle(tester);
+    clock = clock.add(const Duration(seconds: 4));
+    member.setForeground(true);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settle(tester);
+    expect(member.initialSyncComplete, isTrue);
+    final gate = storage.appendGate = Completer<void>();
+    old.open = false;
+    old.emit<void>('close', null);
+    await settle(tester);
+    expect(member.initialSyncComplete, isFalse);
+    expect(member.verifyingAfterResume, isTrue);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settle(tester);
+    expect(member.initialSyncComplete, isFalse);
+    gate.complete();
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    expect(member.initialSyncComplete, isTrue);
+    expect(member.text, 'missed before deferred close');
+  });
 
-  testRoomWidgets(
-    'short focus return escalates a silent last peer to durable verification',
-    (tester) async {
-      network.autoRegister = true;
-      var clock = DateTime.utc(2026, 10, 22);
-      final host = session(actor: 'host');
-      await host.start();
-      await settle(tester);
-      final storage = _Store();
-      final member = session(
-        actor: 'member',
-        store: storage,
-        preferExistingHost: true,
-        now: () => clock,
-      );
-      await member.start();
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      final old = network.peers.last.outbound.single;
-      old.dropData = true;
-      old.other!.dropData = true;
-      member.setForeground(false);
-      await host.edit('missed during a short pause');
-      await settle(tester);
-      clock = clock.add(const Duration(seconds: 4));
-      member.setForeground(true);
-      expect(member.initialSyncComplete, isTrue);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      await tester.pump(const Duration(milliseconds: 5999));
-      await settle(tester);
-      expect(member.initialSyncComplete, isTrue);
-      final saved = storage.appendGate = Completer<void>();
-      await tester.pump(const Duration(milliseconds: 1));
-      await settle(tester);
-      expect(member.initialSyncComplete, isFalse);
-      expect(member.verifyingAfterResume, isTrue);
-      expect(old.disposed, isTrue);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      expect(member.initialSyncComplete, isFalse);
-      saved.complete();
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      expect(member.initialSyncComplete, isTrue);
-      expect(member.text, 'missed during a short pause');
-      expect(
-        roomHistoryInventory(member.changes),
-        roomHistoryInventory(host.changes),
-      );
-    },
-  );
+  testRoomWidgets('short focus return escalates a silent last peer to durable verification', (tester) async {
+    network.autoRegister = true;
+    var clock = DateTime.utc(2026, 10, 22);
+    final host = session(actor: 'host');
+    await host.start();
+    await settle(tester);
+    final storage = _Store();
+    final member = session(actor: 'member', store: storage,
+      preferExistingHost: true, now: () => clock);
+    await member.start();
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    final old = network.peers.last.outbound.single;
+    old.dropData = true;
+    old.other!.dropData = true;
+    member.setForeground(false);
+    await host.edit('missed during a short pause');
+    await settle(tester);
+    clock = clock.add(const Duration(seconds: 4));
+    member.setForeground(true);
+    expect(member.initialSyncComplete, isTrue);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settle(tester);
+    await tester.pump(const Duration(milliseconds: 5999));
+    await settle(tester);
+    expect(member.initialSyncComplete, isTrue);
+    final saved = storage.appendGate = Completer<void>();
+    await tester.pump(const Duration(milliseconds: 1));
+    await settle(tester);
+    expect(member.initialSyncComplete, isFalse);
+    expect(member.verifyingAfterResume, isTrue);
+    expect(old.disposed, isTrue);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settle(tester);
+    expect(member.initialSyncComplete, isFalse);
+    saved.complete();
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    expect(member.initialSyncComplete, isTrue);
+    expect(member.text, 'missed during a short pause');
+    expect(roomHistoryInventory(member.changes), roomHistoryInventory(host.changes));
+  });
 
   testRoomWidgets(
     'resumed solo cannot substitute discovery for synchronization',
@@ -5003,48 +5064,41 @@ void main() {
     },
   );
 
-  testRoomWidgets(
-    'healthy Alt+Tab keeps readiness and channels across long hides',
-    (tester) async {
-      network.autoRegister = true;
-      var clock = DateTime.utc(2026, 10, 22);
-      final host = session(actor: 'host');
-      await host.start();
-      await settle(tester);
-      final member = session(
-        actor: 'member',
-        preferExistingHost: true,
-        now: () => clock,
-      );
-      await member.start();
-      await settle(tester);
-      await tester.pump(const Duration(seconds: 1));
-      await settle(tester);
-      final peers = network.peers.toList();
-      final readiness = <bool>[];
-      member.addListener(() => readiness.add(member.initialSyncComplete));
-      for (var hide = 0; hide < 3; hide++) {
-        member.setForeground(false);
-        for (var tick = 0; tick < 6; tick++) {
-          clock = clock.add(const Duration(seconds: 5));
-          await tester.pump(const Duration(seconds: 5));
-          await settle(tester);
-        }
-        member.setForeground(true);
-        await tester.pump(const Duration(milliseconds: 200));
+  testRoomWidgets('healthy Alt+Tab keeps readiness and channels across long hides', (tester) async {
+    network.autoRegister = true;
+    var clock = DateTime.utc(2026, 10, 22);
+    final host = session(actor: 'host');
+    await host.start();
+    await settle(tester);
+    final member = session(actor: 'member', preferExistingHost: true, now: () => clock);
+    await member.start();
+    await settle(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await settle(tester);
+    final peers = network.peers.toList();
+    final readiness = <bool>[];
+    member.addListener(() => readiness.add(member.initialSyncComplete));
+    for (var hide = 0; hide < 3; hide++) {
+      member.setForeground(false);
+      for (var tick = 0; tick < 6; tick++) {
+        clock = clock.add(const Duration(seconds: 5));
+        await tester.pump(const Duration(seconds: 5));
         await settle(tester);
-        expect(member.initialSyncComplete, isTrue);
-        expect(member.verifyingAfterResume, isFalse);
-        expect(network.peers, orderedEquals(peers));
-        await host.edit('still connected $hide');
-        await settle(tester);
-        expect(member.text, 'still connected $hide');
       }
-      expect(readiness, isNotEmpty);
-      expect(readiness, everyElement(isTrue));
-      expect(peers.every((peer) => !peer.destroyed), isTrue);
-    },
-  );
+      member.setForeground(true);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(member.verifyingAfterResume, isFalse);
+      expect(network.peers, orderedEquals(peers));
+      await host.edit('still connected $hide');
+      await settle(tester);
+      expect(member.text, 'still connected $hide');
+    }
+    expect(readiness, isNotEmpty);
+    expect(readiness, everyElement(isTrue));
+    expect(peers.every((peer) => !peer.destroyed), isTrue);
+  });
 
   testRoomWidgets(
     'healthy hide shorter than three seconds does not probe or create peers',
@@ -5187,35 +5241,32 @@ void main() {
     },
   );
 
-  testRoomWidgets(
-    'healthy local follower Alt+Tab keeps readiness without asking owner to resync',
-    (tester) async {
-      final hub = _TabsHub();
-      final owner = roomTabs(hub);
-      await owner.start();
-      owner.publish(_tabState(const [], online: 2));
-      final tab = roomTabs(hub);
-      var clock = DateTime.utc(2026, 10, 22);
-      final follower = session(tabCoordinator: tab, now: () => clock);
-      await follower.start();
+  testRoomWidgets('healthy local follower Alt+Tab keeps readiness without asking owner to resync', (tester) async {
+    final hub = _TabsHub();
+    final owner = roomTabs(hub);
+    await owner.start();
+    owner.publish(_tabState(const [], online: 2));
+    final tab = roomTabs(hub);
+    var clock = DateTime.utc(2026, 10, 22);
+    final follower = session(tabCoordinator: tab, now: () => clock);
+    await follower.start();
+    await settleTabs(tester);
+    final ready = <bool>[];
+    follower.addListener(() => ready.add(follower.initialSyncComplete));
+    follower.setForeground(false);
+    for (var tick = 0; tick < 8; tick++) {
+      clock = clock.add(const Duration(seconds: 5));
+      await tester.pump(const Duration(seconds: 5));
       await settleTabs(tester);
-      final ready = <bool>[];
-      follower.addListener(() => ready.add(follower.initialSyncComplete));
-      follower.setForeground(false);
-      for (var tick = 0; tick < 8; tick++) {
-        clock = clock.add(const Duration(seconds: 5));
-        await tester.pump(const Duration(seconds: 5));
-        await settleTabs(tester);
-      }
-      follower.setForeground(true);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settleTabs(tester);
-      expect(follower.initialSyncComplete, isTrue);
-      expect(ready, everyElement(isTrue));
-      expect(tab.resyncRequests, isEmpty);
-      expect(network.peers, isEmpty);
-    },
-  );
+    }
+    follower.setForeground(true);
+    await tester.pump(const Duration(milliseconds: 200));
+    await settleTabs(tester);
+    expect(follower.initialSyncComplete, isTrue);
+    expect(ready, everyElement(isTrue));
+    expect(tab.resyncRequests, isEmpty);
+    expect(network.peers, isEmpty);
+  });
 
   testRoomWidgets(
     'local follower resume rejects cached ready state until correlated fresh proof',
@@ -5326,7 +5377,8 @@ void main() {
       expect(
         network.peers.length,
         peersBefore + 2,
-        reason: 'The owner tries the occupied alias, then follows; the local follower opens no sockets',
+        reason:
+            'The owner tries the occupied alias, then follows; the local follower opens no sockets',
       );
       expect(
         roomHistoryInventory(follower.changes),

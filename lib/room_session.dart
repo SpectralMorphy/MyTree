@@ -611,7 +611,8 @@ class RoomSession extends ChangeNotifier {
         await commit;
       } catch (_) {
         if (current()) {
-          _diskEntryError = 'Не удалось проверить сохранённую историю с Диска. Повторите проверку.';
+          _diskEntryError =
+              'Не удалось проверить сохранённую историю с Диска. Повторите проверку.';
           _failInitialSync(_history.error ?? _diskEntryError!);
         }
       } finally {
@@ -1028,6 +1029,25 @@ class RoomSession extends ChangeNotifier {
     return operation == null ? Future.value() : applyTreeOperation(operation);
   }
 
+  /// Room-wide dictionary edit, including reset, with the usual optimistic and
+  /// durable journal lifecycle. It does not require any visible tree person.
+  Future<void> setPatronymicOverride(
+    String name, {
+    required String? male,
+    required String? female,
+  }) {
+    if (!canEdit) {
+      return Future.error(StateError('Только редактор может изменять дерево'));
+    }
+    try {
+      return applyTreeOperation(
+        tree.setPatronymicOverride(name, male: male, female: female),
+      );
+    } catch (error, stack) {
+      return Future.error(error, stack);
+    }
+  }
+
   Future<void> applyTreeOperation(TreeOperation operation) {
     if (!canEdit) {
       return Future.error(StateError('Только редактор может изменять дерево'));
@@ -1045,6 +1065,14 @@ class RoomSession extends ChangeNotifier {
     final id = operation.personId;
     final item = operation.itemId;
     final data = operation.toJson();
+    if (operation.isRoomScoped) {
+      document.setPatronymicOverride(
+        data['name']! as String,
+        male: data['male'] as String?,
+        female: data['female'] as String?,
+      );
+      return;
+    }
     if (operation.type != 'createPerson' &&
         operation.type != 'createSibling' &&
         operation.type != 'unbindActor' &&
@@ -2736,6 +2764,26 @@ class RoomSession extends ChangeNotifier {
   bool get _requiresExplicitSiblings =>
       requireFamilyTree || _containsExplicitSiblings(_history.knownEdits);
 
+  bool _containsPatronymics(Iterable<RoomEdit> history) => history.any(
+    (edit) =>
+        edit.kind == RoomEditKind.tree &&
+        (jsonDecode(edit.text) as Map<String, dynamic>)['type'] ==
+            'setPatronymicOverride',
+  );
+
+  bool get _requiresPatronymics =>
+      requireFamilyTree || _containsPatronymics(_history.knownEdits);
+
+  bool _containsLifeStatus(Iterable<RoomEdit> history) => history.any((edit) {
+    if (edit.kind != RoomEditKind.tree) return false;
+    final operation = jsonDecode(edit.text);
+    return operation is Map &&
+        operation['type'] == 'setValue' &&
+        operation['field'] == 'alive';
+  });
+
+  bool get _requiresLifeStatus => _containsLifeStatus(_history.knownEdits);
+
   bool _containsParticipantIdentity(Iterable<RoomEdit> history) => history.any(
     (edit) =>
         (edit.kind == RoomEditKind.participantName && edit.text.isEmpty) ||
@@ -2798,6 +2846,10 @@ class RoomSession extends ChangeNotifier {
     personalSurnames:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
     explicitSiblings:
+        type == RoomMessageType.hello || type == RoomMessageType.welcome,
+    patronymics:
+        type == RoomMessageType.hello || type == RoomMessageType.welcome,
+    lifeStatus:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
     participantIdentity:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
@@ -3247,6 +3299,22 @@ class RoomSession extends ChangeNotifier {
           )) {
         throw const FormatException('Обновите клиент для синхронизации Диска');
       }
+      if (!message.patronymics && _requiresPatronymics) {
+        const reason =
+            'Обновите страницу на обоих устройствах: '
+            'другой клиент ещё не поддерживает отчества.';
+        _failInitialSync(reason);
+        throw const FormatException(reason);
+      }
+      if (!message.lifeStatus && _requiresLifeStatus) {
+        const reason =
+            'Обновите страницу на обоих устройствах: '
+            'другой клиент ещё не поддерживает отметку «жив» или неизвестную дату смерти.';
+        _failInitialSync(reason);
+        throw const FormatException(reason);
+      }
+      state.patronymics = message.patronymics;
+      state.lifeStatus = message.lifeStatus;
       state.diskSync = message.diskSync;
       state.explicitSiblings = message.explicitSiblings;
       state.roomMetadata = message.roomMetadata;
@@ -3298,6 +3366,18 @@ class RoomSession extends ChangeNotifier {
             _containsExplicitSiblings(message.history))) {
       throw const FormatException(
         'Обновите страницу на обоих устройствах: прямые связи братьев и сестёр не согласованы.',
+      );
+    }
+    if (!state.patronymics &&
+        (_requiresPatronymics || _containsPatronymics(message.history))) {
+      throw const FormatException(
+        'Обновите страницу на обоих устройствах: отчества не согласованы.',
+      );
+    }
+    if (!state.lifeStatus &&
+        (_requiresLifeStatus || _containsLifeStatus(message.history))) {
+      throw const FormatException(
+        'Обновите страницу на обоих устройствах: отметка о жизни не согласована.',
       );
     }
     if (!state.familyTree &&
@@ -3669,6 +3749,21 @@ class RoomSession extends ChangeNotifier {
           'Обновите страницу на обоих устройствах: прямые связи братьев и сестёр не согласованы.',
         );
       }
+      if (!state.patronymics &&
+          (_containsPatronymics(message.history) ||
+              (message.type != RoomMessageType.hello &&
+                  _requiresPatronymics))) {
+        throw const FormatException(
+          'Обновите страницу на обоих устройствах: отчества не согласованы.',
+        );
+      }
+      if (!state.lifeStatus &&
+          (_containsLifeStatus(message.history) ||
+              (message.type != RoomMessageType.hello && _requiresLifeStatus))) {
+        throw const FormatException(
+          'Обновите страницу на обоих устройствах: отметка о жизни не согласована.',
+        );
+      }
       if (!state.familyTree &&
           message.history.any((edit) => edit.kind == RoomEditKind.tree)) {
         throw const FormatException(
@@ -3977,6 +4072,8 @@ class _RoomConnection {
   bool familySurnames = false;
   bool personalSurnames = false;
   bool explicitSiblings = false;
+  bool patronymics = false;
+  bool lifeStatus = false;
   bool participantIdentity = false;
   bool authorHistory = false;
   bool diskSync = false;

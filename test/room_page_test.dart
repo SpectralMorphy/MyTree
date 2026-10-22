@@ -672,6 +672,7 @@ void main() {
           participantIdentity: true,
           personalSurnames: true,
           explicitSiblings: true,
+          patronymics: true,
         ).toJson(),
       );
       for (var i = 0; i < 12; i++) {
@@ -723,6 +724,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          patronymics: true,
           authorHistory: true,
           participantIdentity: true,
         ).toJson(),
@@ -945,6 +947,7 @@ void main() {
           participantIdentity: true,
           personalSurnames: true,
           explicitSiblings: true,
+          patronymics: true,
         ).toJson(),
       );
       for (var i = 0; i < 12; i++) {
@@ -1166,6 +1169,7 @@ void main() {
               participantIdentity: true,
               personalSurnames: true,
               explicitSiblings: true,
+              patronymics: true,
             ).toJson(),
           );
           for (var i = 0; i < 12; i++) {
@@ -1547,6 +1551,7 @@ void main() {
         'participantIdentity': true,
         'personalSurnames': true,
         'explicitSiblings': true,
+        'patronymics': true,
       });
       for (var i = 0; i < 8; i++) {
         await tester.pump();
@@ -1950,6 +1955,7 @@ void main() {
         'participantIdentity': true,
         'personalSurnames': true,
         'explicitSiblings': true,
+        'patronymics': true,
       });
       for (var i = 0; i < 8; i++) {
         await tester.pump();
@@ -2637,6 +2643,7 @@ void main() {
           participantIdentity: true,
           personalSurnames: true,
           explicitSiblings: true,
+          patronymics: true,
           history: const [
             RoomEdit(
               id: 'remote-profile',
@@ -2811,12 +2818,12 @@ void main() {
       semantics.dispose();
       await tester.pumpAndSettle();
       final menuItems = find.byType(PopupMenuItem<String>);
-      expect(menuItems, findsNWidgets(4));
+      expect(menuItems, findsNWidgets(5));
       expect(
         tester
             .widgetList<PopupMenuItem<String>>(menuItems)
             .map((item) => item.value),
-        ['settings', 'history', 'name', 'menu'],
+        ['settings', 'patronymics', 'history', 'name', 'menu'],
       );
       expect(
         tester
@@ -2826,6 +2833,7 @@ void main() {
             .map((text) => text.data),
         [
           'Настройки комнаты',
+          'Словарь отчеств',
           'Журнал изменений',
           'Изменить моё имя',
           'Выход в меню',
@@ -3290,6 +3298,7 @@ void main() {
           participantIdentity: true,
           personalSurnames: true,
           explicitSiblings: true,
+          patronymics: true,
         ).toJson(),
       );
       for (var i = 0; i < 16; i++) {

@@ -1,5 +1,6 @@
 # Completed Verification
 
+- [October 22 — Derived patronymics and name presentation](verification-patronymics-20261022.md)
 - [October 22 — Healthy focus switches versus suspension](verification-alt-tab-20261022.md)
 
 As of October 20, 2026, this document preserves the verification history from the [README](../README.md). The October 16–20 entries cover the current family-tree editor; the October 14–15 entries describe historical text-demo versions, not verification of the current tree canvas. These are dated results, not automatically refreshed guarantees. See also [architecture and testing](architecture/testing.md).

@@ -44,18 +44,24 @@ class TreeEditor extends StatefulWidget {
     this.initialPersonId,
     this.onPickPerson,
     this.canPickPerson,
+    this.nameMode,
   });
 
   final RoomSession session;
   final String? initialPersonId;
   final ValueChanged<String>? onPickPerson;
   final bool Function(TreePerson)? canPickPerson;
+  final ValueNotifier<TreeNameMode>? nameMode;
 
   @override
   State<TreeEditor> createState() => _TreeEditorState();
 }
 
 class _TreeEditorState extends State<TreeEditor> {
+  final _localNameMode = ValueNotifier(TreeNameMode.givenSurname);
+  ValueNotifier<TreeNameMode> get _nameMode =>
+      widget.nameMode ?? _localNameMode;
+
   final _keyboardFocus = FocusNode(debugLabel: 'Tree canvas shortcuts');
   final _mainScroll = _TreeScrollController();
   final _levelScrolls = <int, _TreeScrollController>{};
@@ -928,6 +934,7 @@ class _TreeEditorState extends State<TreeEditor> {
           body: SafeArea(
             child: TreeEditor(
               session: widget.session,
+              nameMode: _nameMode,
               initialPersonId: initialPersonId,
               canPickPerson: canPick,
               onPickPerson: (id) => Navigator.of(routeContext).pop(id),
@@ -965,6 +972,7 @@ class _TreeEditorState extends State<TreeEditor> {
           key: const Key('tree-biography-route'),
           body: SafeArea(
             child: PersonBiography(
+              nameMode: _nameMode,
               session: widget.session,
               personId: _selectedId,
               fullScreen: true,
@@ -991,6 +999,7 @@ class _TreeEditorState extends State<TreeEditor> {
       controller.dispose();
     }
     _scrollRepaint.dispose();
+    _localNameMode.dispose();
     super.dispose();
   }
 
@@ -1008,6 +1017,7 @@ class _TreeEditorState extends State<TreeEditor> {
             children: [
               if (_toolbarExpanded)
                 _TreeToolbar(
+                  nameMode: _nameMode,
                   mode: _mode,
                   onAlign: _alignAll,
                   people: _document.people,
@@ -1042,6 +1052,7 @@ class _TreeEditorState extends State<TreeEditor> {
                                 ),
                               ),
                               child: PersonBiography(
+                                nameMode: _nameMode,
                                 session: widget.session,
                                 personId: _selectedId,
                                 onSelect: _select,
@@ -1364,6 +1375,7 @@ class _TreeEditorState extends State<TreeEditor> {
 
 class _TreeToolbar extends StatefulWidget {
   const _TreeToolbar({
+    required this.nameMode,
     required this.mode,
     required this.onAlign,
     required this.people,
@@ -1374,6 +1386,7 @@ class _TreeToolbar extends StatefulWidget {
     required this.onZoom,
   });
 
+  final ValueNotifier<TreeNameMode> nameMode;
   final TreeTrunkMode mode;
   final VoidCallback onAlign;
   final Map<String, TreePerson> people;
@@ -1447,6 +1460,7 @@ class _TreeToolbarState extends State<_TreeToolbar> {
                                     icon: Icons.center_focus_strong,
                                   ),
                                   _zoomControls(),
+                                  _nameModePicker(),
                                 ],
                               ),
                             ),
@@ -1537,6 +1551,45 @@ class _TreeToolbarState extends State<_TreeToolbar> {
       ),
     );
   }
+
+  Widget _nameModePicker() => ValueListenableBuilder<TreeNameMode>(
+    valueListenable: widget.nameMode,
+    builder: (context, mode, _) => SizedBox(
+      width: 44,
+      height: 40,
+      child: PopupMenuButton<TreeNameMode>(
+        key: const Key('tree-name-mode'),
+        tooltip: 'Формат имени',
+        initialValue: mode,
+        padding: EdgeInsets.zero,
+        onSelected: (value) => widget.nameMode.value = value,
+        itemBuilder: (context) => [
+          for (final candidate in TreeNameMode.values)
+            PopupMenuItem<TreeNameMode>(
+              key: ValueKey('tree-name-mode-${candidate.name}'),
+              value: candidate,
+              child: Tooltip(
+                message: candidate == TreeNameMode.givenSurname
+                    ? 'Имя Фамилия'
+                    : 'Фамилия Имя Отчество',
+                child: Semantics(
+                  selected: mode == candidate,
+                  child: Text(
+                    candidate == TreeNameMode.givenSurname ? 'ИФ' : 'ФИО',
+                  ),
+                ),
+              ),
+            ),
+        ],
+        child: Center(
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(mode == TreeNameMode.givenSurname ? 'ИФ' : 'ФИО'),
+          ),
+        ),
+      ),
+    ),
+  );
 
   Widget _zoomControls() => Row(
     key: const Key('tree-zoom-controls'),

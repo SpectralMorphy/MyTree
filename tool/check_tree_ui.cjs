@@ -1074,6 +1074,7 @@ async function publicSurnames(a, b, errors) {
   let dialog = a.getByRole('alertdialog');
   await dialog.getByRole('button', { name: /^Кого добавить/ }).click();
   await a.getByRole('menuitem', { name: 'Мать', exact: true }).click();
+  await dialog.getByRole('checkbox', { name: 'Из дерева', exact: true }).click();
   await dialog.getByRole('button', { name: 'Выбрать', exact: true }).click();
   await a.getByRole('button', { name: 'Отмена выбора', exact: true }).waitFor();
   await type(a, search(a), 'Мария');
@@ -1271,8 +1272,12 @@ async function publicExplicitSiblings(a, b, errors) {
   const addSibling = async (page, source, sourceId, kind, name, label) => {
     const before = await history(page), dialog = await addDialog(page, source, 'Брат/сестра');
     assert.equal(await dialog.getByRole('button', { name: 'Выбрать', exact: true }).count(), 0);
-    assert.equal(await dialog.getByRole('checkbox', { name: 'Из дерева', exact: true }).count(), 0);
-    assert.equal(await dialog.getByRole('checkbox', { name: 'Новый человек', exact: true }).count(), 0);
+    const fromTree = dialog.getByRole('checkbox', { name: 'Из дерева', exact: true });
+    const fresh = dialog.getByRole('checkbox', { name: 'Новый человек', exact: true });
+    assert.equal(await fromTree.count(), 1);
+    assert.equal(await fresh.count(), 1);
+    assert.equal(await fresh.isChecked(), true);
+    assert.equal(await fromTree.isDisabled(), true);
     const sex = dialog.getByRole('button', { name: /^Пол(?:\s|$)/ });
     await sex.click();
     for (const option of ['Пол не указан', 'Мужской', 'Женский']) await page.getByRole('menuitem', { name: option, exact: true }).waitFor();

@@ -361,6 +361,7 @@ Future<void> _mount(
   String? initialPersonId,
   ValueChanged<String>? onPickPerson,
   bool Function(TreePerson)? canPickPerson,
+  ValueNotifier<TreeNameMode>? nameMode,
 }) async {
   tester.view.physicalSize = size * devicePixelRatio;
   tester.view.devicePixelRatio = devicePixelRatio;
@@ -387,6 +388,7 @@ Future<void> _mount(
           initialPersonId: initialPersonId,
           onPickPerson: onPickPerson,
           canPickPerson: canPickPerson,
+          nameMode: nameMode,
         ),
       ),
     ),
@@ -839,6 +841,7 @@ void _expectToolbarFits(WidgetTester tester) {
   final canvas = tester.getRect(find.byKey(const Key('tree-canvas')));
   final search = tester.getRect(find.byKey(const Key('tree-search-field')));
   final mode = tester.getRect(find.byKey(const Key('tree-mode-picker')));
+  final nameMode = tester.getRect(find.byKey(const Key('tree-name-mode')));
   final align = tester.getRect(find.byKey(const Key('tree-align-all')));
   final toggle = tester.getRect(find.byKey(const Key('tree-toolbar-toggle')));
   final zoom = [
@@ -848,7 +851,7 @@ void _expectToolbarFits(WidgetTester tester) {
   final zoomGroup = zoom.reduce((a, b) => a.expandToInclude(b));
   expect(toolbar.height, closeTo(45, .1));
   expect(canvas.top, greaterThanOrEqualTo(toolbar.bottom));
-  for (final control in [search, mode, align, toggle, ...zoom]) {
+  for (final control in [search, mode, nameMode, align, toggle, ...zoom]) {
     _expectInside(control, toolbar);
     expect(control.width, greaterThan(0));
     expect(control.height, greaterThan(0));
@@ -863,9 +866,10 @@ void _expectToolbarFits(WidgetTester tester) {
   expect(zoomGroup.width, lessThanOrEqualTo(108));
   expect(zoom[0].right, lessThanOrEqualTo(zoom[2].left + .1));
   expect(zoom[2].right, lessThanOrEqualTo(zoom[1].left + .1));
-  expect(search.left, greaterThanOrEqualTo(zoomGroup.right));
+  expect(nameMode.left, greaterThanOrEqualTo(zoomGroup.right - .1));
+  expect(search.left, greaterThanOrEqualTo(nameMode.right));
   expect(search.right, closeTo(toolbar.right - 4, .1));
-  for (final control in [search, mode, align, ...zoom]) {
+  for (final control in [search, mode, nameMode, align, ...zoom]) {
     expect(control.center.dy, closeTo(toggle.center.dy, 1));
   }
   expect(
@@ -890,6 +894,13 @@ Future<void> _chooseMode(WidgetTester tester, TreeTrunkMode mode) async {
   await tester.tap(find.byKey(const Key('tree-mode-picker')));
   await tester.pumpAndSettle();
   await tester.tap(find.byKey(ValueKey('tree-mode-${mode.name}')));
+  await tester.pumpAndSettle();
+}
+
+Future<void> _chooseNameMode(WidgetTester tester, TreeNameMode mode) async {
+  await tester.tap(find.byKey(const Key('tree-name-mode')));
+  await tester.pumpAndSettle();
+  await tester.tap(find.byKey(ValueKey('tree-name-mode-${mode.name}')));
   await tester.pumpAndSettle();
 }
 
@@ -3347,6 +3358,83 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets(
+    'name toolbar updates biography live but never cards search or history',
+    (tester) async {
+      final fixture = _Fixture()
+        ..name(rootTreePersonId, 'Анна')
+        ..add('father', sex: TreeSex.male)
+        ..name('father', 'Иван')
+        ..parents(rootTreePersonId, father: 'father');
+      fixture.apply(
+        fixture.document.setValue(rootTreePersonId, 'sex', 'female'),
+      );
+      fixture.apply(
+        fixture.document.setIndividualSurname(
+          'father',
+          text: 'Иванов',
+          decline: true,
+        ),
+      );
+      final session = _Session(fixture.document, editingAllowed: true);
+      final mode = ValueNotifier(TreeNameMode.givenSurname);
+      addTearDown(mode.dispose);
+      final peopleBefore = fixture.document.people;
+      await _mount(tester, session, nameMode: mode);
+      await tester.tap(find.byKey(const Key('open-biography')));
+      await tester.pumpAndSettle();
+      final biography = find.byType(PersonBiography);
+      expect(tester.widget<PersonBiography>(biography).nameMode, same(mode));
+      expect(find.text('Анна Иванова'), findsOneWidget);
+      final card = _person(rootTreePersonId);
+      final cardBefore = tester.getRect(card);
+      final canvas = find.byKey(const Key('tree-canvas'));
+      final search = find.byKey(const Key('tree-search-field'));
+      final option = find.byKey(const Key('tree-search-option-root'));
+      Future<void> checkSearch() async {
+        await tester.enterText(search, 'ивановна');
+        await tester.pumpAndSettle();
+        expect(
+          find.descendant(
+            of: option,
+            matching: find.text('Иванова Анна Ивановна'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          tester.widget<Semantics>(option).properties.label,
+          'Иванова Анна Ивановна, ?–?',
+        );
+        await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+        await tester.tapAt(tester.getRect(canvas).topLeft + const Offset(8, 8));
+        await tester.pumpAndSettle();
+      }
+
+      await checkSearch();
+      await _chooseNameMode(tester, TreeNameMode.surnameGivenPatronymic);
+      expect(mode.value, TreeNameMode.surnameGivenPatronymic);
+      expect(find.text('Иванова Анна Ивановна'), findsOneWidget);
+      expect(find.text('Анна Иванова'), findsNothing);
+      expect(
+        find.descendant(of: card, matching: find.text('Анна')),
+        findsOneWidget,
+      );
+      expect(tester.getRect(card), cardBefore);
+      _expectToolbarFits(tester);
+      await checkSearch();
+      await _chooseNameMode(tester, TreeNameMode.givenSurname);
+      expect(find.text('Анна Иванова'), findsOneWidget);
+      expect(session.operations, isEmpty);
+      expect(fixture.document.people, same(peopleBefore));
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      // The owner can continue using its notifier after the editor is gone.
+      mode.value = TreeNameMode.surnameGivenPatronymic;
+      mode.addListener(() {});
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   for (final portrait in [true, false]) {
     testWidgets(
       '${portrait ? 'mobile' : 'desktop'} toolbar search uses birth surname and ignores legacy surname without editing or opening biography',
@@ -3424,7 +3512,7 @@ void main() {
         expect(
           find.descendant(
             of: option('oldest'),
-            matching: find.text('Анна Старшая Иванова'),
+            matching: find.text('Иванова Анна Старшая'),
           ),
           findsOneWidget,
         );
@@ -3519,6 +3607,13 @@ void main() {
           ..name(rootTreePersonId, 'Я')
           ..add('Мать', sex: TreeSex.female)
           ..add('Отец', sex: TreeSex.male);
+        fixture.apply(
+          fixture.document.setIndividualSurname(
+            'Мать',
+            text: 'Сидоров',
+            decline: true,
+          ),
+        );
         final session = _Session(fixture.document, editingAllowed: true);
         await _mount(
           tester,
@@ -3529,6 +3624,10 @@ void main() {
         expect(_zoomLabel(tester), '120%');
         await tester.tap(find.byKey(const Key('open-biography')));
         await tester.pumpAndSettle();
+        final nameMode = tester
+            .widget<PersonBiography>(find.byType(PersonBiography))
+            .nameMode!;
+        expect(nameMode.value, TreeNameMode.givenSurname);
         await tester.tap(find.byKey(const Key('biography-edit-toggle')));
         await tester.pumpAndSettle();
         await tester.scrollUntilVisible(
@@ -3547,6 +3646,8 @@ void main() {
         await tester.tap(find.byKey(const Key('relative-kind')));
         await tester.pumpAndSettle();
         await tester.tap(find.text('Мать').last);
+        await tester.pumpAndSettle();
+        await tester.tap(find.widgetWithText(ChoiceChip, 'Из дерева'));
         await tester.pumpAndSettle();
         final pick = find.byKey(const Key('relative-pick-from-tree'));
         expect(tester.widget<OutlinedButton>(pick).child, isA<Text>());
@@ -3570,6 +3671,12 @@ void main() {
         expect(find.byTooltip('Отмена выбора'), findsOneWidget);
         expect(find.byKey(const Key('open-biography')), findsNothing);
         expect(find.byType(PersonBiography), findsNothing);
+        expect(
+          tester.widget<TreeEditor>(find.byType(TreeEditor)).nameMode,
+          same(nameMode),
+        );
+        await _chooseNameMode(tester, TreeNameMode.surnameGivenPatronymic);
+        expect(nameMode.value, TreeNameMode.surnameGivenPatronymic);
         expect(_zoomLabel(tester), '100%');
         _expectToolbarFits(tester);
         await _zoomWheel(tester, 100000, browserScale: false);
@@ -3632,7 +3739,17 @@ void main() {
         await tester.pumpAndSettle();
         expect(route, findsNothing);
         final selected = find.byKey(const Key('relative-selected-person'));
-        expect(tester.widget<Text>(selected).data, 'Мать\n?–?');
+        expect(tester.widget<Text>(selected).data, 'Сидорова Мать\n?–?');
+        expect(
+          tester.widget<PersonBiography>(find.byType(PersonBiography)).nameMode,
+          same(nameMode),
+        );
+        nameMode.value = TreeNameMode.givenSurname;
+        await tester.pumpAndSettle();
+        expect(tester.widget<Text>(selected).data, 'Мать Сидорова\n?–?');
+        nameMode.value = TreeNameMode.surnameGivenPatronymic;
+        await tester.pumpAndSettle();
+        expect(tester.widget<Text>(selected).data, 'Сидорова Мать\n?–?');
         await tester.tap(pick);
         await tester.pumpAndSettle();
         expect(
@@ -3643,7 +3760,7 @@ void main() {
         await tester.pumpAndSettle();
         await tester.tap(find.byTooltip('Отмена выбора'));
         await tester.pumpAndSettle();
-        expect(tester.widget<Text>(selected).data, 'Мать\n?–?');
+        expect(tester.widget<Text>(selected).data, 'Сидорова Мать\n?–?');
         expect(find.byType(AlertDialog), findsOneWidget);
         expect(
           tester.widget<PersonBiography>(find.byType(PersonBiography)).personId,
@@ -7656,6 +7773,8 @@ void main() {
             expect(find.byTooltip('Линия дерева: Обе линии'), findsOneWidget);
             await tester.tap(find.byKey(const Key('tree-align-all')));
             await tester.pumpAndSettle();
+            _expectToolbarFits(tester);
+            await _chooseNameMode(tester, TreeNameMode.surnameGivenPatronymic);
             _expectToolbarFits(tester);
             expect(picked, isEmpty);
             expect(session.operations, isEmpty);

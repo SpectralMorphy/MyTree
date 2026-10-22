@@ -2448,6 +2448,29 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('dictionary journal is room-scoped and grouped by name', (tester) async {
+    final session = _DialogSession();
+    addTearDown(session.dispose);
+    RoomEdit entry(int n, String name, String? male, String? female) => RoomEdit(
+      id: 'dictionary-$n', author: 'self', clock: n, createdAt: n,
+      kind: RoomEditKind.tree,
+      text: jsonEncode(TreeDocument().setPatronymicOverride(name, male: male, female: female).toJson()),
+    );
+    session.edits = [
+      entry(1, 'Илья', 'Ильич', 'Ильинична'),
+      entry(2, 'Илья', null, null),
+      entry(3, 'Лука', 'Лукич', 'Лукинична'),
+    ];
+    await _showDialog(tester, RoomChangesDialog(session: session));
+    expect(find.text('Сброшены отчества для имени «илья»'), findsOneWidget);
+    expect(find.text('илья'), findsOneWidget);
+    expect(find.text('лука'), findsOneWidget);
+    expect(find.text('Участник дерева'), findsNothing);
+    expect(session.edits, hasLength(3));
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('journal displays a UTC instant in local time and locale', (
     tester,
   ) async {

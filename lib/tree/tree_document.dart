@@ -2,14 +2,20 @@ import 'dart:collection';
 import 'dart:convert';
 
 import '../room_identity.dart';
+import 'patronymic.dart';
+
+export 'patronymic.dart';
 
 enum TreeSex { unknown, male, female }
+
+enum TreeNameMode { givenSurname, surnameGivenPatronymic }
 
 enum TreeTextField { name, biography, fact, photoCaption }
 
 const rootTreePersonId = 'root';
 const maxTreeTextLength = 100000;
 const maxTreeSurnameLength = 200;
+const maxTreePatronymicLength = 200;
 const maxTreePhotoBytes = 700 * 1024;
 const treeFactColors = <String>[
   '#E6DCCB',
@@ -83,6 +89,7 @@ class TreePerson {
     this.sex = TreeSex.unknown,
     this.birthDate,
     this.deathDate,
+    this.alive,
     this.fatherId,
     this.motherId,
     Iterable<TreeFact> facts = const [],
@@ -93,8 +100,10 @@ class TreePerson {
     this.maidenSurname,
     TreeSurname? effectiveSurname,
     this.surnameInheritedFrom,
+    TreePatronymicForms? fatherPatronymicForms,
   }) : effectiveSurname =
            effectiveSurname ?? individualSurname ?? familySurname,
+       _fatherPatronymicForms = fatherPatronymicForms,
        facts = List.unmodifiable(facts),
        photos = List.unmodifiable(photos);
 
@@ -104,6 +113,10 @@ class TreePerson {
   final TreeSex sex;
   final DateTime? birthDate;
   final DateTime? deathDate;
+
+  /// Explicit death-date choice when [deathDate] is absent. `true` is living,
+  /// `false` is unknown. Null keeps the legacy display.
+  final bool? alive;
   final String? fatherId;
   final String? motherId;
   final List<TreeFact> facts;
@@ -121,8 +134,19 @@ class TreePerson {
   /// Immediate father, only when the effective value is inherited from him.
   final String? surnameInheritedFrom;
 
+  /// Projection-only forms from the accepted father's current given-name text.
+  /// There is no editable or persisted person patronymic register.
+  final TreePatronymicForms? _fatherPatronymicForms;
+
   String get displayName => name.trim().isEmpty ? 'Без имени' : name;
   String get surname => effectiveSurname?.formForSex(sex) ?? '';
+  String get patronymic => fatherId == null
+      ? ''
+      : switch (sex) {
+          TreeSex.male => _fatherPatronymicForms?.male ?? '',
+          TreeSex.female => _fatherPatronymicForms?.female ?? '',
+          TreeSex.unknown => '',
+        };
 
   String get fullName {
     final givenName = name.trim();
@@ -132,9 +156,29 @@ class TreePerson {
     ].join(' ');
   }
 
+  String nameForMode(TreeNameMode mode) {
+    if (mode == TreeNameMode.givenSurname) return fullName;
+    final givenName = name.trim();
+    return [
+      if (surname.isNotEmpty) surname,
+      givenName.isEmpty ? displayName : givenName,
+      if (patronymic.isNotEmpty) patronymic,
+    ].join(' ');
+  }
+
+  String get fullNameWithPatronymic =>
+      nameForMode(TreeNameMode.surnameGivenPatronymic);
+
+  /// Year span. A death date wins. Otherwise explicit [alive] chooses `н.в.`
+  /// or `?`. With no explicit choice, a missing death is `н.в.` only when a
+  /// birth date exists; both missing stays `?–?`.
   String get lifeYears {
-    if (birthDate == null && deathDate == null) return '?–?';
-    return '${birthDate?.year ?? '?'}–${deathDate?.year ?? 'н.в.'}';
+    if (deathDate != null) {
+      return '${birthDate?.year ?? '?'}–${deathDate!.year}';
+    }
+    final living = alive ?? birthDate != null;
+    if (!living && birthDate == null) return '?–?';
+    return '${birthDate?.year ?? '?'}–${living ? 'н.в.' : '?'}';
   }
 }
 
@@ -193,12 +237,16 @@ class TreeOperation {
   late final String _encoded = jsonEncode(_json);
 
   String get type => _json['type']! as String;
-  String get personId => _json['personId']! as String;
+  bool get isRoomScoped => type == 'setPatronymicOverride';
+
+  /// Room operations have no person target or serialized personId.
+  String get personId => isRoomScoped ? '' : _json['personId']! as String;
   String? get itemId => _json['itemId'] as String?;
 
   String get fieldKey => switch (type) {
     'createPerson' || 'createSibling' || 'deletePerson' => 'person',
     'unlinkSibling' => 'sibling:${_json['linkId']}',
+    'setPatronymicOverride' => 'patronymic:${_json['name']}',
     'setValue' => _json['field']! as String,
     'setSurname' =>
       _json['scope'] == 'family'
@@ -221,10 +269,19 @@ class TreeOperation {
     'createSibling' => 'Добавлен брат или сестра',
     'unlinkSibling' => 'Удалена прямая связь братьев или сестёр',
     'deletePerson' => 'Удалён человек',
+    'setPatronymicOverride' =>
+      _json['male'] == null
+          ? 'Сброшены отчества для имени «${_json['name']}»'
+          : 'Изменены отчества для имени «${_json['name']}»',
     'setValue' => switch (_json['field']) {
       'sex' => 'Изменён пол',
       'birthDate' => 'Изменена дата рождения',
       'deathDate' => 'Изменена дата смерти',
+      'alive' => switch (_json['value']) {
+        true => 'Отмечен как живой',
+        false => 'Дата смерти неизвестна',
+        _ => 'Сброшена отметка о жизни',
+      },
       'fatherId' => 'Изменён отец',
       'motherId' => 'Изменена мать',
       'avatarPhotoId' => 'Изменена главная фотография',
@@ -267,8 +324,21 @@ class TreeOperation {
   static TreeOperation fromJson(Object? value) {
     final json = _object(value);
     final type = json['type'];
-    _id(json['personId']);
+    if (type != 'setPatronymicOverride') _id(json['personId']);
     switch (type) {
+      case 'setPatronymicOverride':
+        _keys(json, const ['type', 'name', 'male', 'female']);
+        _patronymicText(json['name']);
+        final name = json['name']! as String;
+        if (name.isEmpty || name != normalizePatronymicName(name)) {
+          throw const FormatException('Expected a normalized father name');
+        }
+        final male = json['male'];
+        final female = json['female'];
+        if (male != null || female != null) {
+          _patronymicText(male);
+          _patronymicText(female);
+        }
       case 'createPerson':
         _keys(json, const ['type', 'personId', 'name', 'sex']);
         _text(json['name']);
@@ -558,6 +628,7 @@ class TreeDocument {
   Map<String, _PersonState> _states = {};
   Set<String> _deletedPersonIds = const {};
   Map<String, TreePerson> _people = const {};
+  Map<String, TreePatronymicForms> _patronymicOverrides = const {};
   Map<String, String> _bindings = const {};
   Map<String, StampedTreeOperation> _bindingEvents = const {};
   Map<String, String> _siblingGroupIds = const {};
@@ -566,6 +637,8 @@ class TreeDocument {
   Map<String, String> get siblingGroupIds => _siblingGroupIds;
   List<TreeSiblingLink> get directSiblingLinks => _directSiblingLinks;
   Map<String, TreePerson> get people => _people;
+  Map<String, TreePatronymicForms> get patronymicOverrides =>
+      _patronymicOverrides;
   Map<String, String> get bindings => _bindings;
   TreePerson? person(String id) => _people[id];
 
@@ -689,6 +762,19 @@ class TreeDocument {
     }
     return operation;
   }
+
+  /// Atomic room-scoped forms; both null resets to built-in/algorithmic forms.
+  /// This command is valid even when every person, including root, is deleted.
+  TreeOperation setPatronymicOverride(
+    String name, {
+    required String? male,
+    required String? female,
+  }) => TreeOperation.fromJson({
+    'type': 'setPatronymicOverride',
+    'name': normalizePatronymicName(name),
+    'male': male?.trim(),
+    'female': female?.trim(),
+  });
 
   String surnameFamilyKey(String personId) {
     _requirePerson(personId);
@@ -1077,9 +1163,25 @@ class TreeDocument {
     }
     final bindingEvents = <String, StampedTreeOperation>{};
     final familySurnames = <String, _Register>{};
+    final patronymicOverrides = <String, TreePatronymicForms>{};
     for (final event in events) {
       final op = event.operation;
       final json = op._json;
+      if (op.type == 'setPatronymicOverride') {
+        // Sorted replay is LWW for the whole pair, including resets. Keep the
+        // reset event in history so delayed older overrides cannot reappear.
+        // This room register must be processed before looking up any person.
+        final name = json['name']! as String;
+        if (json['male'] == null) {
+          patronymicOverrides.remove(name);
+        } else {
+          patronymicOverrides[name] = TreePatronymicForms(
+            male: json['male']! as String,
+            female: json['female']! as String,
+          );
+        }
+        continue;
+      }
       if (op.type == 'bindActor') {
         // Preserve legacy earliest-claim replay until that exact claim is
         // explicitly released. A later bind alone never changes an active one.
@@ -1204,9 +1306,22 @@ class TreeDocument {
         if (surname != null) inheritedFrom[child] = father;
       }
     }
+    // Names are independent of person iteration order: a father can sort after
+    // his child. Derive forms only after deletion and accepted-edge projection.
+    final names = {
+      for (final id in ids)
+        id: states[id]!.name.snapshot(id, TreeTextField.name, null).text,
+    };
     for (final id in ids) {
       if (deletedPersonIds.contains(id)) continue;
       final state = states[id]!;
+      final father = accepted[id]?['fatherId'];
+      final fatherPatronymicForms = father == null
+          ? null
+          : generatePatronymicForms(
+              names[father]!,
+              overrides: patronymicOverrides,
+            );
       final facts = _orderItems(state.facts.values)
           .where((fact) => !fact.removed)
           .map(
@@ -1231,7 +1346,7 @@ class TreeDocument {
       final avatar = state.values['avatarPhotoId']?.value as String?;
       people[id] = TreePerson(
         id: id,
-        name: state.name.snapshot(id, TreeTextField.name, null).text,
+        name: names[id]!,
         biography: state.biography
             .snapshot(id, TreeTextField.biography, null)
             .text,
@@ -1240,7 +1355,9 @@ class TreeDocument {
         ),
         birthDate: _dateValue(state.values['birthDate']?.value),
         deathDate: _dateValue(state.values['deathDate']?.value),
-        fatherId: accepted[id]?['fatherId'],
+        alive: state.values['alive']?.value as bool?,
+        fatherId: father,
+        fatherPatronymicForms: fatherPatronymicForms,
         motherId: accepted[id]?['motherId'],
         familySurname: explicitFamilies[id],
         individualSurname:
@@ -1258,6 +1375,7 @@ class TreeDocument {
     _states = states;
     _deletedPersonIds = deletedPersonIds;
     _people = Map.unmodifiable(people);
+    _patronymicOverrides = Map.unmodifiable(patronymicOverrides);
     _directSiblingLinks = List.unmodifiable(
       relations?.links.values ?? const <TreeSiblingLink>[],
     );
@@ -1944,6 +2062,16 @@ void _surnameText(Object? value) {
   }
 }
 
+void _patronymicText(Object? value) {
+  if (value is! String ||
+      value != value.trim() ||
+      value.runes.length > maxTreePatronymicLength ||
+      RegExp(r'[\x00-\x1f\x7f-\x9f]').hasMatch(value) ||
+      !_wellFormedUnicode(value)) {
+    throw const FormatException('Invalid or oversized patronymic text');
+  }
+}
+
 void _validateSurnameFamilyKey(Object? value, String personId) {
   if (value is! String || value.length > 540) {
     throw const FormatException('Invalid surname family key');
@@ -2024,6 +2152,10 @@ void _validateValue(Object? field, Object? value) {
     case 'birthDate' || 'deathDate':
       if (value != null && _dateValue(value) == null) {
         throw const FormatException('Expected yyyy-MM-dd');
+      }
+    case 'alive':
+      if (value != null && value is! bool) {
+        throw const FormatException('Expected alive true, false, or null');
       }
     case 'fatherId' || 'motherId' || 'avatarPhotoId':
       _nullableId(value);

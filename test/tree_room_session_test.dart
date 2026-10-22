@@ -324,6 +324,10 @@ Future<RoomEdit> _seedLegacyGuestBinding(_Store storage, String actor) async {
 Map<String, Object?> _projection(TreeDocument tree) => {
   'bindings': tree.bindings,
   'siblingGroups': tree.siblingGroupIds,
+  'patronymicOverrides': {
+    for (final entry in tree.patronymicOverrides.entries)
+      entry.key: {'male': entry.value.male, 'female': entry.value.female},
+  },
   'directSiblingLinks': [
     for (final link in tree.directSiblingLinks)
       [link.id, link.personId, link.siblingId],
@@ -346,6 +350,8 @@ Map<String, Object?> _projection(TreeDocument tree) => {
         'effectiveSurname': person.effectiveSurname,
         'surnameInheritedFrom': person.surnameInheritedFrom,
         'fullName': person.fullName,
+        'patronymic': person.patronymic,
+        'fullNameWithPatronymic': person.fullNameWithPatronymic,
         'facts': [
           for (final fact in person.facts)
             {'id': fact.id, 'text': fact.text, 'color': fact.color},
@@ -612,6 +618,7 @@ void main() {
       expect(handshakes.every((message) => message.familySurnames), isTrue);
       expect(handshakes.every((message) => message.personalSurnames), isTrue);
       expect(handshakes.every((message) => message.explicitSiblings), isTrue);
+      expect(handshakes.every((message) => message.patronymics), isTrue);
       expect(handshakes.every((message) => message.authorHistory), isTrue);
       expect(
         handshakes
@@ -885,6 +892,239 @@ void main() {
         );
       }
       expect(roomHistoryInventory(room.changes), before);
+    },
+  );
+
+  treeTest(
+    'room dictionary commands need no visible people and retry the same optimistic record',
+    (tester) async {
+      final storage = store();
+      final alice = session(actor: 'alice', storage: storage, creator: true);
+      await alice.start();
+      await _settle(tester);
+      await alice.applyTreeOperation(alice.tree.deletePerson(rootTreePersonId));
+      expect(alice.tree.people, isEmpty);
+      storage.failAppend = true;
+      await expectLater(
+        alice.setPatronymicOverride(
+          ' ПЁТР ',
+          male: ' Другое мужское ',
+          female: ' Другое женское ',
+        ),
+        throwsStateError,
+      );
+      final failed = _treeEdits(alice).singleWhere(
+        (edit) => jsonDecode(edit.text)['type'] == 'setPatronymicOverride',
+      );
+      expect(jsonDecode(failed.text), {
+        'type': 'setPatronymicOverride',
+        'name': 'петр',
+        'male': 'Другое мужское',
+        'female': 'Другое женское',
+      });
+      expect(alice.tree.patronymicOverrides['петр']!.male, 'Другое мужское');
+      expect(alice.durableTree.patronymicOverrides, isEmpty);
+      expect(alice.storageError, isNotNull);
+      storage.failAppend = false;
+      await alice.flush();
+      await _settle(tester);
+      expect(
+        alice.durableTree.patronymicOverrides['петр']!.female,
+        'Другое женское',
+      );
+      expect(
+        decodeRoomHistory(
+          await storage.loadHistory(_roomId),
+        ).where((edit) => edit.id == failed.id),
+        hasLength(1),
+      );
+      final attempts = storage.batches
+          .expand((batch) => batch)
+          .where((row) => row['id'] == failed.id);
+      expect(attempts.length, greaterThanOrEqualTo(2));
+      expect(attempts, everyElement(_immutableEdit(failed)));
+      // Generic submission observes the same room-scoped validation as the API.
+      await alice.applyTreeOperation(
+        TreeOperation.fromJson({
+          'type': 'setPatronymicOverride',
+          'name': 'петр',
+          'male': null,
+          'female': null,
+        }),
+      );
+      expect(alice.tree.people, isEmpty);
+      expect(alice.tree.patronymicOverrides, isEmpty);
+      expect(alice.durableTree.patronymicOverrides, isEmpty);
+      expect(alice.storageError, isNull);
+      final guestStore = store();
+      final guest = session(
+        actor: 'guest',
+        storage: guestStore,
+        role: RoomRole.guest,
+        member: false,
+        follower: true,
+      );
+      await guest.start();
+      await _settleRoom(tester);
+      expect(guest.joined, isTrue);
+      expect(guest.tree.people, isEmpty);
+      expect(guest.canEdit, isFalse);
+      final guestBefore = roomHistoryInventory(guest.changes);
+      final guestBatchesBefore = guestStore.batches.length;
+      final guestAuthoredBefore = guestStore.authoredBatches.length;
+      for (final reset in [false, true]) {
+        await expectLater(
+          guest.setPatronymicOverride(
+            'Пётр',
+            male: reset ? null : 'Нельзя',
+            female: reset ? null : 'Нельзя',
+          ),
+          throwsStateError,
+        );
+        await expectLater(
+          guest.applyTreeOperation(
+            TreeOperation.fromJson({
+              'type': 'setPatronymicOverride',
+              'name': 'петр',
+              'male': reset ? null : 'Нельзя',
+              'female': reset ? null : 'Нельзя',
+            }),
+          ),
+          throwsStateError,
+        );
+      }
+      expect(roomHistoryInventory(guest.changes), guestBefore);
+      expect(guestStore.batches, hasLength(guestBatchesBefore));
+      expect(guestStore.authoredBatches, hasLength(guestAuthoredBefore));
+      expect(guest.tree.patronymicOverrides, isEmpty);
+      final before = roomHistoryInventory(alice.changes);
+      guest.dispose();
+      alice.dispose();
+      await _settle(tester);
+      network.autoRegister = false;
+      final reopened = session(actor: 'alice', storage: storage);
+      await reopened.start();
+      expect(reopened.tree.people, isEmpty);
+      expect(reopened.tree.patronymicOverrides, isEmpty);
+      expect(roomHistoryInventory(reopened.changes), before);
+    },
+  );
+
+  treeTest(
+    'patronymic dictionary exchange concurrent reset shuffled replay and reload converge',
+    (tester) async {
+      final aliceStore = store();
+      final bobStore = store();
+      final alice = session(actor: 'alice', storage: aliceStore, creator: true);
+      await alice.start();
+      await _settle(tester);
+      await alice.applyTreeOperation(
+        alice.tree.createPerson('father', name: 'Илья', sex: TreeSex.male),
+      );
+      await alice.applyTreeOperation(
+        alice.tree.createPerson('daughter', name: 'Анна', sex: TreeSex.female),
+      );
+      await alice.applyTreeOperation(
+        alice.tree.setValue(rootTreePersonId, 'sex', TreeSex.male),
+      );
+      for (final id in [rootTreePersonId, 'daughter']) {
+        await alice.applyTreeOperation(
+          alice.tree.setValue(id, 'fatherId', 'father'),
+        );
+      }
+      await alice.setPatronymicOverride(
+        ' ИЛЬЯ ',
+        male: 'Особый сын',
+        female: 'Особая дочь',
+      );
+      await alice.setPatronymicOverride(
+        'Квентин',
+        male: 'Квентинович',
+        female: 'Квентиновна',
+      );
+      final bob = session(
+        actor: 'bob',
+        storage: bobStore,
+        member: false,
+        follower: true,
+      );
+      await bob.start();
+      await _settleRoom(tester);
+      expect(bob.initialSyncComplete, isTrue);
+      expect(bob.tree.person(rootTreePersonId)!.patronymic, 'Особый сын');
+      expect(bob.tree.person('daughter')!.patronymic, 'Особая дочь');
+      expect(_projection(bob.durableTree), _projection(alice.durableTree));
+      final before = roomHistoryInventory(alice.changes);
+      network.paused = true;
+      await Future.wait([
+        alice.setPatronymicOverride(
+          'Илья',
+          male: 'Конкурентный сын',
+          female: 'Конкурентная дочь',
+        ),
+        bob.setPatronymicOverride(' ИЛЬЯ ', male: null, female: null),
+      ]);
+      final concurrent = [
+        ...alice.changes.where((edit) => !before.containsKey(edit.id)),
+        ...bob.changes.where((edit) => !before.containsKey(edit.id)),
+      ];
+      expect(concurrent, hasLength(2));
+      expect(
+        concurrent.map((edit) => jsonDecode(edit.text)['name']),
+        everyElement('илья'),
+      );
+      expect(alice.tree.person('daughter')!.patronymic, 'Конкурентная дочь');
+      expect(bob.tree.person('daughter')!.patronymic, 'Ильинична');
+      network.resume();
+      await _settleRoom(tester);
+      // Bob's entry profile advanced his Lamport clock beyond Alice's base;
+      // his concurrent reset wins, while both immutable operations remain.
+      final override = concurrent.singleWhere((edit) => edit.author == 'alice');
+      final reset = concurrent.singleWhere((edit) => edit.author == 'bob');
+      expect(reset.clock, greaterThanOrEqualTo(override.clock));
+      expect(alice.tree.person(rootTreePersonId)!.patronymic, 'Ильич');
+      expect(alice.tree.person('daughter')!.patronymic, 'Ильинична');
+      expect(alice.tree.patronymicOverrides.keys, ['квентин']);
+      final expected = _projection(alice.tree);
+      final inventory = roomHistoryInventory(alice.changes);
+      expect(_projection(bob.tree), expected);
+      expect(_projection(bob.durableTree), expected);
+      expect(roomHistoryInventory(bob.changes), inventory);
+      expect(inventory.keys, containsAll(concurrent.map((edit) => edit.id)));
+      final stamped = [
+        for (final edit in _treeEdits(alice))
+          StampedTreeOperation(
+            id: edit.id,
+            author: edit.author,
+            clock: edit.clock,
+            createdAt: DateTime.fromMillisecondsSinceEpoch(
+              edit.createdAt,
+              isUtc: true,
+            ),
+            operation: TreeOperation.fromJson(jsonDecode(edit.text)),
+          ),
+      ];
+      final replay = TreeDocument();
+      final shuffled = [
+        for (var i = 1; i < stamped.length; i += 2) stamped[i],
+        for (var i = 0; i < stamped.length; i += 2) stamped[i],
+      ];
+      for (final event in shuffled) {
+        replay.merge([event]);
+      }
+      replay.merge(stamped.reversed);
+      expect(_projection(replay), expected);
+      alice.dispose();
+      bob.dispose();
+      await _settle(tester);
+      network.autoRegister = false;
+      for (final entry in [('alice', aliceStore), ('bob', bobStore)]) {
+        final reopened = session(actor: entry.$1, storage: entry.$2);
+        await reopened.start();
+        expect(_projection(reopened.tree), expected);
+        expect(_projection(reopened.durableTree), expected);
+        expect(roomHistoryInventory(reopened.changes), inventory);
+      }
     },
   );
 
@@ -1292,6 +1532,12 @@ void main() {
           'scope': 'family',
           'familyKey': bob.tree.surnameFamilyKey(rootTreePersonId),
         }),
+        bob.tree.setPatronymicOverride(
+          'Илья',
+          male: 'Ильич',
+          female: 'Ильинична',
+        ),
+        bob.tree.setPatronymicOverride('Илья', male: null, female: null),
         bob.tree.setIndividualSurname(rootTreePersonId, text: 'Нельзя'),
         bob.tree.setMaidenSurname(rootTreePersonId, text: 'Нельзя'),
         TreeOperation.fromJson({
@@ -1311,6 +1557,14 @@ void main() {
       }
       await expectLater(
         bob.editTreeText(rootTreePersonId, TreeTextField.name, 'Нельзя'),
+        throwsStateError,
+      );
+      await expectLater(
+        bob.setPatronymicOverride('Илья', male: 'Ильич', female: 'Ильинична'),
+        throwsStateError,
+      );
+      await expectLater(
+        bob.setPatronymicOverride('Илья', male: null, female: null),
         throwsStateError,
       );
       for (final id in [rootTreePersonId, 'another', 'missing']) {
@@ -2607,6 +2861,412 @@ void main() {
     },
   );
 
+  for (final incoming in [false, true]) {
+    treeTest(
+      'unnegotiated alive mark in ${incoming ? 'hello' : 'welcome'} is rejected before import',
+      (tester) async {
+        final storage = store();
+        final room = session(
+          actor: 'alice',
+          storage: storage,
+          member: incoming,
+          creator: incoming,
+          follower: !incoming,
+          requireFamilyTree: false,
+        );
+        await room.start();
+        await _settle(tester);
+        final _Channel channel;
+        if (incoming) {
+          channel = _Channel(network, 'old-life');
+          network.registered[room.hostAlias]!.accept(channel);
+        } else {
+          channel = network.channels.single;
+        }
+        channel.openChannel();
+        await _settle(tester);
+        final before = roomHistoryInventory(room.changes);
+        final batchesBefore = storage.batches.length;
+        final packetsBefore = channel.sent.length;
+        channel.receive(
+          RoomMessage(
+            roomId: _roomId,
+            type: incoming ? RoomMessageType.hello : RoomMessageType.welcome,
+            actor: 'old-life',
+            history: [
+              RoomEdit(
+                id: 'unnegotiated-alive',
+                author: 'old-life',
+                clock: 100,
+                createdAt: 100,
+                kind: RoomEditKind.tree,
+                text: jsonEncode(
+                  room.tree.setValue(rootTreePersonId, 'alive', false).toJson(),
+                ),
+              ),
+            ],
+            online: incoming ? null : 2,
+            hosting: incoming ? null : true,
+            roomMetadata: true,
+            roomRoles: true,
+            familyTree: true,
+            familySurnames: true,
+            personalSurnames: true,
+            explicitSiblings: true,
+            patronymics: true,
+            authorHistory: true,
+            participantIdentity: true,
+            durableSync: true,
+          ).toJson(),
+        );
+        await _settle(tester);
+        expect(channel.disposed, isTrue);
+        expect(channel.sent, hasLength(packetsBefore));
+        expect(room.joined, incoming);
+        expect(roomHistoryInventory(room.changes), before);
+        expect(storage.batches, hasLength(batchesBefore));
+        expect(room.tree.person(rootTreePersonId)!.alive, isNull);
+        expect(
+          room.log.any((line) => line.contains('отметка о жизни')),
+          isTrue,
+        );
+      },
+    );
+  }
+
+  treeTest('known alive history rejects an old hello before import', (
+    tester,
+  ) async {
+    final storage = store();
+    final host = session(
+      actor: 'alice',
+      storage: storage,
+      creator: true,
+      requireFamilyTree: false,
+    );
+    await host.start();
+    await _settle(tester);
+    await host.applyTreeOperation(
+      host.tree.setValue(rootTreePersonId, 'alive', true),
+    );
+    expect(host.tree.person(rootTreePersonId)!.alive, isTrue);
+    final before = roomHistoryInventory(host.changes);
+    final batchesBefore = storage.batches.length;
+    final inbound = _Channel(network, 'old-life');
+    network.registered[host.hostAlias]!.accept(inbound);
+    inbound.openChannel();
+    inbound.receive(
+      RoomMessage(
+        roomId: _roomId,
+        type: RoomMessageType.hello,
+        actor: 'old-life',
+        history: const [
+          RoomEdit(
+            id: 'do-not-import',
+            author: 'old-life',
+            clock: 100,
+            createdAt: 100,
+            text: 'Private old history',
+          ),
+        ],
+        roomMetadata: true,
+        roomRoles: true,
+        familyTree: true,
+        familySurnames: true,
+        personalSurnames: true,
+        explicitSiblings: true,
+        patronymics: true,
+        authorHistory: true,
+        participantIdentity: true,
+        durableSync: true,
+      ).toJson(),
+    );
+    await _settle(tester);
+    expect(inbound.disposed, isTrue);
+    expect(roomHistoryInventory(host.changes), before);
+    expect(storage.batches, hasLength(batchesBefore));
+    expect(host.tree.person(rootTreePersonId)!.alive, isTrue);
+    expect(host.log.any((line) => line.contains('отметку')), isTrue);
+  });
+
+  for (final incoming in [false, true]) {
+    for (final reset in [false, true]) {
+      treeTest(
+        'unnegotiated patronymic ${reset ? 'reset' : 'override'} in ${incoming ? 'hello' : 'welcome'} is rejected before import',
+        (tester) async {
+          final storage = store();
+          final room = session(
+            actor: 'alice',
+            storage: storage,
+            member: incoming,
+            creator: incoming,
+            follower: !incoming,
+            requireFamilyTree: false,
+          );
+          await room.start();
+          await _settle(tester);
+          final _Channel channel;
+          if (incoming) {
+            channel = _Channel(network, 'old-patronymics');
+            network.registered[room.hostAlias]!.accept(channel);
+          } else {
+            channel = network.channels.single;
+          }
+          channel.openChannel();
+          await _settle(tester);
+          expect(room.tree.patronymicOverrides, isEmpty);
+          final before = roomHistoryInventory(room.changes);
+          final batchesBefore = storage.batches.length;
+          final authoredBefore = storage.authoredBatches.length;
+          final membershipBefore = storage.membershipCalls;
+          final packetsBefore = channel.sent.length;
+          channel.receive(
+            RoomMessage(
+              roomId: _roomId,
+              type: incoming ? RoomMessageType.hello : RoomMessageType.welcome,
+              actor: 'old-patronymics',
+              history: [
+                RoomEdit(
+                  id: 'unnegotiated-dictionary-handshake',
+                  author: 'old-patronymics',
+                  clock: 100,
+                  createdAt: 100,
+                  kind: RoomEditKind.tree,
+                  text: jsonEncode(
+                    room.tree
+                        .setPatronymicOverride(
+                          'Илья',
+                          male: reset ? null : 'Особый сын',
+                          female: reset ? null : 'Особая дочь',
+                        )
+                        .toJson(),
+                  ),
+                ),
+              ],
+              online: incoming ? null : 2,
+              hosting: incoming ? null : true,
+              roomMetadata: true,
+              roomRoles: true,
+              familyTree: true,
+              familySurnames: true,
+              personalSurnames: true,
+              explicitSiblings: true,
+              authorHistory: true,
+              participantIdentity: true,
+              durableSync: true,
+            ).toJson(),
+          );
+          await _settle(tester);
+          expect(channel.disposed, isTrue);
+          expect(channel.sent, hasLength(packetsBefore));
+          expect(room.joined, incoming);
+          expect(roomHistoryInventory(room.changes), before);
+          expect(storage.batches, hasLength(batchesBefore));
+          expect(storage.authoredBatches, hasLength(authoredBefore));
+          expect(storage.membershipCalls, membershipBefore);
+          expect(room.durableTree.patronymicOverrides, isEmpty);
+          expect(room.log.any((line) => line.contains('отчества')), isTrue);
+        },
+      );
+    }
+  }
+
+  for (final kind in ['pending', 'losing', 'reset']) {
+    treeTest(
+      'known $kind patronymic history rejects old hello before preview or import',
+      (tester) async {
+        final storage = store();
+        final host = session(
+          actor: 'alice',
+          storage: storage,
+          creator: true,
+          requireFamilyTree: false,
+        );
+        await host.start();
+        await _settle(tester);
+        if (kind != 'reset') {
+          storage.failAppend = kind == 'pending';
+          final saved = host.setPatronymicOverride(
+            'Илья',
+            male: 'Особый сын',
+            female: 'Особая дочь',
+          );
+          if (kind == 'pending') {
+            await expectLater(saved, throwsStateError);
+          } else {
+            await saved;
+          }
+        }
+        if (kind != 'pending') {
+          await host.setPatronymicOverride('Илья', male: null, female: null);
+          expect(host.tree.patronymicOverrides, isEmpty);
+        }
+        final before = roomHistoryInventory(host.changes);
+        final batchesBefore = storage.batches.length;
+        final authoredBefore = storage.authoredBatches.length;
+        final inbound = _Channel(network, 'old-patronymics');
+        network.registered[host.hostAlias]!.accept(inbound);
+        inbound.openChannel();
+        inbound.receive(
+          RoomMessage(
+            roomId: _roomId,
+            type: RoomMessageType.hello,
+            actor: 'old-patronymics',
+            history: const [
+              RoomEdit(
+                id: 'do-not-import',
+                author: 'old-patronymics',
+                clock: 100,
+                createdAt: 100,
+                text: 'Private old history',
+              ),
+            ],
+            roomMetadata: true,
+            roomRoles: true,
+            familyTree: true,
+            familySurnames: true,
+            personalSurnames: true,
+            explicitSiblings: true,
+            authorHistory: true,
+            participantIdentity: true,
+            durableSync: true,
+          ).toJson(),
+        );
+        await _settle(tester);
+        expect(inbound.disposed, isTrue);
+        expect(inbound.sent, isEmpty);
+        expect(roomHistoryInventory(host.changes), before);
+        expect(storage.batches, hasLength(batchesBefore));
+        expect(storage.authoredBatches, hasLength(authoredBefore));
+        expect(
+          host.log.any(
+            (line) => line.contains('отчества') && line.contains('Обновите'),
+          ),
+          isTrue,
+        );
+      },
+    );
+  }
+
+  for (final incoming in [false, true]) {
+    for (final kind in ['override', 'reset', 'ordinaryAfterPending']) {
+      treeTest(
+        'established old patronymic peer blocks ${incoming ? 'incoming' : 'outgoing'} $kind',
+        (tester) async {
+          final storage = store();
+          final host = session(
+            actor: 'alice',
+            storage: storage,
+            creator: true,
+            requireFamilyTree: false,
+          );
+          await host.start();
+          await _settle(tester);
+          final inbound = _Channel(network, 'old-patronymics');
+          network.registered[host.hostAlias]!.accept(inbound);
+          inbound.openChannel();
+          inbound.receive(
+            RoomMessage(
+              roomId: _roomId,
+              type: RoomMessageType.hello,
+              actor: 'old-patronymics',
+              history: const [],
+              roomMetadata: true,
+              roomRoles: true,
+              familyTree: true,
+              familySurnames: true,
+              personalSurnames: true,
+              explicitSiblings: true,
+              authorHistory: true,
+              participantIdentity: true,
+            ).toJson(),
+          );
+          await _settle(tester);
+          expect(inbound.disposed, isFalse);
+          final welcome = _channelMessages(
+            inbound,
+          ).singleWhere((message) => message.type == RoomMessageType.welcome);
+          expect(welcome.patronymics, isTrue);
+          if (kind == 'ordinaryAfterPending') {
+            storage.failAppend = true;
+            await expectLater(
+              host.setPatronymicOverride(
+                'Илья',
+                male: 'Особый сын',
+                female: 'Особая дочь',
+              ),
+              throwsStateError,
+            );
+            expect(inbound.disposed, isFalse);
+          }
+          final before = roomHistoryInventory(host.changes);
+          final batchesBefore = storage.batches.length;
+          final packetsBefore = inbound.sent.length;
+          if (incoming) {
+            inbound.receive(
+              RoomMessage(
+                roomId: _roomId,
+                type: RoomMessageType.edits,
+                actor: 'old-patronymics',
+                history: [
+                  RoomEdit(
+                    id: 'unnegotiated-patronymics',
+                    author: 'old-patronymics',
+                    clock: 100,
+                    createdAt: 100,
+                    text: kind == 'ordinaryAfterPending'
+                        ? 'Ordinary text must also be rejected'
+                        : jsonEncode(
+                            host.tree
+                                .setPatronymicOverride(
+                                  'Илья',
+                                  male: kind == 'reset' ? null : 'Особый сын',
+                                  female: kind == 'reset'
+                                      ? null
+                                      : 'Особая дочь',
+                                )
+                                .toJson(),
+                          ),
+                    kind: kind == 'ordinaryAfterPending'
+                        ? RoomEditKind.text
+                        : RoomEditKind.tree,
+                  ),
+                ],
+              ).toJson(),
+            );
+          } else if (kind == 'ordinaryAfterPending') {
+            // Empty ongoing presence must not bypass the new room requirement.
+            await tester.pump(const Duration(seconds: 5));
+          } else {
+            await host.setPatronymicOverride(
+              'Илья',
+              male: kind == 'reset' ? null : 'Особый сын',
+              female: kind == 'reset' ? null : 'Особая дочь',
+            );
+          }
+          await _settle(tester);
+          expect(inbound.disposed, isTrue);
+          expect(inbound.sent, hasLength(packetsBefore));
+          expect(
+            _channelMessages(inbound)
+                .expand((message) => message.history)
+                .where(
+                  (edit) =>
+                      edit.kind == RoomEditKind.tree &&
+                      jsonDecode(edit.text)['type'] == 'setPatronymicOverride',
+                ),
+            isEmpty,
+          );
+          if (incoming) {
+            expect(roomHistoryInventory(host.changes), before);
+            expect(storage.batches, hasLength(batchesBefore));
+          }
+          expect(host.log.any((line) => line.contains('отчества')), isTrue);
+        },
+      );
+    }
+  }
+
   treeTest(
     'production identity admission rejects a fully capable older welcome before history or membership',
     (tester) async {
@@ -2639,6 +3299,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          patronymics: true,
           explicitSiblings: true,
           authorHistory: true,
           durableSync: true,
@@ -2685,6 +3346,7 @@ void main() {
             familyTree: true,
             familySurnames: true,
             personalSurnames: true,
+            patronymics: true,
             explicitSiblings: true,
             authorHistory: true,
             durableSync: true,
@@ -2729,6 +3391,7 @@ void main() {
               familyTree: true,
               familySurnames: true,
               personalSurnames: true,
+              patronymics: true,
               explicitSiblings: true,
               authorHistory: true,
             ).toJson(),
@@ -2830,6 +3493,7 @@ void main() {
           participantIdentity: true,
           familySurnames: true,
           personalSurnames: true,
+          patronymics: true,
           explicitSiblings: true,
           durableSync: true,
         ).toJson(),
@@ -2884,6 +3548,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          patronymics: true,
           authorHistory: true,
           participantIdentity: true,
           durableSync: true,
@@ -2955,6 +3620,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          patronymics: true,
           authorHistory: true,
           participantIdentity: true,
           durableSync: true,
@@ -2998,6 +3664,7 @@ void main() {
             familyTree: true,
             familySurnames: true,
             personalSurnames: true,
+            patronymics: true,
             authorHistory: true,
             participantIdentity: true,
           ).toJson(),

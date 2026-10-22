@@ -154,6 +154,8 @@ class RoomMessage {
     this.familySurnames = false,
     this.personalSurnames = false,
     this.explicitSiblings = false,
+    this.patronymics = false,
+    this.lifeStatus = false,
     this.authorHistory = false,
     this.participantIdentity = false,
     this.diskSync = false,
@@ -205,6 +207,12 @@ class RoomMessage {
   /// Atomic sibling creation, exact-claim unlink, and component-wide parents.
   final bool explicitSiblings;
 
+  /// Room-wide patronymic dictionary overrides, including explicit resets.
+  final bool patronymics;
+
+  /// Explicit living/unknown death mark. Older readers reject the `alive` field.
+  final bool lifeStatus;
+
   /// Complete, contiguous same-author history proofs. Legacy readers discard
   /// these fields and must never receive proof-bearing records.
   final bool authorHistory;
@@ -244,6 +252,8 @@ class RoomMessage {
     if (familySurnames) 'familySurnames': true,
     if (personalSurnames) 'personalSurnames': true,
     if (explicitSiblings) 'explicitSiblings': true,
+    if (patronymics) 'patronymics': true,
+    if (lifeStatus) 'lifeStatus': true,
     if (authorHistory) 'authorHistory': true,
     if (participantIdentity) 'participantIdentity': true,
     if (diskSync) 'diskSync': true,
@@ -359,6 +369,18 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
       'Неверная поддержка прямых связей братьев и сестёр',
     );
   }
+  final patronymics = value['patronymics'] ?? false;
+  if (patronymics is! bool ||
+      (value.containsKey('patronymics') && value['patronymics'] is! bool) ||
+      (patronymics && !handshake)) {
+    throw const FormatException('Неверная поддержка отчеств');
+  }
+  final lifeStatus = value['lifeStatus'] ?? false;
+  if (lifeStatus is! bool ||
+      (value.containsKey('lifeStatus') && value['lifeStatus'] is! bool) ||
+      (lifeStatus && !handshake)) {
+    throw const FormatException('Неверная поддержка отметки о жизни');
+  }
   final authorHistory = value['authorHistory'] ?? false;
   if (authorHistory is! bool ||
       (value.containsKey('authorHistory') && value['authorHistory'] is! bool) ||
@@ -469,6 +491,8 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
     familySurnames: familySurnames,
     personalSurnames: personalSurnames,
     explicitSiblings: explicitSiblings,
+    patronymics: patronymics,
+    lifeStatus: lifeStatus,
     authorHistory: authorHistory,
     participantIdentity: participantIdentity,
     diskSync: diskSync,

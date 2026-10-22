@@ -253,6 +253,7 @@ void main() {
     bool fullScreen = false,
     Size size = const Size(480, 1100),
     ThemeData? theme,
+    ValueNotifier<TreeNameMode>? nameMode,
   }) async {
     tester.view.physicalSize = size;
     tester.view.devicePixelRatio = 1;
@@ -264,6 +265,7 @@ void main() {
         home: Scaffold(
           body: PersonBiography(
             session: session,
+            nameMode: nameMode,
             personId: id,
             onSelect: onSelect ?? (_) {},
             onClose: onClose ?? () {},
@@ -355,10 +357,19 @@ void main() {
     await visibleTap(tester, find.byKey(const Key('add-relative')));
   }
 
+  Future<void> chooseFromTree(WidgetTester tester) async {
+    final pick = find.byKey(const Key('relative-pick-from-tree'));
+    if (pick.evaluate().isEmpty) {
+      await tester.tap(find.widgetWithText(ChoiceChip, 'Из дерева'));
+      await tester.pumpAndSettle();
+    }
+  }
+
   Future<void> chooseExisting(WidgetTester tester, String name) async {
     pickedExistingId = session.tree.people.values
         .singleWhere((person) => person.name == name)
         .id;
+    await chooseFromTree(tester);
     await tester.tap(find.byKey(const Key('relative-pick-from-tree')));
     await tester.pumpAndSettle();
     pickedExistingId = null;
@@ -536,6 +547,146 @@ void main() {
     expect(closed, 1);
     expect(session.operations, isEmpty);
   });
+
+  testWidgets(
+    'name mode updates identity relatives binding and inherited surname hints live without edits',
+    (tester) async {
+      session.seed(
+        session.tree.editText(rootTreePersonId, TreeTextField.name, 'Анна')!,
+      );
+      session.seed(session.tree.setValue(rootTreePersonId, 'sex', 'female'));
+      session.seed(
+        session.tree.createPerson(
+          'grandfather',
+          name: 'Пётр',
+          sex: TreeSex.male,
+        ),
+      );
+      session.seed(
+        session.tree.createPerson('father', name: 'Иван', sex: TreeSex.male),
+      );
+      session.seed(session.tree.setValue('father', 'fatherId', 'grandfather'));
+      session.seed(
+        session.tree.setIndividualSurname(
+          'father',
+          text: 'Иванов',
+          decline: true,
+        ),
+      );
+      session.seed(
+        session.tree.setValue(rootTreePersonId, 'fatherId', 'father'),
+      );
+      session.seed(
+        session.tree.createPerson('sister', name: 'Ольга', sex: TreeSex.female),
+      );
+      session.seed(session.tree.setValue('sister', 'fatherId', 'father'));
+      final nameMode = ValueNotifier(TreeNameMode.givenSurname);
+      addTearDown(nameMode.dispose);
+      final peopleBefore = session.tree.people;
+      await mount(tester, nameMode: nameMode);
+      expect(find.text('Анна Иванова'), findsOneWidget);
+      expect(find.widgetWithText(ActionChip, 'Иван Иванов'), findsOneWidget);
+      expect(find.widgetWithText(ActionChip, 'Ольга Иванова'), findsOneWidget);
+      await visibleTap(tester, find.byKey(const Key('this-is-me')));
+      expect(
+        find.text('Связать ваш профиль с «Анна Иванова»?'),
+        findsOneWidget,
+      );
+      nameMode.value = TreeNameMode.surnameGivenPatronymic;
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Связать ваш профиль с «Иванова Анна Ивановна»?'),
+        findsOneWidget,
+      );
+      await tester.tap(find.text('Отмена'));
+      await tester.pumpAndSettle();
+      expect(find.text('Иванова Анна Ивановна'), findsOneWidget);
+      expect(
+        find.widgetWithText(ActionChip, 'Иванов Иван Петрович'),
+        findsOneWidget,
+      );
+      expect(
+        find.widgetWithText(ActionChip, 'Иванова Ольга Ивановна'),
+        findsOneWidget,
+      );
+      await edit(tester);
+      final name = find.byKey(const Key('person-name-field'));
+      final surname = find.byKey(const Key('person-surname-field'));
+      final nameController = tester.widget<TextField>(name).controller!;
+      final surnameController = tester.widget<TextField>(surname).controller!;
+      expect(nameController.text, 'Анна');
+      expect(surnameController.text, isEmpty);
+      expect(
+        tester.widget<TextField>(surname).decoration!.helperText,
+        'Наследуется от отца: Иванов Иван Петрович',
+      );
+      expect(
+        find.byWidgetPredicate(
+          (widget) =>
+              widget is TextField && widget.decoration?.labelText == 'Отчество',
+        ),
+        findsNothing,
+      );
+      expect(
+        find.widgetWithText(InputChip, 'Иванов Иван Петрович'),
+        findsOneWidget,
+      );
+      nameMode.value = TreeNameMode.givenSurname;
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(name).controller, same(nameController));
+      expect(
+        tester.widget<TextField>(surname).controller,
+        same(surnameController),
+      );
+      expect(nameController.text, 'Анна');
+      expect(surnameController.text, isEmpty);
+      expect(
+        tester.widget<TextField>(surname).decoration!.helperText,
+        'Наследуется от отца: Иван Иванов',
+      );
+      expect(session.operations, isEmpty);
+      expect(session.tree.people, same(peopleBefore));
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      nameMode.value = TreeNameMode.surnameGivenPatronymic;
+      nameMode.addListener(() {});
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  for (final hasFather in [false, true]) {
+    testWidgets(
+      'FIO has no patronymic gaps with ${hasFather ? 'unknown sex' : 'no father'}',
+      (tester) async {
+        session.seed(
+          session.tree.editText(rootTreePersonId, TreeTextField.name, 'Саша')!,
+        );
+        session.seed(
+          session.tree.setIndividualSurname(rootTreePersonId, text: 'Седых'),
+        );
+        if (hasFather) {
+          session.seed(
+            session.tree.createPerson(
+              'father',
+              name: 'Иван',
+              sex: TreeSex.male,
+            ),
+          );
+          session.seed(
+            session.tree.setValue(rootTreePersonId, 'fatherId', 'father'),
+          );
+        } else {
+          session.seed(session.tree.setValue(rootTreePersonId, 'sex', 'male'));
+        }
+        final nameMode = ValueNotifier(TreeNameMode.surnameGivenPatronymic);
+        addTearDown(nameMode.dispose);
+        await mount(tester, nameMode: nameMode);
+        expect(find.text('Седых Саша'), findsOneWidget);
+        expect(session.operations, isEmpty);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
 
   testWidgets('a missing person is handled without editing or binding', (
     tester,
@@ -939,7 +1090,7 @@ void main() {
   });
 
   for (final size in [const Size(390, 844), const Size(1100, 900)]) {
-    testWidgets('one new-only sibling choice precedes child at $size', (
+    testWidgets('sibling choice precedes child and mutes from-tree at $size', (
       tester,
     ) async {
       await mount(tester, size: size, fullScreen: size.width < 900);
@@ -949,10 +1100,38 @@ void main() {
       ).items!.map((item) => (item.child as Text).data).toList();
       expect(labels, ['Отца', 'Мать', 'Брат/сестра', 'Ребёнка']);
       expect(labels.where((label) => label == 'Брат/сестра'), hasLength(1));
+      final chips = tester
+          .widgetList<ChoiceChip>(
+            find.descendant(
+              of: find.byType(AlertDialog),
+              matching: find.byType(ChoiceChip),
+            ),
+          )
+          .toList();
+      expect(chips.map((chip) => (chip.label as Text).data).toList(), [
+        'Новый человек',
+        'Из дерева',
+      ]);
+      expect(chips.first.selected, isTrue);
+      expect(find.byKey(const Key('relative-new-name')), findsOneWidget);
       await chooseRelativeKind(tester, 'Брат/сестра');
       await relativeFrames(tester);
-      expect(find.text('Из дерева'), findsNothing);
-      expect(find.text('Новый человек'), findsNothing);
+      final siblingChips = tester
+          .widgetList<ChoiceChip>(
+            find.descendant(
+              of: find.byType(AlertDialog),
+              matching: find.byType(ChoiceChip),
+            ),
+          )
+          .toList();
+      expect(siblingChips.map((chip) => (chip.label as Text).data).toList(), [
+        'Новый человек',
+        'Из дерева',
+      ]);
+      expect(siblingChips.first.selected, isTrue);
+      expect(siblingChips.first.onSelected, isNotNull);
+      expect(siblingChips.last.selected, isFalse);
+      expect(siblingChips.last.onSelected, isNull);
       expect(find.byKey(const Key('relative-pick-from-tree')), findsNothing);
       expect(
         dropdown<TreeSex>(tester, newRelativeSex()).value,
@@ -975,7 +1154,7 @@ void main() {
     for (final parentMask in [0, 1, 2, 3]) {
       final delayed = parentMask.isEven;
       testWidgets(
-        'atomic sibling creation sex=${sex.name} copies live parents mask=$parentMask, new-only frames delayed=$delayed',
+        'atomic sibling creation sex=${sex.name} copies live parents mask=$parentMask, muted from-tree frames delayed=$delayed',
         (tester) async {
           session.seed(session.tree.createPerson('father', name: 'Отец'));
           session.seed(session.tree.createPerson('mother', name: 'Мать'));
@@ -996,8 +1175,24 @@ void main() {
           await openRelative(tester);
           await chooseRelativeKind(tester, 'Брат/сестра');
           await relativeFrames(tester);
-          expect(find.text('Из дерева'), findsNothing);
-          expect(find.text('Новый человек'), findsNothing);
+          expect(find.text('Из дерева'), findsOneWidget);
+          expect(find.text('Новый человек'), findsOneWidget);
+          expect(
+            tester
+                .widget<ChoiceChip>(
+                  find.widgetWithText(ChoiceChip, 'Из дерева'),
+                )
+                .onSelected,
+            isNull,
+          );
+          expect(
+            tester
+                .widget<ChoiceChip>(
+                  find.widgetWithText(ChoiceChip, 'Новый человек'),
+                )
+                .selected,
+            isTrue,
+          );
           expect(
             find.byKey(const Key('relative-pick-from-tree')),
             findsNothing,
@@ -1379,6 +1574,7 @@ void main() {
         },
       );
       await openRelative(tester);
+      await chooseFromTree(tester);
       final stalePick = tester
           .widget<OutlinedButton>(
             find.byKey(const Key('relative-pick-from-tree')),
@@ -1942,6 +2138,7 @@ void main() {
           );
           await openRelative(tester);
           if (label != 'Отца') await chooseRelativeKind(tester, label);
+          await chooseFromTree(tester);
           final pick = find.byKey(const Key('relative-pick-from-tree'));
           final openPicker = tester.widget<OutlinedButton>(pick).onPressed!;
           if (createNew) {
@@ -2038,6 +2235,7 @@ void main() {
       );
       await openRelative(tester);
       if (label != 'Отца') await chooseRelativeKind(tester, label);
+      await chooseFromTree(tester);
       await tester.tap(find.byKey(const Key('relative-pick-from-tree')));
       await tester.pumpAndSettle();
       final stale = session.tree.person('candidate')!;
@@ -2184,6 +2382,7 @@ void main() {
         );
         await openRelative(tester);
         await chooseRelativeKind(tester, 'Ребёнка');
+        await chooseFromTree(tester);
         final pick = find.byKey(const Key('relative-pick-from-tree'));
         await tester.tap(pick);
         await tester.pumpAndSettle();
@@ -2327,6 +2526,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Мать').last);
     await tester.pumpAndSettle();
+    await chooseFromTree(tester);
     final pick = find.byKey(const Key('relative-pick-from-tree'));
     expect(tester.widget<OutlinedButton>(pick).onPressed, isNotNull);
     expect(find.widgetWithText(OutlinedButton, 'Выбрать'), findsOneWidget);
@@ -2455,6 +2655,7 @@ void main() {
       },
     );
     await openRelative(tester);
+    await chooseFromTree(tester);
     final pick = find.byKey(const Key('relative-pick-from-tree'));
     for (final (role, allowed) in const [
       ('Отца', ['man', 'unknown', 'ancestor']),
@@ -2505,6 +2706,7 @@ void main() {
         },
       );
       await openRelative(tester);
+      await chooseFromTree(tester);
       await tester.tap(find.byKey(const Key('relative-pick-from-tree')));
       await tester.pumpAndSettle();
       expect(filter(stalePerson), isTrue);
@@ -2532,6 +2734,7 @@ void main() {
     var result = Completer<String?>();
     await mount(tester, onPickFromTree: (_, _) => result.future);
     await openRelative(tester);
+    await chooseFromTree(tester);
     final pick = find.byKey(const Key('relative-pick-from-tree'));
     await tester.tap(pick);
     await tester.pumpAndSettle();
@@ -2578,6 +2781,7 @@ void main() {
       },
     );
     await openRelative(tester);
+    await chooseFromTree(tester);
     final pick = find.byKey(const Key('relative-pick-from-tree'));
     await tester.tap(pick);
     await tester.pumpAndSettle();
@@ -2996,6 +3200,77 @@ void main() {
     expect(session.tree.person(rootTreePersonId)!.motherId, isNull);
   });
 
+  testWidgets('death date distinguishes living from unknown', (tester) async {
+    session.seed(
+      session.tree.setValue(rootTreePersonId, 'birthDate', '1980-05-06'),
+    );
+    await mount(tester);
+    expect(find.text('06.05.1980 — жив'), findsOneWidget);
+    expect(find.byKey(const Key('person-alive')), findsNothing);
+    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–н.в.');
+    await edit(tester);
+    expect(
+      tester.widget<ChoiceChip>(find.byKey(const Key('person-alive'))).selected,
+      isTrue,
+    );
+    expect(
+      tester
+          .widget<ChoiceChip>(find.byKey(const Key('person-death-unknown')))
+          .selected,
+      isFalse,
+    );
+    await tester.tap(find.byKey(const Key('person-death-unknown')));
+    await tester.pumpAndSettle();
+    expect(session.tree.person(rootTreePersonId)!.alive, isFalse);
+    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–?');
+    expect(session.operations.single.fieldKey, 'alive');
+    await tester.tap(find.byKey(const Key('person-alive')));
+    await tester.pumpAndSettle();
+    expect(session.tree.person(rootTreePersonId)!.alive, isTrue);
+    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–н.в.');
+    await tester.tap(find.byKey(const Key('person-death-date')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('OK'));
+    await tester.pumpAndSettle();
+    final dated = session.tree.person(rootTreePersonId)!;
+    expect(dated.deathDate, DateTime.utc(1970));
+    expect(dated.alive, isNull);
+    expect(dated.lifeYears, '1980–1970');
+    expect(
+      tester.widget<ChoiceChip>(find.byKey(const Key('person-alive'))).selected,
+      isFalse,
+    );
+    expect(
+      tester
+          .widget<ChoiceChip>(find.byKey(const Key('person-death-unknown')))
+          .selected,
+      isFalse,
+    );
+    await tester.tap(find.byTooltip('Убрать дату смерти'));
+    await tester.pumpAndSettle();
+    final cleared = session.tree.person(rootTreePersonId)!;
+    expect(cleared.deathDate, isNull);
+    expect(cleared.alive, isFalse);
+    expect(cleared.lifeYears, '1980–?');
+    expect(
+      tester
+          .widget<ChoiceChip>(find.byKey(const Key('person-death-unknown')))
+          .selected,
+      isTrue,
+    );
+    await tester.tap(find.byKey(const Key('biography-edit-toggle')));
+    await tester.pumpAndSettle();
+    expect(find.text('06.05.1980 — не известно'), findsOneWidget);
+    expect(session.operations.map((operation) => operation.fieldKey), [
+      'alive',
+      'alive',
+      'deathDate',
+      'alive',
+      'deathDate',
+      'alive',
+    ]);
+  });
+
   testWidgets('descendants cannot be selected as parents', (tester) async {
     session.seed(session.tree.createPerson('child', name: 'Потомок'));
     session.seed(session.tree.setValue('child', 'fatherId', rootTreePersonId));
@@ -3011,6 +3286,7 @@ void main() {
     );
     await edit(tester);
     await visibleTap(tester, find.byKey(const Key('add-relative')));
+    await chooseFromTree(tester);
     final pick = find.byKey(const Key('relative-pick-from-tree'));
     expect(tester.widget<OutlinedButton>(pick).onPressed, isNotNull);
     expect(find.textContaining('Нет подходящих людей'), findsOneWidget);

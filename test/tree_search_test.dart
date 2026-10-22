@@ -27,6 +27,32 @@ Map<String, TreePerson> _map(Iterable<TreePerson> people) => {
   for (final person in people) person.id: person,
 };
 
+TreeDocument _patronymicFamily() {
+  final tree = TreeDocument();
+  var clock = 0;
+  void apply(TreeOperation operation) => tree.merge([
+    StampedTreeOperation(
+      id: 'family-${++clock}',
+      author: 'actor',
+      clock: clock,
+      createdAt: DateTime.utc(2026),
+      operation: operation,
+    ),
+  ]);
+  apply(tree.createPerson('father', name: 'Иван', sex: TreeSex.male));
+  apply(tree.setIndividualSurname('father', text: 'Иванов', decline: true));
+  for (final (id, name, sex) in const [
+    ('son', 'Алексей', TreeSex.male),
+    ('daughter', 'Анна', TreeSex.female),
+    ('unknown', 'Саша', TreeSex.unknown),
+  ]) {
+    apply(tree.createPerson(id, name: name, sex: sex));
+    apply(tree.setValue(id, 'fatherId', 'father'));
+  }
+  apply(tree.createPerson('no-father', name: 'Мария', sex: TreeSex.female));
+  return tree;
+}
+
 Finder get _field => find.byKey(const Key('tree-search-field'));
 Finder _option(String id) => find.byKey(ValueKey('tree-search-option-$id'));
 
@@ -300,6 +326,25 @@ void main() {
       },
     );
 
+    test(
+      'matches computed male and female patronymics from accepted father',
+      () {
+        final tree = _patronymicFamily();
+        final people = tree.people;
+        expect(searchTreePeople(people, 'иванович').map((p) => p.id), ['son']);
+        expect(searchTreePeople(people, 'ИВАНОВНА анна').map((p) => p.id), [
+          'daughter',
+        ]);
+        expect(searchTreePeople(people, 'ивановна алексей'), isEmpty);
+        expect(people['unknown']!.fullNameWithPatronymic, 'Иванов Саша');
+        expect(people['no-father']!.fullNameWithPatronymic, 'Мария');
+        expect(
+          people['unknown']!.fullNameWithPatronymic,
+          isNot(contains('  ')),
+        );
+      },
+    );
+
     test('empty queries and empty maps produce no options', () {
       final people = _map([_person('one')]);
       expect(searchTreePeople(people, ''), isEmpty);
@@ -420,13 +465,13 @@ void main() {
       expect(_option('anna'), findsNothing);
       expect(find.text('Ничего не найдено'), findsOneWidget);
       await _query(tester, 'иванова');
-      expect(find.text('Анна Петровна Иванова'), findsOneWidget);
-      expect(find.text('Иванова Анна Петровна'), findsNothing);
+      expect(find.text('Иванова Анна Петровна'), findsOneWidget);
+      expect(find.text('Анна Петровна Иванова'), findsNothing);
       expect(find.text('1930–2010'), findsOneWidget);
       expect(find.textContaining('до замужества'), findsNothing);
       final semantics = tester.widget<Semantics>(_option('anna')).properties;
       expect(semantics.button, isTrue);
-      expect(semantics.label, 'Анна Петровна Иванова, 1930–2010');
+      expect(semantics.label, 'Иванова Анна Петровна, 1930–2010');
       await tester.tap(_option('anna'));
       await tester.pumpAndSettle();
       expect(selected, ['anna']);
@@ -434,6 +479,32 @@ void main() {
       expect(field.controller!.text, isEmpty);
       expect(field.focusNode!.hasFocus, isFalse);
       expect(_option('anna'), findsNothing);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'results always show FIO with automatic patronymics and no gaps',
+    (tester) async {
+      final people = ValueNotifier(_patronymicFamily().people);
+      await _mount(tester, people, []);
+      for (final (id, query, label) in const [
+        ('son', 'иванович', 'Иванов Алексей Иванович'),
+        ('daughter', 'ИВАНОВНА', 'Иванова Анна Ивановна'),
+        ('unknown', 'саша', 'Иванов Саша'),
+        ('no-father', 'мария', 'Мария'),
+      ]) {
+        await _query(tester, query);
+        expect(_option(id), findsOneWidget);
+        expect(
+          find.descendant(of: _option(id), matching: find.text(label)),
+          findsOneWidget,
+        );
+        expect(
+          tester.widget<Semantics>(_option(id)).properties.label,
+          '$label, ?–?',
+        );
+      }
       expect(tester.takeException(), isNull);
     },
   );

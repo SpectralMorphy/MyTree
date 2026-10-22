@@ -33,6 +33,7 @@ class PersonBiography extends StatefulWidget {
     required this.onClose,
     this.fullScreen = false,
     this.onPickFromTree,
+    this.nameMode,
   });
 
   final RoomSession session;
@@ -41,12 +42,17 @@ class PersonBiography extends StatefulWidget {
   final VoidCallback onClose;
   final bool fullScreen;
   final PickTreePerson? onPickFromTree;
+  final ValueNotifier<TreeNameMode>? nameMode;
 
   @override
   State<PersonBiography> createState() => _PersonBiographyState();
 }
 
 class _PersonBiographyState extends State<PersonBiography> {
+  final _localNameMode = ValueNotifier(TreeNameMode.givenSurname);
+  ValueNotifier<TreeNameMode> get _nameMode =>
+      widget.nameMode ?? _localNameMode;
+
   bool _editing = false;
   bool _binding = false;
   bool _deleting = false;
@@ -57,11 +63,16 @@ class _PersonBiographyState extends State<PersonBiography> {
   void initState() {
     super.initState();
     widget.session.addListener(_sessionChanged);
+    _nameMode.addListener(_nameModeChanged);
   }
 
   @override
   void didUpdateWidget(PersonBiography oldWidget) {
     super.didUpdateWidget(oldWidget);
+    if (oldWidget.nameMode != widget.nameMode) {
+      (oldWidget.nameMode ?? _localNameMode).removeListener(_nameModeChanged);
+      _nameMode.addListener(_nameModeChanged);
+    }
     if (oldWidget.session != widget.session) {
       oldWidget.session.removeListener(_sessionChanged);
       widget.session.addListener(_sessionChanged);
@@ -73,6 +84,8 @@ class _PersonBiographyState extends State<PersonBiography> {
     }
   }
 
+  void _nameModeChanged() => setState(() {});
+
   void _sessionChanged() {
     if (!mounted) return;
     setState(() {
@@ -83,6 +96,8 @@ class _PersonBiographyState extends State<PersonBiography> {
   @override
   void dispose() {
     widget.session.removeListener(_sessionChanged);
+    _nameMode.removeListener(_nameModeChanged);
+    _localNameMode.dispose();
     super.dispose();
   }
 
@@ -130,20 +145,25 @@ class _PersonBiographyState extends State<PersonBiography> {
     }
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Это вы?'),
-        content: Text('Связать ваш профиль с «${person.fullName}»?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Отмена'),
+      builder: (context) => ListenableBuilder(
+        listenable: _nameMode,
+        builder: (context, _) => AlertDialog(
+          title: const Text('Это вы?'),
+          content: Text(
+            'Связать ваш профиль с «${person.nameForMode(_nameMode.value)}»?',
           ),
-          FilledButton(
-            key: const Key('confirm-person-binding'),
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Да, это я'),
-          ),
-        ],
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Отмена'),
+            ),
+            FilledButton(
+              key: const Key('confirm-person-binding'),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Да, это я'),
+            ),
+          ],
+        ),
       ),
     );
     if (confirmed != true || !mounted) return;
@@ -156,15 +176,58 @@ class _PersonBiographyState extends State<PersonBiography> {
     final current = birth ? person.birthDate : person.deathDate;
     final picked = await _pickDate(context, current);
     if (picked == null || !mounted) return;
-    await _act(
-      () => widget.session.applyTreeOperation(
-        widget.session.tree.setValue(
+    await _act(() async {
+      final session = widget.session;
+      await session.applyTreeOperation(
+        session.tree.setValue(
           person.id,
           birth ? 'birthDate' : 'deathDate',
           _dateValue(picked),
         ),
-      ),
-    );
+      );
+      // A chosen death date replaces either explicit mark. Leaving `alive`
+      // set would make clearing the date fall back to "living".
+      if (!birth && session.tree.person(person.id)?.alive != null) {
+        await session.applyTreeOperation(
+          session.tree.setValue(person.id, 'alive', null),
+        );
+      }
+    });
+  }
+
+  Future<void> _markAlive(TreePerson person, {required bool alive}) async {
+    await _act(() async {
+      final session = widget.session;
+      final current = session.tree.person(person.id);
+      if (current == null || !session.canEdit) return;
+      if (current.deathDate != null) {
+        await session.applyTreeOperation(
+          session.tree.setValue(person.id, 'deathDate', null),
+        );
+      }
+      if (session.tree.person(person.id)?.alive != alive) {
+        await session.applyTreeOperation(
+          session.tree.setValue(person.id, 'alive', alive),
+        );
+      }
+    });
+  }
+
+  Future<void> _clearDeathDate(TreePerson person) async {
+    await _act(() async {
+      final session = widget.session;
+      if (session.tree.person(person.id)?.deathDate != null) {
+        await session.applyTreeOperation(
+          session.tree.setValue(person.id, 'deathDate', null),
+        );
+      }
+      // Removing a date must not imply the person is alive.
+      if (session.tree.person(person.id)?.alive != false) {
+        await session.applyTreeOperation(
+          session.tree.setValue(person.id, 'alive', false),
+        );
+      }
+    });
   }
 
   void _album() {
@@ -183,6 +246,7 @@ class _PersonBiographyState extends State<PersonBiography> {
       context: context,
       builder: (context) => _AddRelativeDialog(
         session: widget.session,
+        nameMode: _nameMode,
         personId: widget.personId,
         onPickFromTree: widget.onPickFromTree,
       ),
@@ -535,11 +599,12 @@ class _PersonBiographyState extends State<PersonBiography> {
             key: ValueKey('surname-editor-${person.id}'),
             session: widget.session,
             person: person,
+            nameMode: _nameMode.value,
             onError: _report,
           ),
         ] else ...[
           SelectableText(
-            person.fullName,
+            person.nameForMode(_nameMode.value),
             style: Theme.of(context).textTheme.headlineSmall,
             textAlign: TextAlign.center,
           ),
@@ -583,8 +648,8 @@ class _PersonBiographyState extends State<PersonBiography> {
             },
           ),
           const SizedBox(height: 12),
-          _editableDate(person, birth: true),
-          _editableDate(person, birth: false),
+          _birthDate(person),
+          _deathDate(person),
         ] else ...[
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -611,35 +676,88 @@ class _PersonBiographyState extends State<PersonBiography> {
     );
   }
 
-  Widget _editableDate(TreePerson person, {required bool birth}) {
-    final date = birth ? person.birthDate : person.deathDate;
-    final label = birth ? 'Дата рождения' : 'Дата смерти';
+  Widget _birthDate(TreePerson person) {
+    final date = person.birthDate;
     return Row(
       children: [
         Expanded(
           child: OutlinedButton.icon(
-            key: Key(birth ? 'person-birth-date' : 'person-death-date'),
-            onPressed: () => _date(person, birth: birth),
+            key: const Key('person-birth-date'),
+            onPressed: () => _date(person, birth: true),
             icon: const Icon(Icons.calendar_today_outlined, size: 18),
             label: Text(
-              '$label: ${date == null ? 'не указана' : _dateLabel(date)}',
+              'Дата рождения: ${date == null ? 'не указана' : _dateLabel(date)}',
             ),
           ),
         ),
         if (date != null)
           IconButton(
-            tooltip: 'Убрать ${label.toLowerCase()}',
+            tooltip: 'Убрать дату рождения',
             onPressed: () => _act(
               () => widget.session.applyTreeOperation(
-                widget.session.tree.setValue(
-                  person.id,
-                  birth ? 'birthDate' : 'deathDate',
-                  null,
-                ),
+                widget.session.tree.setValue(person.id, 'birthDate', null),
               ),
             ),
             icon: const Icon(Icons.clear, size: 18),
           ),
+      ],
+    );
+  }
+
+  /// Null when a death date is set, so neither choice looks selected.
+  /// Legacy records with only a birth date still read as living.
+  bool? _shownAlive(TreePerson person) {
+    if (person.deathDate != null) return null;
+    return person.alive ?? person.birthDate != null;
+  }
+
+  Widget _deathDate(TreePerson person) {
+    final shown = _shownAlive(person);
+    final date = person.deathDate;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            ChoiceChip(
+              key: const Key('person-alive'),
+              label: const Text('Жив'),
+              selected: shown == true,
+              onSelected: (_) => _markAlive(person, alive: true),
+            ),
+            ChoiceChip(
+              key: const Key('person-death-unknown'),
+              label: const Text('Не известно'),
+              selected: shown == false,
+              onSelected: (_) => _markAlive(person, alive: false),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                key: const Key('person-death-date'),
+                onPressed: () => _date(person, birth: false),
+                icon: const Icon(Icons.calendar_today_outlined, size: 18),
+                label: Text(
+                  date == null
+                      ? 'Дата смерти'
+                      : 'Дата смерти: ${_dateLabel(date)}',
+                ),
+              ),
+            ),
+            if (date != null)
+              IconButton(
+                tooltip: 'Убрать дату смерти',
+                onPressed: () => _clearDeathDate(person),
+                icon: const Icon(Icons.clear, size: 18),
+              ),
+          ],
+        ),
       ],
     );
   }
@@ -763,7 +881,7 @@ class _PersonBiographyState extends State<PersonBiography> {
                       size: 18,
                       color: _sexColor(relative.sex),
                     ),
-                    label: Text(relative.fullName),
+                    label: Text(relative.nameForMode(_nameMode.value)),
                     onPressed: () => widget.onSelect(relative.id),
                   )
                 else
@@ -774,7 +892,7 @@ class _PersonBiographyState extends State<PersonBiography> {
                       size: 18,
                       color: _sexColor(relative.sex),
                     ),
-                    label: Text(relative.fullName),
+                    label: Text(relative.nameForMode(_nameMode.value)),
                     onPressed: () => widget.onSelect(relative.id),
                     deleteIcon: const Icon(Icons.close, size: 18),
                     deleteButtonTooltipMessage: deleteTooltip,
@@ -890,11 +1008,13 @@ class _SurnameEditor extends StatefulWidget {
     super.key,
     required this.session,
     required this.person,
+    required this.nameMode,
     required this.onError,
   });
 
   final RoomSession session;
   final TreePerson person;
+  final TreeNameMode nameMode;
   final ValueChanged<Object> onError;
 
   @override
@@ -1021,7 +1141,7 @@ class _SurnameEditorState extends State<_SurnameEditor> {
             helperText: _explicitSnapshot != null
                 ? 'Указана для этого человека'
                 : father?.effectiveSurname != null
-                ? 'Наследуется от отца: ${father!.fullName}'
+                ? 'Наследуется от отца: ${father!.nameForMode(widget.nameMode)}'
                 : 'Не указана',
             helperMaxLines: 3,
             border: const OutlineInputBorder(),
@@ -1279,10 +1399,12 @@ class _AddRelativeDialog extends StatefulWidget {
     required this.session,
     required this.personId,
     required this.onPickFromTree,
+    required this.nameMode,
   });
   final RoomSession session;
   final String personId;
   final PickTreePerson? onPickFromTree;
+  final ValueNotifier<TreeNameMode> nameMode;
 
   @override
   State<_AddRelativeDialog> createState() => _AddRelativeDialogState();
@@ -1291,7 +1413,7 @@ class _AddRelativeDialog extends StatefulWidget {
 class _AddRelativeDialogState extends State<_AddRelativeDialog> {
   final _name = TextEditingController();
   _RelativeKind _kind = _RelativeKind.father;
-  bool _newPerson = false;
+  bool _newPerson = true;
   String? _existingId;
   String? _createdId;
   TreeSex _sex = TreeSex.male;
@@ -1611,7 +1733,7 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
 
   @override
   Widget build(BuildContext context) => ListenableBuilder(
-    listenable: widget.session,
+    listenable: Listenable.merge([widget.session, widget.nameMode]),
     builder: (context, _) {
       final tree = widget.session.tree;
       final hasCandidates = tree.people.values.any(_canPick);
@@ -1693,48 +1815,53 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
                           setState(() {
                             _kind = kind;
                             _existingId = null;
+                            // A sibling is always a new person. Keep that choice
+                            // selected so the muted "from tree" chip is not shown
+                            // as the current one.
+                            if (kind == _RelativeKind.sibling) {
+                              _newPerson = true;
+                            }
                             _sex = _fixedSex ?? TreeSex.unknown;
                             _error = null;
                           });
                         },
                 ),
                 const SizedBox(height: 12),
-                if (!_isSibling) ...[
-                  Wrap(
-                    spacing: 8,
-                    children: [
-                      ChoiceChip(
-                        label: const Text('Из дерева'),
-                        selected: !_newPerson,
-                        onSelected:
-                            _busy ||
-                                _createdId != null ||
-                                _submittedLink != null
-                            ? null
-                            : (_) {
-                                if (!_isSibling && _createdId == null) {
-                                  setState(() => _newPerson = false);
-                                }
-                              },
-                      ),
-                      ChoiceChip(
-                        label: const Text('Новый человек'),
-                        selected: _newPerson,
-                        onSelected:
-                            _busy ||
-                                _createdId != null ||
-                                _submittedLink != null
-                            ? null
-                            : (_) {
-                                if (!_isSibling && _createdId == null) {
-                                  setState(() => _newPerson = true);
-                                }
-                              },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                ],
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('Новый человек'),
+                      selected: _newPerson,
+                      onSelected:
+                          _busy || _createdId != null || _submittedLink != null
+                          ? null
+                          : (_) {
+                              if (_createdId == null) {
+                                setState(() => _newPerson = true);
+                              }
+                            },
+                    ),
+                    ChoiceChip(
+                      label: const Text('Из дерева'),
+                      selected: !_newPerson,
+                      // Siblings stay new people. The choice remains visible,
+                      // but muted, so an existing person cannot be selected.
+                      onSelected:
+                          _busy ||
+                              _createdId != null ||
+                              _submittedLink != null ||
+                              _isSibling
+                          ? null
+                          : (_) {
+                              if (!_isSibling && _createdId == null) {
+                                setState(() => _newPerson = false);
+                              }
+                            },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
                 if (!_createsNewPerson) ...[
                   OutlinedButton(
                     key: const Key('relative-pick-from-tree'),
@@ -1753,7 +1880,7 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
                     const SizedBox(height: 8),
                     Text(
                       [
-                        selected.fullName,
+                        selected.nameForMode(widget.nameMode.value),
                         if (selected.lifeYears.isNotEmpty) selected.lifeYears,
                       ].join('\n'),
                       key: const Key('relative-selected-person'),
@@ -2309,10 +2436,21 @@ String _dateValue(DateTime date) =>
 String _dateLabel(DateTime date) =>
     '${date.day.toString().padLeft(2, '0')}.${date.month.toString().padLeft(2, '0')}.${date.year.toString().padLeft(4, '0')}';
 String _lifeDates(TreePerson person) {
-  if (person.birthDate == null && person.deathDate == null) {
+  final living = person.deathDate != null
+      ? null
+      : person.alive ?? person.birthDate != null;
+  if (person.birthDate == null && person.deathDate == null && living != true) {
     return 'Даты жизни не указаны';
   }
-  return '${person.birthDate == null ? 'Дата рождения неизвестна' : _dateLabel(person.birthDate!)}${person.deathDate == null ? '' : ' — ${_dateLabel(person.deathDate!)}'}';
+  final birth = person.birthDate == null
+      ? 'Дата рождения неизвестна'
+      : _dateLabel(person.birthDate!);
+  final death = person.deathDate != null
+      ? _dateLabel(person.deathDate!)
+      : living == true
+      ? 'жив'
+      : 'не известно';
+  return '$birth — $death';
 }
 
 Future<DateTime?> _pickDate(BuildContext context, DateTime? current) =>

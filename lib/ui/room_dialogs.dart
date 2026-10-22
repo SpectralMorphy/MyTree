@@ -756,9 +756,14 @@ class RoomParticipantsButton extends StatelessWidget {
 }
 
 class RoomParticipantsDialog extends StatefulWidget {
-  const RoomParticipantsDialog({super.key, required this.session});
+  const RoomParticipantsDialog({
+    super.key,
+    required this.session,
+    this.nameMode = TreeNameMode.givenSurname,
+  });
 
   final RoomSession session;
+  final TreeNameMode nameMode;
 
   @override
   State<RoomParticipantsDialog> createState() => _RoomParticipantsDialogState();
@@ -866,6 +871,10 @@ class _RoomParticipantsDialogState extends State<RoomParticipantsDialog> {
                             for (final person in participants)
                               _ParticipantAvatar(
                                 person: person,
+                                boundPersonName: session.durableTree
+                                        .person(person.personId ?? '')
+                                        ?.nameForMode(widget.nameMode) ??
+                                    person.boundPersonFullName,
                                 onPressed:
                                     !_saving &&
                                         !person.isSelf &&
@@ -921,9 +930,15 @@ class _RoomParticipantsDialogState extends State<RoomParticipantsDialog> {
 }
 
 class _ParticipantAvatar extends StatelessWidget {
-  const _ParticipantAvatar({required this.person, this.onPressed, this.action});
+  const _ParticipantAvatar({
+    required this.person,
+    this.boundPersonName,
+    this.onPressed,
+    this.action,
+  });
 
   final RoomParticipant person;
+  final String? boundPersonName;
   final VoidCallback? onPressed;
   final String? action;
 
@@ -944,7 +959,7 @@ class _ParticipantAvatar extends StatelessWidget {
     )..layout(maxWidth: tileWidth - tilePadding * 2);
     final truncated = nameLayout.didExceedMaxLines;
     nameLayout.dispose();
-    final fullName = person.boundPersonFullName;
+    final fullName = boundPersonName;
     final tooltip = [
       if (truncated) person.name,
       if (fullName != null &&
@@ -1158,7 +1173,9 @@ class RoomChangesDialog extends StatelessWidget {
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            operation != null
+                            operation?.isRoomScoped == true
+                                ? operation!.toJson()['name'] as String
+                                : operation != null
                                 ? session.tree
                                           .person(operation.personId)
                                           ?.displayName ??

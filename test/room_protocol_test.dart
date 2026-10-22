@@ -178,6 +178,7 @@ void main() {
       expect(encoded.containsKey('familySurnames'), isFalse);
       expect(encoded.containsKey('personalSurnames'), isFalse);
       expect(encoded.containsKey('explicitSiblings'), isFalse);
+      expect(encoded.containsKey('patronymics'), isFalse);
       expect(encoded.containsKey('authorHistory'), isFalse);
       expect(encoded.containsKey('participantIdentity'), isFalse);
       expect(encoded.containsKey('diskSync'), isFalse);
@@ -538,6 +539,160 @@ void main() {
       expect(decoded.history.single.toJson(), edit.toJson());
       expect(roomEditDigest(decoded.history.single), roomEditDigest(edit));
       expect(jsonDecode(decoded.history.single.text), op.toJson());
+    },
+  );
+
+  test('lifeStatus is an independent optional handshake capability', () {
+    for (final type in RoomMessageType.values) {
+      final raw = _message(type: type).toJson();
+      expect(raw.containsKey('lifeStatus'), isFalse);
+      expect(decodeRoomMessage(raw, roomId: _roomId).lifeStatus, isFalse);
+      expect(
+        decodeRoomMessage({
+          ...raw,
+          'lifeStatus': false,
+        }, roomId: _roomId).toJson(),
+        raw,
+      );
+      if (type == RoomMessageType.hello || type == RoomMessageType.welcome) {
+        final message = RoomMessage(
+          roomId: _roomId,
+          type: type,
+          actor: 'remote',
+          history: const [],
+          lifeStatus: true,
+          online: type == RoomMessageType.welcome ? 1 : null,
+          hosting: type == RoomMessageType.welcome ? true : null,
+        );
+        final decoded = decodeRoomMessage(
+          encodeRoomMessage(message).single,
+          roomId: _roomId,
+        );
+        expect(decoded.lifeStatus, isTrue);
+        expect(decoded.patronymics, isFalse);
+        expect(decoded.toJson(), message.toJson());
+      } else {
+        expect(
+          () =>
+              decodeRoomMessage({...raw, 'lifeStatus': true}, roomId: _roomId),
+          throwsFormatException,
+        );
+      }
+      for (final invalid in <Object?>[null, 0, 1, 'true', []]) {
+        expect(
+          () => decodeRoomMessage({
+            ...raw,
+            'lifeStatus': invalid,
+          }, roomId: _roomId),
+          throwsFormatException,
+          reason: '$type: $invalid',
+        );
+      }
+    }
+  });
+
+  test('patronymics is an independent optional handshake capability', () {
+    for (final type in RoomMessageType.values) {
+      final raw = _message(type: type).toJson();
+      expect(raw.containsKey('patronymics'), isFalse);
+      expect(decodeRoomMessage(raw, roomId: _roomId).patronymics, isFalse);
+      expect(
+        decodeRoomMessage({
+          ...raw,
+          'patronymics': false,
+        }, roomId: _roomId).toJson(),
+        raw,
+      );
+      if (type == RoomMessageType.hello || type == RoomMessageType.welcome) {
+        final message = RoomMessage(
+          roomId: _roomId,
+          type: type,
+          actor: 'remote',
+          history: const [],
+          patronymics: true,
+          online: type == RoomMessageType.welcome ? 1 : null,
+          hosting: type == RoomMessageType.welcome ? true : null,
+        );
+        final decoded = decodeRoomMessage(
+          encodeRoomMessage(message).single,
+          roomId: _roomId,
+        );
+        expect(decoded.patronymics, isTrue);
+        expect(decoded.familyTree, isFalse);
+        expect(decoded.toJson(), message.toJson());
+      } else {
+        expect(
+          () =>
+              decodeRoomMessage({...raw, 'patronymics': true}, roomId: _roomId),
+          throwsFormatException,
+        );
+      }
+      for (final invalid in <Object?>[
+        null,
+        0,
+        1,
+        1.0,
+        'true',
+        'false',
+        [],
+        {},
+      ]) {
+        expect(
+          () => decodeRoomMessage({
+            ...raw,
+            'patronymics': invalid,
+          }, roomId: _roomId),
+          throwsFormatException,
+          reason: '$type: $invalid',
+        );
+      }
+    }
+  });
+
+  test(
+    'room dictionary overrides and resets preserve immutable wire records',
+    () {
+      for (final reset in [false, true]) {
+        final operation = TreeDocument().setPatronymicOverride(
+          ' ПЁТР ',
+          male: reset ? null : ' Петрович ',
+          female: reset ? null : ' Петровна ',
+        );
+        expect(operation.isRoomScoped, isTrue);
+        expect(operation.personId, isEmpty);
+        expect(operation.toJson(), {
+          'type': 'setPatronymicOverride',
+          'name': 'петр',
+          'male': reset ? null : 'Петрович',
+          'female': reset ? null : 'Петровна',
+        });
+        final edit = RoomEdit(
+          id: reset ? 'dictionary-reset' : 'dictionary-override',
+          author: 'remote',
+          clock: 1,
+          createdAt: 2,
+          kind: RoomEditKind.tree,
+          text: jsonEncode(operation.toJson()),
+        );
+        final message = RoomMessage(
+          roomId: _roomId,
+          type: RoomMessageType.hello,
+          actor: 'remote',
+          history: [edit],
+          patronymics: true,
+        );
+        final encoded = encodeRoomMessage(message).single;
+        expect(encoded['v'], 1);
+        final decoded = decodeRoomMessage(encoded, roomId: _roomId);
+        expect(decoded.history.single.toJson(), edit.toJson());
+        expect(roomEditDigest(decoded.history.single), roomEditDigest(edit));
+        expect(
+          TreeOperation.fromJson(
+            jsonDecode(decoded.history.single.text),
+          ).toJson(),
+          operation.toJson(),
+        );
+      }
     },
   );
 

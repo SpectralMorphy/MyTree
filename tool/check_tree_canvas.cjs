@@ -1232,6 +1232,12 @@ async function type(page, field, text) {
   await until(async () => await activeInputValue(page) === text, 'The actual native input lost or reordered typed characters.', 10000);
 }
 
+async function useExistingRelative(page) {
+  const dialog = page.getByRole('alertdialog');
+  await dialog.getByRole('checkbox', { name: 'Из дерева', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Выбрать', exact: true }).waitFor();
+}
+
 async function relativeTreeSelection(page, seeded, label) {
   await loadRoom(page, seeded);
   const original = await snapshot(page, seeded, `${label}-relative-original`);
@@ -1246,6 +1252,7 @@ async function relativeTreeSelection(page, seeded, label) {
     const action = page.getByRole('button', { name: 'Добавить родственника', exact: true });
     await revealBiography(page, action);
     await action.click();
+    await useExistingRelative(page);
     await pick.waitFor();
     assert.equal(await pick.count(), 1, 'Existing-relative selection must have exactly one Choose action.');
     assert.equal(await dialog.getByRole('button', { name: /^Человек из дерева/ }).count(), 0,
@@ -1745,6 +1752,7 @@ async function collateralExistingMother(page, seeded, label, child, mother) {
   await action.click();
   const dialog = page.getByRole('alertdialog');
   await chooseKind(page, 'Мать');
+  await dialog.getByRole('checkbox', { name: 'Из дерева', exact: true }).click();
   assert.equal(await dialog.getByRole('checkbox', { name: 'Новый человек', exact: true }).isChecked(), false,
     'Attaching the existing mother must not create a second person.');
   const before = await history(page, seeded);
@@ -2127,6 +2135,7 @@ async function surnamePicker(page, seeded, label) {
   await revealBiography(page, addRelative);
   await addRelative.click();
   const openPicker = async () => {
+    await dialog.getByRole('checkbox', { name: 'Из дерева', exact: true }).click();
     const choose = dialog.getByRole('button', { name: 'Выбрать', exact: true });
     await choose.waitFor();
     assert.equal(await choose.count(), 1);
@@ -2828,9 +2837,12 @@ async function explicitSiblingForm(page, label, kind) {
   await dialog.getByRole('textbox', { name: 'Имя нового человека', exact: true }).waitFor();
   assert.equal(await dialog.getByRole('button', { name: 'Выбрать', exact: true }).count(), 0,
     `${label}: a sibling kind must not offer an existing-person picker.`);
-  for (const name of ['Из дерева', 'Новый человек']) assert.equal(
-    await dialog.getByRole('checkbox', { name, exact: true }).count(), 0,
-    `${label}: a sibling kind unexpectedly exposes source choice chips.`);
+  const fromTree = dialog.getByRole('checkbox', { name: 'Из дерева', exact: true });
+  const fresh = dialog.getByRole('checkbox', { name: 'Новый человек', exact: true });
+  assert.equal(await fromTree.count(), 1, `${label}: the sibling source row must keep from-tree visible.`);
+  assert.equal(await fresh.count(), 1, `${label}: the sibling source row must keep new-person visible.`);
+  assert.equal(await fresh.isChecked(), true, `${label}: a sibling stays on the new person.`);
+  assert.equal(await fromTree.isDisabled(), true, `${label}: from-tree must be muted for a sibling.`);
   await chooseNewPersonSex(page, kind === 'Брат' ? 'Мужской' : 'Женский');
   await dialog.getByRole('button', { name: 'Дата рождения (необязательно)', exact: true }).waitFor();
   await page.screenshot({ path: path.join(output, `${label}-${kind === 'Брат' ? 'brother' : 'sister'}-form.png`), animations: 'disabled' });
@@ -2866,6 +2878,7 @@ async function explicitSiblingParent(page, seeded, source, kind, name, label, ex
   await revealBiography(page, add); await add.click(); await chooseKind(page, kind);
   const dialog = page.getByRole('alertdialog'), field = kind === 'Отца' ? 'fatherId' : 'motherId';
   if (existing) {
+    await dialog.getByRole('checkbox', { name: 'Из дерева', exact: true }).click();
     await dialog.getByRole('button', { name: 'Выбрать', exact: true }).click();
     await page.getByRole('button', { name: 'Отмена выбора', exact: true }).waitFor();
     await select(page, name);
@@ -3376,6 +3389,7 @@ async function pickerZoom(page, seeded, label, touch = false) {
   await openBiography(page, null, true);
   await page.getByRole('button', { name: 'Добавить родственника', exact: true }).click();
   const dialog = page.getByRole('alertdialog');
+  await useExistingRelative(page);
   await dialog.getByRole('button', { name: 'Выбрать', exact: true }).click();
   const cancel = page.getByRole('button', { name: 'Отмена выбора', exact: true });
   await cancel.waitFor();
@@ -4028,6 +4042,7 @@ async function compactToolbarBrowsing(page, seeded, label, portrait) {
   await revealBiography(page, addRelative);
   await addRelative.click();
   const dialog = page.getByRole('alertdialog');
+  await useExistingRelative(page);
   await dialog.getByRole('button', { name: 'Выбрать', exact: true }).click();
   const cancel = page.getByRole('button', { name: 'Отмена выбора', exact: true });
   await cancel.waitFor();
@@ -4146,6 +4161,7 @@ async function compactSearchActions(page, seeded, label, mobile) {
   await revealBiography(page, add);
   await add.click();
   const dialog = page.getByRole('alertdialog');
+  await useExistingRelative(page);
   await dialog.getByRole('button', { name: 'Выбрать', exact: true }).click();
   const cancel = page.getByRole('button', { name: 'Отмена выбора', exact: true });
   await cancel.waitFor();
@@ -5744,7 +5760,12 @@ async function combinedSiblingForm(page, seeded, journal) {
   assert.equal(options.filter((label) => ['Брат', 'Сестра'].includes(label.trim())).length, 0);
   await page.getByRole('menuitem', { name: 'Брат/сестра', exact: true }).click();
   await dialog.getByRole('textbox', { name: 'Имя нового человека', exact: true }).waitFor();
-  for (const label of ['Из дерева', 'Новый человек']) assert.equal(await dialog.getByRole('checkbox', { name: label, exact: true }).count(), 0);
+  const fromTree = dialog.getByRole('checkbox', { name: 'Из дерева', exact: true });
+  const fresh = dialog.getByRole('checkbox', { name: 'Новый человек', exact: true });
+  assert.equal(await fromTree.count(), 1);
+  assert.equal(await fresh.count(), 1);
+  assert.equal(await fresh.isChecked(), true);
+  assert.equal(await fromTree.isDisabled(), true);
   assert.equal(await dialog.getByRole('button', { name: 'Выбрать', exact: true }).count(), 0);
   await dialog.getByRole('button', { name: 'Дата рождения (необязательно)', exact: true }).waitFor();
   assert.match(await dialog.getByRole('button', { name: /^Пол(?:\s|$)/ }).getAttribute('aria-label') || '', /Пол не указан/);
