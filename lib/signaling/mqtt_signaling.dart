@@ -40,8 +40,13 @@ abstract interface class MqttSignalingBus {
   Future<void> connect(Uri endpoint, String clientId);
   Future<void> subscribe(String topic);
   void publish(String topic, String payload);
+
+  /// Terminal; completes only after this bus and any pending connection retire.
+  /// A closed bus must never be reused by a later registration attempt.
   Future<void> close();
 }
+
+typedef MqttSignalingBusFactory = MqttSignalingBus Function();
 
 class MqttSignalingMessage {
   const MqttSignalingMessage(this.topic, this.payload, {this.retained = false});
@@ -59,12 +64,16 @@ typedef MqttRtcFactory =
 /// This clean-session, non-retained election is best-effort alias collision
 /// detection, NOT atomic reservation or authorization. A public broker can
 /// observe SDP/IP metadata and anybody can publish to its topics.
-class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
+class MqttSignalingPeer
+    implements SignalingPeer, SignalingDiscovery, SignalingRecovery {
   MqttSignalingPeer({
     required this.id,
     required Map<String, dynamic> config,
     Uri? endpoint,
     MqttSignalingBus? bus,
+    // A bus is single-use. Recovery needs a fresh bus, never a new RTC owner.
+    // An injected bus alone intentionally cannot be restarted after close.
+    MqttSignalingBusFactory? busFactory,
     MqttRtcFactory? rtcFactory,
     String? instanceId,
     // Opt in only for cryptographically random runtime IDs, never room aliases.
@@ -72,12 +81,16 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
     bool ephemeralIdentity = false,
   }) : endpoint = endpoint ?? Uri.parse('wss://test.mosquitto.org:8081/mqtt'),
        _configuration = Map<String, dynamic>.from(config),
-       _bus = bus ?? _ClientMqttBus(),
+       _bus = bus ?? (busFactory ?? _ClientMqttBus.new)(),
+       _busFactory = busFactory ?? (bus == null ? _ClientMqttBus.new : null),
        _rtcFactory = rtcFactory ?? ((config) => createPeerConnection(config)),
        _claimWindow = ephemeralIdentity && isValidRoomId(id)
            ? _ephemeralClaimDelay
            : _claimDelay,
        _instance = instanceId ?? createRoomId() {
+    if (bus != null && busFactory != null) {
+      throw ArgumentError('Provide either bus or busFactory, not both');
+    }
     if (!_validId(id)) throw ArgumentError.value(id, 'id');
     if (!_validToken(_instance)) {
       throw ArgumentError.value(instanceId, 'instanceId');
@@ -94,7 +107,8 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
   final String id;
   final Uri endpoint;
   final Map<String, dynamic> _configuration;
-  final MqttSignalingBus _bus;
+  MqttSignalingBus _bus;
+  final MqttSignalingBusFactory? _busFactory;
   final MqttRtcFactory _rtcFactory;
   final Duration _claimWindow;
   final String _instance;
@@ -122,6 +136,12 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
   bool _claiming = false;
   bool _open = false;
   bool _closeEmitted = false;
+  bool _registered = false;
+  bool _conflict = false;
+  bool _recovering = false;
+  int _registrationEpoch = 0;
+  Future<void>? _registrationWork;
+  Future<void>? _busRetirement;
 
   @override
   String get service =>
@@ -149,41 +169,97 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
   void start() {
     if (_started || _disposed || _stopped) return;
     _started = true;
-    _discoveryChanges.add(null);
-    _messages = _bus.messages.listen(
-      _receive,
-      onError: (_) => _unavailable(),
-      onDone: () {
-        if (!_disposed && !_stopped) _unavailable();
-      },
-    );
-    _busDisconnects = _bus.onDisconnected.listen((_) => _unavailable());
-    unawaited(_start());
+    _beginRegistration();
   }
 
-  Future<void> _start() async {
+  bool _currentRegistration(int epoch) =>
+      !_disposed && !_stopped && epoch == _registrationEpoch;
+
+  void _beginRegistration() {
+    final epoch = ++_registrationEpoch;
+    final bus = _bus;
+    _discoveryChanges.add(null);
+    _messages = bus.messages.listen(
+      (message) {
+        if (_currentRegistration(epoch)) _receive(message);
+      },
+      onError: (_) {
+        if (_currentRegistration(epoch)) _unavailable();
+      },
+      onDone: () {
+        if (_currentRegistration(epoch)) _unavailable();
+      },
+    );
+    _busDisconnects = bus.onDisconnected.listen((_) {
+      if (_currentRegistration(epoch)) _unavailable();
+    });
+    _registrationWork = _start(bus, epoch);
+    unawaited(_registrationWork);
+  }
+
+  @override
+  void reconnect() {
+    if (!_started ||
+        !_registered ||
+        !_stopped ||
+        _disposed ||
+        _conflict ||
+        _recovering ||
+        _busFactory == null) {
+      return;
+    }
+    _recovering = true;
+    final epoch = ++_registrationEpoch;
+    unawaited(_recoverRegistration(epoch));
+  }
+
+  Future<void> _recoverRegistration(int epoch) async {
+    try {
+      // Wait for both startup and socket retirement. In particular a timed-out
+      // native handshake must not finish beside a replacement registration.
+      await _registrationWork;
+      await _busRetirement;
+      if (_disposed || _conflict || epoch != _registrationEpoch) return;
+      final bus = _busFactory!();
+      _stopped = false;
+      _closeEmitted = false;
+      _claiming = false;
+      _contenders.clear();
+      _bus = bus;
+      _busRetirement = null;
+      _beginRegistration();
+    } catch (_) {
+      if (_disposed || _conflict || epoch != _registrationEpoch) return;
+      // If retirement failed, do not risk opening a replacement socket.
+      _recovering = false;
+      if (!_stopped) _unavailable();
+    }
+  }
+
+  Future<void> _start(MqttSignalingBus bus, int epoch) async {
     try {
       // The logical alias is deliberately NOT the MQTT client identifier.
-      await _bus.connect(endpoint, 'mytree-$_instance');
-      if (_disposed || _stopped) return;
+      await bus.connect(endpoint, 'mytree-$_instance');
+      if (!_currentRegistration(epoch)) return;
       // Issue both subscriptions in one network round trip, but never probe
       // or begin admission before both subscriptions have been acknowledged.
       await Future.wait<void>([
-        _bus.subscribe(_topic(id, 'mailbox')),
-        _bus.subscribe(_topic(id, 'presence')),
+        bus.subscribe(_topic(id, 'mailbox')),
+        bus.subscribe(_topic(id, 'presence')),
       ]);
-      if (_disposed || _stopped) return;
-      _presence('probe');
+      if (!_currentRegistration(epoch)) return;
+      if (!_presence('probe')) return;
       _probeTimer = Timer(_probeDelay, () {
-        if (_disposed || _stopped) return;
+        if (!_currentRegistration(epoch)) return;
         _claiming = true;
         _contenders.add(_instance);
-        _presence('claim');
-        if (_stopped) return;
-        _claimTimer = Timer(_claimWindow, _confirmClaim);
+        if (!_presence('claim')) return;
+        _claimTimer = Timer(_claimWindow, () {
+          if (_currentRegistration(epoch)) _confirmClaim();
+        });
       });
     } catch (_) {
-      _unavailable();
+      if (_currentRegistration(epoch)) _unavailable();
     }
   }
 
@@ -194,8 +270,9 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
       return;
     }
     _open = true;
-    _presence('owner');
-    if (_stopped) return;
+    if (!_presence('owner')) return;
+    _registered = true;
+    _recovering = false;
     _heartbeat = Timer.periodic(
       const Duration(seconds: 3),
       (_) => _presence('owner'),
@@ -204,15 +281,14 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
     _opens.add(id);
   }
 
-  void _presence(String type, {String? recipient}) {
-    _publish(_topic(id, 'presence'), {
-      'v': 1,
-      'type': type,
-      'from': id,
-      'instance': _instance,
-      if (recipient != null) 'recipient': recipient,
-    });
-  }
+  bool _presence(String type, {String? recipient}) =>
+      _publish(_topic(id, 'presence'), {
+        'v': 1,
+        'type': type,
+        'from': id,
+        'instance': _instance,
+        if (recipient != null) 'recipient': recipient,
+      });
 
   bool _publish(String topic, Map<String, dynamic> packet) {
     if (_disposed || _stopped) return false;
@@ -505,6 +581,9 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
   void _stop(SignalingFailure failure) {
     if (_disposed || _stopped) return;
     _stopped = true;
+    _conflict = failure.kind == SignalingFailureKind.idTaken;
+    _recovering = false;
+    _registrationEpoch++;
     _open = false;
     _cancelSignaling();
     _discoveryChanges.add(null);
@@ -519,7 +598,16 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
       // Signaling loss must not terminate an established encrypted RTC link.
       if (!channel.open) channel._fail(failure);
     }
-    unawaited(_bus.close());
+    _retireBus();
+  }
+
+  void _retireBus() {
+    final retirement = _busRetirement ??= Future<void>.sync(_bus.close);
+    // Preserve a failed retirement for reconnect(), but never leak an unhandled
+    // error when the owner only disposes this peer instead of recovering it.
+    unawaited(
+      retirement.then<void>((_) {}, onError: (Object _, StackTrace __) {}),
+    );
   }
 
   void _cancelSignaling() {
@@ -550,6 +638,7 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+    _registrationEpoch++;
     _open = false;
     _cancelSignaling();
     _discoveryChanges.add(null);
@@ -557,7 +646,7 @@ class MqttSignalingPeer implements SignalingPeer, SignalingDiscovery {
       channel.dispose();
     }
     _emitClose();
-    unawaited(_bus.close());
+    _retireBus();
     unawaited(_opens.close());
     unawaited(_connections.close());
     unawaited(_errors.close());
@@ -991,6 +1080,8 @@ class _ClientMqttBus implements MqttSignalingBus {
   final _subscriptions = <String, Completer<void>>{};
   MqttClient? _client;
   StreamSubscription<List<MqttReceivedMessage<MqttMessage>>>? _updates;
+  Future<void>? _connecting;
+  Future<void>? _closing;
   bool _closed = false;
 
   @override
@@ -1026,11 +1117,9 @@ class _ClientMqttBus implements MqttSignalingBus {
     final connecting = client.connect();
     // Future.timeout cannot abort the library's native websocket handshake.
     // If it completes after disposal/timeout, immediately close the late socket.
-    unawaited(
-      connecting.then<void>((_) {
-        if (_closed) _disconnectClient();
-      }, onError: (Object _, StackTrace __) {}),
-    );
+    _connecting = connecting.then<void>((_) {
+      if (_closed) _disconnectClient();
+    }, onError: (Object _, StackTrace __) {});
     await connecting.timeout(const Duration(seconds: 8));
     if (_closed) {
       _disconnectClient();
@@ -1110,8 +1199,9 @@ class _ClientMqttBus implements MqttSignalingBus {
   }
 
   @override
-  Future<void> close() async {
-    if (_closed) return;
+  Future<void> close() => _closing ??= _close();
+
+  Future<void> _close() async {
     _closed = true;
     _rejectSubscriptions();
     await _updates?.cancel();
@@ -1122,6 +1212,10 @@ class _ClientMqttBus implements MqttSignalingBus {
       client.onSubscribeFail = null;
       _disconnectClient();
     }
+    // A pending native handshake is not abortable. Do not declare retirement
+    // complete (and let an owner reconnect) until its late socket is closed.
+    await _connecting;
+    _disconnectClient();
     await _messages.close();
     await _disconnects.close();
   }

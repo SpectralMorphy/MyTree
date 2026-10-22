@@ -8,13 +8,22 @@ import 'package:peer_rtc/peer_rtc.dart';
 
 mixin _Events {
   final _events = <String?, StreamController<dynamic>>{};
+  bool _emitting = false;
 
   Stream<T> on<T>([String? name]) => _events
       .putIfAbsent(name, () => StreamController<dynamic>.broadcast(sync: true))
       .stream
       .cast<T>();
 
-  void emit<T>(String name, T data) => _events[name]?.add(data);
+  void emit<T>(String name, T data) {
+    final previous = _emitting;
+    _emitting = true;
+    try {
+      _events[name]?.add(data);
+    } finally {
+      _emitting = previous;
+    }
+  }
 
   Future<void> closeEvents() async {
     for (final controller in _events.values) {
@@ -28,7 +37,7 @@ class _Peer with _Events implements Peer {
   _Peer(this.id);
 
   @override
-  final String? id;
+  String? id;
   @override
   final options = PeerOptions(autoReconnect: true);
   @override
@@ -61,6 +70,31 @@ class _Peer with _Events implements Peer {
 
   @override
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+class _RecoveringPeer extends _Peer {
+  _RecoveringPeer(super.id) {
+    options
+      ..autoReconnect = false
+      ..maxRetries = 1;
+  }
+
+  int recoveries = 0;
+  bool recoveryAccepted = true;
+  void Function()? onRecovery;
+
+  @override
+  bool tryReconnect() {
+    recoveries++;
+    onRecovery?.call();
+    return recoveryAccepted;
+  }
+
+  @override
+  void cancelReconnect() {
+    if (_emitting) throw StateError('Reentrant PeerJS cancellation');
+    super.cancelReconnect();
+  }
 }
 
 class _Connection with _Events implements DataConnection {
@@ -344,6 +378,146 @@ void main() {
       expect(peer.open, isFalse);
       expect(raw.disposals, 1);
       expect(raw.reconnectCancellations, 1);
+    },
+  );
+
+  test(
+    'recovery preserves logical ID and the exact live RTC channel',
+    () async {
+      final native = _RecoveringPeer('stable-id');
+      final adapter = PeerJsSignalingPeer(native)..start();
+      final opens = <String?>[];
+      var disconnects = 0;
+      adapter.onOpen.listen(opens.add);
+      adapter.onDisconnected.listen((_) => disconnects++);
+      native.onRecovery = () => native.emit('reconnecting', 0);
+      adapter.reconnect();
+      expect(native.recoveries, 0, reason: 'No confirmed original ID yet');
+      native.open = true;
+      native.emit('open', 'stable-id');
+      final channel = adapter.connect('remote');
+      final connection = native.connections.single..open = true;
+      native
+        ..open = false
+        ..disconnected = true
+        ..id = null;
+      native.emit('disconnected', 'stable-id');
+      expect(adapter.id, 'stable-id');
+      expect(adapter.discoveryComplete, isFalse);
+      adapter.reconnect();
+      adapter.reconnect();
+      native.emit('reconnecting', 1);
+      expect(native.recoveries, 1);
+      expect(disconnects, 1, reason: 'Recovery progress is not another outage');
+      expect(native.disposals, 0);
+      expect(channel.disposed, isFalse);
+      await channel.send({'during': 'registration recovery'});
+      native
+        ..id = 'stable-id'
+        ..open = true
+        ..disconnected = false;
+      native.emit('open', 'stable-id');
+      expect(adapter.open, isTrue);
+      expect(adapter.discoveryComplete, isTrue);
+      adapter.reconnect();
+      expect(native.recoveries, 1);
+      expect(opens, ['stable-id', 'stable-id']);
+      expect(native.connections.single, same(connection));
+      expect(connection.disposals, 0);
+      adapter.dispose();
+      await native.closeEvents();
+      await connection.closeEvents();
+    },
+  );
+
+  test(
+    'failed recovery can be retried, but conflict and disposal are terminal',
+    () async {
+      final native = _RecoveringPeer('stable-id');
+      final adapter = PeerJsSignalingPeer(native)..start();
+      native.open = true;
+      native.emit('open', 'stable-id');
+      native
+        ..open = false
+        ..disconnected = true;
+      native.emit('disconnected', 'stable-id');
+      adapter.reconnect();
+      native.emit('reconnectFailed', null);
+      adapter.reconnect();
+      expect(native.recoveries, 2);
+      native.emit('error', 'ID stable-id is taken');
+      native.open = true;
+      native.emit('open', 'stable-id');
+      native.emit('reconnected', null);
+      adapter.reconnect();
+      expect(adapter.open, isFalse);
+      expect(adapter.discoveryComplete, isFalse);
+      expect(native.recoveries, 2);
+      adapter.dispose();
+      adapter.reconnect();
+      expect(native.recoveries, 2);
+      await native.closeEvents();
+    },
+  );
+
+  test(
+    'recovery conflict cancels outside the synchronous package error callback',
+    () async {
+      final native = _RecoveringPeer('stable-id');
+      final adapter = PeerJsSignalingPeer(native)..start();
+      native.open = true;
+      native.emit('open', 'stable-id');
+      native
+        ..open = false
+        ..disconnected = true;
+      native.emit('disconnected', 'stable-id');
+      adapter.reconnect();
+      final failures = <SignalingFailure>[];
+      adapter.onError.listen(failures.add);
+      native.emit('error', 'ID stable-id is taken');
+      adapter.reconnect();
+      expect(failures.single.kind, SignalingFailureKind.idTaken);
+      expect(adapter.open, isFalse);
+      expect(native.reconnectCancellations, 0);
+      await Future<void>.value();
+      expect(native.reconnectCancellations, 1);
+      expect(native.recoveries, 1);
+      adapter.dispose();
+      await native.closeEvents();
+    },
+  );
+
+  test(
+    'recovery never changes external automatic or multi-attempt options',
+    () async {
+      final native = _RecoveringPeer('stable-id');
+      final adapter = PeerJsSignalingPeer(native)..start();
+      native.open = true;
+      native.emit('open', 'stable-id');
+      native
+        ..open = false
+        ..disconnected = true;
+      native.emit('disconnected', 'stable-id');
+      native.options.maxRetries = 5;
+      adapter.reconnect();
+      expect(native.options.maxRetries, 5);
+      native.options
+        ..maxRetries = 1
+        ..autoReconnect = true;
+      adapter.reconnect();
+      expect(native.options.autoReconnect, isTrue);
+      expect(native.recoveries, 0);
+      native.options.autoReconnect = false;
+      native.recoveryAccepted = false;
+      adapter.reconnect();
+      adapter.reconnect();
+      expect(
+        native.recoveries,
+        2,
+        reason: 'Rejected attempt is not kept pending',
+      );
+      adapter.dispose();
+      await native.closeEvents();
     },
   );
 

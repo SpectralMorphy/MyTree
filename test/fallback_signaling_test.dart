@@ -136,6 +136,25 @@ class _DiscoveringPeer extends _FakePeer implements SignalingDiscovery {
   }
 }
 
+class _RecoveringPeer extends _DiscoveringPeer implements SignalingRecovery {
+  _RecoveringPeer(super.id, super.service);
+
+  int recoveries = 0;
+  void Function()? onRecovery;
+
+  @override
+  void loseSignaling() {
+    discoveryComplete = false;
+    super.loseSignaling();
+  }
+
+  @override
+  void reconnect() {
+    recoveries++;
+    onRecovery?.call();
+  }
+}
+
 class _FakeChannel with _Events implements RoomChannel {
   _FakeChannel(this.peer, this.service);
 
@@ -462,6 +481,204 @@ void main() {
       );
     }
   }
+
+  for (final allOffline in [false, true]) {
+    testSignaling(
+      '${allOffline ? 'whole-wrapper' : 'partial'} recovery retains registered peers and native RTC',
+      (tester) async {
+        final native = [
+          _RecoveringPeer(_id, 'PeerJS'),
+          _RecoveringPeer(_id, 'MQTT'),
+        ];
+        peers.addAll(native);
+        var constructions = 0;
+        final peer = wrapper(
+          providers: [
+            (_, _) {
+              constructions++;
+              return native[0];
+            },
+            (_, _) {
+              constructions++;
+              return native[1];
+            },
+          ],
+        );
+        peer.reconnect();
+        peer.start();
+        native[0].register();
+        native[1].register();
+        final opens = <String?>[];
+        final disconnects = <void>[];
+        peer.onOpen.listen(opens.add);
+        peer.onDisconnected.listen(disconnects.add);
+        final channel = peer.connect('remote');
+        await _settle(tester);
+        final active = native[0].outbound.single..openChannel();
+        native[0].loseSignaling();
+        if (allOffline) native[1].loseSignaling();
+        expect(channel.open, isTrue);
+        expect(disconnects, hasLength(allOffline ? 1 : 0));
+        peer.reconnect();
+        peer.reconnect();
+        await _settle(tester);
+        expect(native[0].recoveries, 1);
+        expect(native[1].recoveries, allOffline ? 1 : 0);
+        expect(constructions, 2);
+        expect(native.map((provider) => provider.starts), [1, 1]);
+        expect(native.every((provider) => !provider.disposed), isTrue);
+        expect(peer.discoveryComplete, isFalse);
+        native[0].register();
+        if (allOffline) native[1].register();
+        await _settle(tester);
+        expect(peer.discoveryComplete, isTrue);
+        expect(peer.open, isTrue);
+        expect(opens, allOffline ? [_id] : isEmpty);
+        expect(channel.open, isTrue);
+        expect(active.disposals, 0);
+        expect(native[0].outbound, [same(active)]);
+        expect(native[1].outbound, isEmpty);
+        await channel.send({'edit': 'same native connection'});
+        expect(active.sent, [
+          {'edit': 'same native connection'},
+        ]);
+        peer.reconnect();
+        await tester.pump(const Duration(seconds: 30));
+        expect(native[0].recoveries, 1);
+        expect(constructions, 2);
+        expect(peer.discoveryComplete, isTrue);
+      },
+    );
+  }
+
+  testSignaling(
+    'recovery does not revive cold retries after whole-wrapper loss',
+    (tester) async {
+      final retained = _RecoveringPeer(_id, 'primary');
+      peers.add(retained);
+      var coldConstructions = 0;
+      final peer = wrapper(
+        providers: [
+          (_, _) => retained,
+          (id, _) {
+            coldConstructions++;
+            final cold = _FakePeer(id, 'cold');
+            peers.add(cold);
+            return cold;
+          },
+        ],
+      )..start();
+      retained.register();
+      await tester.pump(const Duration(seconds: 14));
+      retained.loseSignaling();
+      peer.reconnect();
+      retained.register();
+      await tester.pump(const Duration(minutes: 1));
+      expect(peer.open, isTrue);
+      expect(peer.discoveryComplete, isFalse);
+      expect(retained.recoveries, 1);
+      expect(coldConstructions, 1);
+      expect(retained.disposed, isFalse);
+    },
+  );
+
+  testSignaling(
+    'recovery conflict is terminal and preserves an established RTC',
+    (tester) async {
+      final native = _RecoveringPeer(_id, 'primary');
+      peers.add(native);
+      final peer = wrapper(providers: [(_, _) => native])..start();
+      native.register();
+      final channel = peer.connect('remote');
+      await _settle(tester);
+      final active = native.outbound.single..openChannel();
+      final errors = <SignalingFailure>[];
+      peer.onError.listen(errors.add);
+      native.loseSignaling();
+      peer.reconnect();
+      const conflict = SignalingFailure(
+        SignalingFailureKind.idTaken,
+        'Original ID was occupied while disconnected',
+      );
+      native.fail(conflict);
+      native.register();
+      peer.reconnect();
+      await tester.pump(const Duration(minutes: 1));
+      expect(errors, [same(conflict)]);
+      expect(peer.open, isFalse);
+      expect(peer.discoveryComplete, isFalse);
+      expect(native.recoveries, 1);
+      expect(native.disposed, isFalse);
+      expect(channel.open, isTrue);
+      expect(active.disposals, 0);
+      peer.dispose();
+      peer.reconnect();
+      expect(native.recoveries, 1);
+    },
+  );
+
+  testSignaling(
+    'retained peer conflict between retries blocks healthy standby',
+    (tester) async {
+      final native = _RecoveringPeer(_id, 'primary');
+      final standby = _FakePeer(_id, 'standby');
+      peers.addAll([native, standby]);
+      final peer = wrapper(providers: [(_, _) => native, (_, _) => standby])
+        ..start();
+      native.register();
+      standby.register();
+      native.loseSignaling();
+      expect(peer.open, isTrue);
+      final errors = <SignalingFailure>[];
+      peer.onError.listen(errors.add);
+      const conflict = SignalingFailure(
+        SignalingFailureKind.idTaken,
+        'Retained registration learned of a conflict',
+      );
+      native.fail(conflict);
+      peer.reconnect();
+      standby.register();
+      await _settle(tester);
+      expect(errors, [same(conflict)]);
+      expect(peer.open, isFalse);
+      expect(peer.discoveryComplete, isFalse);
+      expect(native.recoveries, 0);
+    },
+  );
+
+  testSignaling(
+    'a timed-out recovery replays only provider-validated coverage',
+    (tester) async {
+      final native = _RecoveringPeer(_id, 'primary');
+      peers.add(native);
+      final peer = wrapper(providers: [(_, _) => native])..start();
+      native.register();
+      native.loseSignaling();
+      peer.reconnect();
+      await tester.pump(const Duration(seconds: 12));
+      expect(native.disposed, isFalse);
+      expect(peer.open, isFalse);
+      native.open = true;
+      native.disconnected = false;
+      peer.reconnect();
+      await _settle(tester);
+      expect(
+        peer.open,
+        isFalse,
+        reason: 'Stale open alone is not registration',
+      );
+      native.loseSignaling();
+      native.register();
+      await _settle(tester);
+      expect(peer.open, isFalse, reason: 'Failed epoch ignores queued open');
+      peer.reconnect();
+      await _settle(tester);
+      expect(peer.open, isTrue);
+      expect(peer.discoveryComplete, isTrue);
+      expect(native.starts, 1);
+      expect(native.disposals, 0);
+    },
+  );
 
   for (final slowBackend in [0, 1]) {
     testSignaling(

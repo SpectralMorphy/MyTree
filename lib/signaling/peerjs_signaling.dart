@@ -9,15 +9,24 @@ SignalingPeer createPeerJsPeer(String id, Map<String, dynamic> configuration) =>
     PeerJsSignalingPeer(
       Peer(
         id: id,
-        options: PeerOptions(autoReconnect: false, config: configuration),
+        // The package can otherwise open another socket on an attempt timeout
+        // without retiring the first. The owner schedules subsequent attempts.
+        options: PeerOptions(
+          autoReconnect: false,
+          maxRetries: 1,
+          config: configuration,
+        ),
       ),
     );
 
 /// The only boundary which knows PeerJS options, error strings and RTC objects.
 /// Wrapping an existing Peer also keeps network-free test doubles useful.
-class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
-  PeerJsSignalingPeer(this._peer);
+class PeerJsSignalingPeer
+    implements SignalingPeer, SignalingDiscovery, SignalingRecovery {
+  PeerJsSignalingPeer(this._peer) : _id = _peer.id ?? '';
   final Peer _peer;
+  // peer_rtc clears Peer.id on disconnect. The logical identity must not change.
+  final String _id;
   final _channels = <DataConnection, PeerJsRoomChannel>{};
   final _subscriptions = <StreamSubscription<dynamic>>[];
   final _opens = StreamController<String?>.broadcast(sync: true);
@@ -27,11 +36,13 @@ class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
   bool _started = false;
   bool _disposed = false;
   bool _ready = false;
+  bool _conflict = false;
+  bool _recovering = false;
   String? _registeredId;
   int _registrationEpoch = 0;
 
   @override
-  String get id => _peer.id ?? '';
+  String get id => _id;
   @override
   String get service => 'PeerJS';
   @override
@@ -54,7 +65,7 @@ class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
   Stream<void> get onDiscoveryChanged => _discoveryChanges.stream;
 
   void _registered(String? registeredId) {
-    if (_disposed) return;
+    if (_disposed || _conflict) return;
     if (registeredId == null || registeredId.isEmpty || registeredId != id) {
       _invalidateRegistration();
       _errors.add(
@@ -68,6 +79,7 @@ class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
     _registrationEpoch++;
     final changed = !_ready || _registeredId != registeredId;
     _registeredId = registeredId;
+    _recovering = false;
     _ready = true;
     if (changed) _discoveryChanges.add(null);
     _opens.add(registeredId);
@@ -95,7 +107,16 @@ class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
       _peer.onOpen.listen(_registered),
       _peer.onReconnected.listen((_) => _registered(_peer.id)),
       _peer.onDisconnected.listen((_) => _disconnected()),
-      _peer.onReconnecting.listen((_) => _disconnected()),
+      _peer.onReconnecting.listen((_) {
+        // The owner's request starts the package's bounded attempt. Its
+        // progress events are not new outages that should fail this attempt.
+        if (_recovering) {
+          _invalidateRegistration();
+        } else {
+          _disconnected();
+        }
+      }),
+      _peer.on<void>('reconnectFailed').listen((_) => _recovering = false),
       _peer.onClose.listen((_) => _invalidateRegistration()),
       _peer.onError.listen((error) {
         if (_disposed) return;
@@ -104,6 +125,15 @@ class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
             : '$error'.startsWith('Could not connect to peer ')
             ? SignalingFailureKind.remoteUnavailable
             : SignalingFailureKind.unavailable;
+        if (kind == SignalingFailureKind.idTaken) {
+          _conflict = true;
+          _recovering = false;
+          // The package emits reconnectCancelled on the same synchronous event
+          // controller. Never cancel from inside its current error callback.
+          scheduleMicrotask(() {
+            if (!_disposed) _peer.cancelReconnect();
+          });
+        }
         if (kind != SignalingFailureKind.remoteUnavailable) {
           _invalidateRegistration();
         }
@@ -118,6 +148,38 @@ class PeerJsSignalingPeer implements SignalingPeer, SignalingDiscovery {
         if (_disposed || epoch != _registrationEpoch) return;
         if (_peer.open && !_peer.disconnected) _registered(_peer.id);
       });
+    }
+  }
+
+  @override
+  void reconnect() {
+    if (!_started ||
+        _disposed ||
+        _conflict ||
+        _recovering ||
+        open ||
+        _registeredId != id ||
+        _peer.destroyed) {
+      return;
+    }
+    // Do not alter options of externally supplied peers. Their own automatic
+    // retries/multiple socket attempts cannot provide this narrow guarantee.
+    if (_peer.options.autoReconnect || _peer.options.maxRetries != 1) return;
+    _registrationEpoch++;
+    _recovering = true;
+    try {
+      // Never call before a confirmed registration: otherwise the locked package
+      // retrieves a new random ID instead of recovering the supplied identity.
+      if (!_peer.tryReconnect()) _recovering = false;
+    } catch (_) {
+      _recovering = false;
+      _invalidateRegistration();
+      _errors.add(
+        const SignalingFailure(
+          SignalingFailureKind.unavailable,
+          'PeerJS signaling recovery failed.',
+        ),
+      );
     }
   }
 

@@ -172,6 +172,8 @@ void main() {
       expect(encoded.containsKey('historyDigest'), isFalse);
       expect(encoded.containsKey('inventory'), isFalse);
       expect(encoded.containsKey('durableSync'), isFalse);
+      expect(encoded.containsKey('recheckSync'), isFalse);
+      expect(encoded.containsKey('recheckId'), isFalse);
       expect(encoded.containsKey('roomMetadata'), isFalse);
       expect(encoded.containsKey('roomRoles'), isFalse);
       expect(encoded.containsKey('familyTree'), isFalse);
@@ -1720,6 +1722,258 @@ void main() {
       }, roomId: _roomId),
       throwsFormatException,
     );
+  });
+
+  test('recheck sync defaults false and true is handshake-only', () {
+    for (final type in RoomMessageType.values) {
+      final raw = _message(type: type).toJson();
+      expect(raw.containsKey('recheckSync'), isFalse);
+      expect(raw.containsKey('recheckId'), isFalse);
+      final legacy = decodeRoomMessage(raw, roomId: _roomId);
+      expect(legacy.recheckSync, isFalse);
+      expect(legacy.recheckId, isNull);
+      expect(legacy.toJson(), raw);
+      expect(
+        decodeRoomMessage({
+          ...raw,
+          'recheckSync': false,
+        }, roomId: _roomId).toJson(),
+        raw,
+      );
+      if (type == RoomMessageType.hello || type == RoomMessageType.welcome) {
+        final message = RoomMessage(
+          roomId: _roomId,
+          type: type,
+          actor: 'remote',
+          history: const [],
+          online: type == RoomMessageType.welcome ? 1 : null,
+          hosting: type == RoomMessageType.welcome ? true : null,
+          recheckSync: true,
+        );
+        final encoded = encodeRoomMessage(message).single;
+        expect(encoded['v'], 1);
+        expect(encoded['recheckSync'], isTrue);
+        for (final packet in [encoded, jsonEncode(encoded)]) {
+          final decoded = RoomMessageDecoder(
+            roomId: _roomId,
+          ).decode(packet).message!;
+          expect(decoded.recheckSync, isTrue);
+          expect(decoded.durableSync, isFalse);
+          expect(decoded.fastSync, isFalse);
+          expect(decoded.recheckId, isNull);
+          expect(decoded.toJson(), message.toJson());
+        }
+      } else {
+        expect(
+          () =>
+              decodeRoomMessage({...raw, 'recheckSync': true}, roomId: _roomId),
+          throwsFormatException,
+        );
+      }
+      for (final invalid in <Object?>[
+        null,
+        0,
+        1,
+        1.0,
+        'true',
+        'false',
+        [],
+        {},
+      ]) {
+        expect(
+          () => decodeRoomMessage({
+            ...raw,
+            'recheckSync': invalid,
+          }, roomId: _roomId),
+          throwsFormatException,
+          reason: type.name,
+        );
+      }
+    }
+  });
+
+  test('recheck requests and checkpoint echoes round trip independently', () {
+    final history = _message().history;
+    final inventory = roomHistoryInventory(history);
+    final digest = roomInventoryDigest(inventory);
+    for (final nonce in ['0' * 32, '0123456789abcdef' * 2, 'f' * 32]) {
+      final request = RoomMessage(
+        roomId: _roomId,
+        type: RoomMessageType.inventory,
+        actor: 'remote',
+        history: const [],
+        inventory: inventory,
+        recheckId: nonce,
+      );
+      for (final message in [
+        request,
+        for (final includeInventory in [false, true])
+          RoomMessage(
+            roomId: _roomId,
+            type: RoomMessageType.checkpoint,
+            actor: 'remote',
+            history: const [],
+            syncId: 'a' * 32,
+            syncDigest: digest,
+            inventory: includeInventory ? inventory : null,
+            recheckId: request.recheckId,
+          ),
+      ]) {
+        final encoded = encodeRoomMessage(message).single;
+        expect(encoded['v'], 1);
+        expect(encoded['recheckId'], nonce);
+        expect(encoded.containsKey('recheckSync'), isFalse);
+        for (final packet in [encoded, jsonEncode(encoded)]) {
+          final decoded = RoomMessageDecoder(
+            roomId: _roomId,
+          ).decode(packet).message!;
+          expect(decoded.recheckId, nonce);
+          expect(decoded.recheckSync, isFalse);
+          expect(decoded.history, isEmpty);
+          expect(decoded.toJson(), message.toJson());
+          if (decoded.type == RoomMessageType.inventory) {
+            expect(decoded.syncId, isNull);
+            expect(decoded.syncDigest, isNull);
+          } else {
+            expect(decoded.syncId, 'a' * 32);
+            expect(decoded.syncDigest, digest);
+          }
+          if (decoded.inventory != null) {
+            expect(decoded.inventory, inventory);
+            expect(roomInventoryDigest(decoded.inventory!), digest);
+            expect(missingRoomEdits(history, decoded.inventory!), isEmpty);
+          }
+        }
+      }
+    }
+  });
+
+  test('recheck IDs reject null, invalid nonces and every wrong placement', () {
+    for (final type in RoomMessageType.values) {
+      final raw = _message(type: type).toJson();
+      for (final invalid in <Object?>[
+        null,
+        false,
+        true,
+        0,
+        1.0,
+        [],
+        {},
+        '',
+        'a' * 31,
+        'a' * 33,
+        'A' * 32,
+        'g' * 32,
+        'а' * 32,
+        ' ${'a' * 32}',
+        '${'a' * 32}\n',
+        if (type != RoomMessageType.inventory &&
+            type != RoomMessageType.checkpoint)
+          'a' * 32,
+      ]) {
+        expect(
+          () => decodeRoomMessage({
+            ...raw,
+            'recheckId': invalid,
+          }, roomId: _roomId),
+          throwsFormatException,
+          reason: '${type.name}: $invalid',
+        );
+      }
+    }
+  });
+
+  test('recheck IDs do not relax inventory or checkpoint validation', () {
+    final inventory = roomHistoryInventory(_message().history);
+    final request = {
+      ..._message(type: RoomMessageType.inventory).toJson(),
+      'inventory': inventory,
+      'recheckId': 'b' * 32,
+    };
+    final checkpoint = {
+      ..._message(type: RoomMessageType.checkpoint).toJson(),
+      'syncDigest': roomInventoryDigest(inventory),
+      'inventory': inventory,
+      'recheckId': 'b' * 32,
+    };
+    for (final invalid in [
+      Map<String, dynamic>.of(request)..remove('inventory'),
+      {...request, 'inventory': null},
+      {...request, 'inventory': []},
+      {
+        ...request,
+        'inventory': {'': 'a' * 64},
+      },
+      {
+        ...request,
+        'inventory': {'edit': 'z' * 64},
+      },
+      {...request, 'history': _message().toJson()['history']},
+      {...request, 'syncId': 'a' * 32},
+      {...request, 'fastSync': true, 'historyDigest': 'a' * 64},
+      Map<String, dynamic>.of(checkpoint)..remove('syncId'),
+      Map<String, dynamic>.of(checkpoint)..remove('syncDigest'),
+      {...checkpoint, 'syncId': null},
+      {...checkpoint, 'syncId': 'a' * 31},
+      {...checkpoint, 'syncDigest': null},
+      {...checkpoint, 'syncDigest': 'a' * 64},
+      {...checkpoint, 'inventory': null},
+      {...checkpoint, 'inventory': []},
+      {...checkpoint, 'history': _message().toJson()['history']},
+    ]) {
+      expect(
+        () => decodeRoomMessage(invalid, roomId: _roomId),
+        throwsFormatException,
+      );
+    }
+  });
+
+  test('fragmented handshakes and recheck exchanges retain their fields', () {
+    final inventory = {
+      for (var index = 0; index < 300; index++) 'edit-$index': 'a' * 64,
+    };
+    for (final type in [
+      RoomMessageType.hello,
+      RoomMessageType.welcome,
+      RoomMessageType.inventory,
+      RoomMessageType.checkpoint,
+    ]) {
+      final handshake =
+          type == RoomMessageType.hello || type == RoomMessageType.welcome;
+      final base = _message(type: type, text: 'Ж' * 7000);
+      final message = RoomMessage(
+        roomId: _roomId,
+        type: type,
+        actor: 'remote',
+        history: base.history,
+        online: base.online,
+        hosting: base.hosting,
+        recheckSync: handshake,
+        recheckId: handshake ? null : 'b' * 32,
+        inventory: handshake ? null : inventory,
+        syncId: base.syncId,
+        syncDigest: type == RoomMessageType.checkpoint
+            ? roomInventoryDigest(inventory)
+            : null,
+      );
+      final chunks = encodeRoomMessage(message).toList();
+      expect(chunks.length, greaterThan(1));
+      final decoder = RoomMessageDecoder(roomId: _roomId);
+      RoomMessage? decoded;
+      for (final chunk in chunks.reversed) {
+        decoded = decoder.decode(jsonEncode(chunk)).message ?? decoded;
+      }
+      expect(decoded!.toJson(), message.toJson());
+      expect(decoded.recheckSync, handshake);
+      expect(decoded.recheckId, handshake ? isNull : 'b' * 32);
+      expect(decoded.syncId, base.syncId);
+      expect(decoded.syncDigest, message.syncDigest);
+      expect(
+        roomHistoryDigest(decoded.history),
+        roomHistoryDigest(base.history),
+      );
+      expect(decoder.assembling, isFalse);
+    }
   });
 
   test(

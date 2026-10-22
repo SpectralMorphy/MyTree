@@ -20,8 +20,8 @@ Room and version must match; an established channel cannot change its actor. `hi
 | `welcome` | Hub's response; requires `online` and `hosting`; may include `onlineActors`. |
 | `edits` | Immutable history records, including missing backfill and ordinary durable additions. |
 | `presence` | Empty history; `online`, `hosting`, optional `onlineActors`; also ordinary heartbeat traffic. |
-| `inventory` | Empty history; ID-to-record-digest map for negotiated fast synchronization. |
-| `checkpoint` | Empty history; `syncId`, `syncDigest`, optional inventory identifying a fixed contribution. |
+| `inventory` | Empty history; ID-to-record-digest map for negotiated fast synchronization; optional `recheckId` requests a fresh in-place read. |
+| `checkpoint` | Empty history; `syncId`, `syncDigest`, optional inventory identifying a fixed contribution; optional `recheckId` echoes that read's request. |
 | `syncAck` | Empty history; matching `syncId`/`syncDigest` and required Boolean `roomReady`. |
 | `diskCredentials` | Empty history; exact `diskBindingId` and `diskToken`, only over an eligible negotiated editor-to-editor RTC channel. Never ordinary journal relay or guest traffic. |
 
@@ -71,6 +71,7 @@ Current clients advertise these extensions in `hello`/`welcome`; absence means u
 | --- | --- |
 | `fastSync` + `historyDigest` | Durable-root comparison and inventory/diff exchange; current author-aware handshakes omit text previews. |
 | `durableSync` | Checkpoint/ACK protocol; new control types are never sent to peers lacking it. |
+| `recheckSync` | Optional durable recheck on an admitted RTC channel; nonce-bearing inventory requests and checkpoint echoes. It grants no membership or semantic capability. |
 | `roomMetadata` | Non-text operations such as participant names and room names. |
 | `roomRoles` | Separate support for participant roles; metadata support alone is insufficient. |
 | `familyTree` | Character-anchored tree text, people/relationships, and legacy `bindActor` participant/person claims. |
@@ -228,9 +229,11 @@ Encoding rejects oversize data before sending and generates fragments lazily; it
 | Incomplete checkpoint round | 12 s; presence and repeated checkpoint packets do not renew it |
 | Real assembly | Fixed 25 s from its first accepted fragment, replacing handshake wait |
 | Incomplete checkpoint assembly allowance | Fixed 25 s across transfers in that unfinished round |
-| Receive liveness / ordinary presence | 20 s silence / heartbeat every 5 s |
+| Receive liveness / ordinary presence | 20 s silence / heartbeat every 5 s; silence revokes online evidence |
 | Connectivity polling / disconnected ICE grace | Every 1 s / 5 s; failed or closed is terminal |
-| Packet send | 5 s per packet, on the channel's serialized send queue |
+| Packet send | 5 s watchdog per packet, on the channel's serialized send queue |
+| Established recheck-capable channel | The 5/12/20/25 s watchdogs are soft while native RTC remains usable; new admission retains its hard bounds |
+| Stalled established recheck | 90 s of uninterrupted foreground execution; hidden/execution gaps restart the active window |
 
 Accepted new fragments renew liveness, not the fixed assembly cap. A fresh join's overall 30 seconds remains in force.
 A final superseding hub checkpoint starts a new bounded ACK round. Completing a round cancels its checkpoint timers.
@@ -244,17 +247,40 @@ transient `inactive` state is not backgrounding. A session-wide five-second exec
 and Disk-only copies, detects an actual wall-clock execution gap over 20 seconds independently of network heartbeats.
 
 A real execution gap, observed loss of the last verified connection/network during backgrounding, or a failed last-peer
-receive probe qualifies for fresh verification. A qualifying wake of an already-confirmed accepted copy immediately
-clears readiness, retires the previous network
-generation and shows loading. After the coalesced 200 ms delay it starts fresh discovery/checkpoint exchange and, when
-matching access exists, a bounded validated Disk entry read. RTC starts before awaiting Disk. Old channel checkpoint/ACK
-flags cannot release this wait, and solo discovery is not a substitute for a fresh durable peer exchange or a freshly
-validated and persisted Disk snapshot. Duplicate wake events do not reset its fixed 30-second budget.
+receive probe qualifies for fresh verification. It immediately clears an already-confirmed accepted copy's readiness and
+shows loading, but keeps admitted usable RTC channels, their ordered sends, decoders and transport generation. With
+negotiated `recheckSync` and `durableSync`, each channel gets a new local checkpoint token and independent `recheckId`:
+
+1. Invalidate the whole old cohort's proof before any queued flush; freeze and durably resolve each new finite contribution.
+2. Send its full inventory tagged with the fresh request nonce, plus its new ordinary checkpoint.
+3. The receiver flushes and snapshots its current complete history, replies with an inventory/diff and a separate full
+   checkpoint echoing that nonce. This response token does not replace its own tracked checkpoint in a simultaneous recheck.
+4. Require both durable containment of the nonce-correlated response inventory and a matching ACK for the current tracked
+   checkpoint. Old or unrelated echoes, ordinary presence, equal old roots and old ACK flags cannot release this barrier.
+
+Repeated requests reuse the same nonce and fixed response snapshot without rotating tokens or starting reciprocal rounds.
+A genuinely new execution suspension supersedes a pending attempt and its nonce; duplicate foreground/online hints do not
+reset the fixed 30-second readiness budget. A serial-queue revision guard rejects a flush result from a superseded round.
+Freshly admitted non-fast peers can recheck too. Peers without the optional capability retain reconnect-based verification.
+
+After the coalesced 200 ms delay, missing/broken channels use normal discovery and matching Disk access starts a bounded
+validated entry read, in parallel with retained RTC. Solo discovery is not a substitute for fresh durable peer proof or a
+freshly validated and persisted Disk snapshot. An admitted cohort can recheck while public signaling is unavailable;
+initial admission and solo inference still require their ordinary registration/discovery evidence.
 
 Short connectivity hints during an unfinished entry or an explicitly opened local copy retain the conservative probe
 path: terminal/dead channels drop immediately; admitted settled channels receive a presence probe and six seconds for
 **received** heartbeat traffic. Connecting channels, a hello still saving, pending checkpoints and assemblies keep their
 normal deadlines. A newly arriving handshake likewise prevents premature re-election.
+
+For a previously established recheck-capable channel, missing packets or a soft send/checkpoint/assembly/ICE-disconnected
+watchdog revoke positive online evidence and request verification, not immediate disposal. A native failed/closed channel,
+real send error, integrity failure or unsupported old client still follows its appropriate failure path. A permanently
+stalled recheck is replaced only after a 90-second foreground window without completion; hidden time and delayed execution
+do not count. Ordinary heartbeats cannot indefinitely extend a blocked send/recheck. A soft send timeout never releases
+the serialized queue ahead of the still-pending native send, preventing interleaved chunk transfers. An offline actor is
+removed from other peers' rosters while its own directed heartbeat still names it, so waking does not violate roster checks.
+Browsers/OSes can still freeze/discard pages or close native RTC; this policy cannot guarantee indefinite background survival.
 
 With no remaining channels, recovery can bypass backoff and restart normal alias election. A nonfailed registration younger
 than eight seconds is preserved. Ordinary reconnect delay is `min(8000, 400 * 2^min(attempt, 4)) + random(0..699)` ms;
@@ -284,8 +310,8 @@ Connectivity/presence indicators are separate from local saving, checkpoint read
 
 ## Source and regression map
 
-- [Protocol tests](../../test/room_protocol_test.dart): proof-aware digests with unchanged legacy fingerprints, handshake-only surname/patronymic/marriage-history/author/participant-identity capabilities, recursive author closure, immutable IDs, bounds, Unicode, malformed chunks.
-- [Session tests](../../test/room_session_test.dart): empty capability offers/current fast welcomes, author/patronymic/marriage-history gates on empty production rooms and legacy channels, closure before persistence/ACK, frozen-core checkpoint resolution, same-actor tab relay, admission, finite cohorts, solo/partial outages, ACK timers, and wake recovery.
+- [Protocol tests](../../test/room_protocol_test.dart): proof-aware digests with unchanged legacy fingerprints, handshake-only surname/patronymic/marriage-history/author/participant-identity capabilities, strict optional recheck capability/nonces and fragmented round trips, recursive author closure, immutable IDs, bounds, Unicode, malformed chunks.
+- [Session tests](../../test/room_session_test.dart): empty capability offers/current fast welcomes, author/patronymic/marriage-history gates on empty production rooms and legacy channels, closure before persistence/ACK, frozen-core checkpoint resolution, same-actor tab relay, admission, finite cohorts, solo/partial outages, ACK timers, one-sided/crossed nonce rechecks, queued inventory and native-send races, active-only stalled recovery, and wake without RTC replacement.
 - [Tree session tests](../../test/tree_room_session_test.dart) and [role tests](../../test/room_roles_test.dart): payload compatibility and durable admission, participant-identity gates before import and on established legacy channels, marriage/surname-history guest permissions, atomic new partners, implied materialization/suppression/re-entry and durable replay/reload, frozen-core retry and bidirectional capability gates; room dictionary permissions without visible people, durable dictionary exchange/concurrent reset/shuffled replay/reload and bidirectional patronymic gates, independent per-person surname convergence/reload, legacy history preservation without opening migration, person-target retry, and bidirectional wire/semantic surname capability gates.
 - [History tests](../../test/room_history_test.dart), [page tests](../../test/room_page_test.dart), and the historical [headless recovery driver](../../tool/check_room_resume.cjs). The latter targets the old text-demo UI; see [testing](testing.md#historical-drivers-and-browser-harness-caveat) before reusing it.
 

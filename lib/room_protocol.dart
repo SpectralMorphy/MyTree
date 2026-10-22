@@ -148,6 +148,7 @@ class RoomMessage {
     this.fastSync = false,
     this.historyDigest,
     this.durableSync = false,
+    this.recheckSync = false,
     this.roomMetadata = false,
     this.roomRoles = false,
     this.familyTree = false,
@@ -164,6 +165,7 @@ class RoomMessage {
     this.diskToken,
     this.syncId,
     this.syncDigest,
+    this.recheckId,
     this.roomReady,
     List<String>? onlineActors,
     Map<String, String>? inventory,
@@ -186,6 +188,10 @@ class RoomMessage {
   /// Negotiated only in hello/welcome. Legacy v1 peers ignore this field and
   /// must never receive the new checkpoint/ack message types.
   final bool durableSync;
+
+  /// Hello/welcome-only support for correlating inventory rechecks with
+  /// checkpoint echoes. The session negotiates support before using recheck IDs.
+  final bool recheckSync;
 
   /// Metadata edit kinds are unsafe for legacy readers that ignore `kind`.
   /// Negotiate this capability before sending any non-text operation.
@@ -235,6 +241,9 @@ class RoomMessage {
   final String? diskToken;
   final String? syncId;
   final String? syncDigest;
+
+  /// Optional inventory request nonce, echoed only by its response checkpoint.
+  final String? recheckId;
   final bool? roomReady;
   final Map<String, String>? inventory;
 
@@ -250,6 +259,7 @@ class RoomMessage {
     if (fastSync) 'fastSync': true,
     if (historyDigest != null) 'historyDigest': historyDigest,
     if (durableSync) 'durableSync': true,
+    if (recheckSync) 'recheckSync': true,
     if (roomMetadata) 'roomMetadata': true,
     if (roomRoles) 'roomRoles': true,
     if (familyTree) 'familyTree': true,
@@ -268,6 +278,7 @@ class RoomMessage {
     },
     if (syncId != null) 'syncId': syncId,
     if (syncDigest != null) 'syncDigest': syncDigest,
+    if (recheckId != null) 'recheckId': recheckId,
     if (roomReady != null) 'roomReady': roomReady,
     if (inventory != null) 'inventory': inventory,
   };
@@ -333,6 +344,12 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
   final rawInventory = value['inventory'];
   final handshake =
       type == RoomMessageType.hello || type == RoomMessageType.welcome;
+  final recheckSync = value['recheckSync'] ?? false;
+  if (recheckSync is! bool ||
+      (value.containsKey('recheckSync') && value['recheckSync'] is! bool) ||
+      (recheckSync && !handshake)) {
+    throw const FormatException('Неверная поддержка повторной синхронизации');
+  }
   final roomMetadata = value['roomMetadata'] ?? false;
   if (roomMetadata is! bool ||
       (value.containsKey('roomMetadata') && value['roomMetadata'] is! bool) ||
@@ -440,6 +457,13 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
   final roomReady = value['roomReady'];
   final checkpoint = type == RoomMessageType.checkpoint;
   final ack = type == RoomMessageType.syncAck;
+  final recheckId = value['recheckId'];
+  if (value.containsKey('recheckId') &&
+      ((type != RoomMessageType.inventory && !checkpoint) ||
+          recheckId is! String ||
+          !isValidRoomId(recheckId))) {
+    throw const FormatException('Неверный ID повторной синхронизации');
+  }
   if (durableSync is! bool ||
       (value.containsKey('durableSync') &&
           (!handshake || value['durableSync'] is! bool)) ||
@@ -497,6 +521,7 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
     fastSync: fastSync,
     historyDigest: digest as String?,
     durableSync: durableSync,
+    recheckSync: recheckSync,
     roomMetadata: roomMetadata,
     roomRoles: roomRoles,
     familyTree: familyTree,
@@ -513,6 +538,7 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
     diskToken: diskToken as String?,
     syncId: syncId as String?,
     syncDigest: syncDigest as String?,
+    recheckId: recheckId as String?,
     roomReady: roomReady as bool?,
     inventory: inventory,
   );

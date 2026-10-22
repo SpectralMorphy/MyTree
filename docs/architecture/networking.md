@@ -39,6 +39,7 @@ The small contracts in [signaling.dart](../../lib/signaling/signaling.dart) keep
 | `SignalingPeer` | Registration, incoming/outgoing channels, open/error/disconnect/close events, and disposal. |
 | `RoomChannel` | Peer/service identity, open/disposed/connectivity state, data/events, asynchronous send, disposal. |
 | Optional `SignalingDiscovery` | Current registration coverage plus change notifications; stronger than `open`. |
+| Optional `SignalingRecovery` | Retry an already-confirmed registration in place, without replacing live RTC; only validated events establish recovery. |
 
 `SignalingFailureKind` distinguishes `idTaken`, service `unavailable`, `remoteUnavailable`, and `negotiation` failure.
 Discovery coverage says configured providers validated the logical ID without pending registration, failure, or conflict.
@@ -48,8 +49,12 @@ It is not a census of devices. A usable channel, validated room handshake, and d
 
 [PeerJsSignalingPeer](../../lib/signaling/peerjs_signaling.dart) wraps `peer_rtc`'s `Peer` and reliable `DataConnection`.
 It normalizes package errors and RTC/ICE states, validates registration, and guards queued registration replay with an epoch.
-Package automatic reconnect is disabled; the room session owns whole-peer reconnection. Adapter disposal cancels package
-reconnect and releases its channels; a signaling error alone is not an instruction to dispose an established channel.
+Package automatic reconnect is disabled; the room session schedules recovery. The adapter permits one manual attempt at a
+time only after a confirmed registration, with the package's retry count limited to one. Its public logical ID remains
+stable while the package temporarily clears its raw ID. Current registration events, not old getters or a reconnect call,
+restore readiness; identity contention is terminal and cancellation is deferred outside synchronous package emitters.
+Adapter disposal cancels recovery and releases channels. A signaling outage alone does not require closing established
+RTC; a fatal package error which has already destroyed its peer/RTC cannot be repaired in place.
 
 The production factory in [fallback_signaling.dart](../../lib/signaling/fallback_signaling.dart) constructs one
 `FallbackSignalingPeer` with PeerJS preferred and MQTT secondary. Both register **the same logical ID concurrently**.
@@ -68,7 +73,11 @@ A failed backend that **never registered** can be replaced at most twice while a
 subscriptions are released, a new epoch guards callbacks, and jittered backoff bounds retries. A backend that registered
 at least once is retained even after signaling loss: it may own outgoing or incoming RTC links. It is not hot-replaced
 or kept beside a duplicate registration. The working provider and established winner are not recreated by cold recovery.
-When the whole wrapper loses service or is disposed/conflicted, its internal retries stop; the session owns the next peer.
+When the whole wrapper loses service, cold replacement retries stop. The session may request in-place `SignalingRecovery`
+for retained previously registered backends; healthy backends are untouched, epochs guard each attempt and validated
+registration restores discovery. Recovery budgets are 12 s for retained PeerJS and 14 s for MQTT. Repeated calls during an
+attempt are no-ops, and late `idTaken` from a retained backend is still terminal. Conflict/disposal stop all recovery;
+registered backends are never replaced beside a duplicate registration.
 
 A pending logical channel records provider failures against the registration epoch, not the persistent backend slot. A recovered cold registration can therefore join an already-pending race without restarting its healthy attempt. Duplicate readiness within the same epoch does not redial a failed attempt. Once that logical channel has reported exhaustion, later provider recovery cannot revive it; a new channel is required. Established winners remain unchanged.
 
@@ -81,13 +90,17 @@ A pending logical channel records provider failures against the registration epo
 
 The secondary registration budget includes the MQTT adapter's complete bounded startup: up to 8 s connecting, 4 s for parallel subscription acknowledgments, then at most 1.5 s probing/claiming. It must not cut these valid stages off at the old 7 s boundary. This wrapper budget is not a new room-entry deadline: the session's independent 8 s registration, 12 s channel/handshake, and fixed 30 s fresh-admission limits still apply. It prevents premature cancellation when a valid fallback becomes ready before those session limits; it does not promise that every 13.5 s MQTT startup can complete fresh admission. Failed/expired visitors never become hosts or receive membership by timeout.
 
-An established RTC link can survive one provider's loss while another maintains the logical peer. MQTT also preserves open
-RTC links on its own signaling failure. This is not indefinite survival of a session-wide restart: the session keeps links
-during reconnect backoff, then `_beginPeer` retires the old generation and its channels. Recovery does not migrate a channel
-between providers; newly established channels perform the ordinary journal/checkpoint exchange. A genuinely closed
-DataChannel cannot resume in place: recovery needs a new connection/PeerConnection. ICE `disconnected` is different and
-can recover during the session's five-second grace period. The selected fallback channel does not automatically rerace
-providers after closing; the session owns reconnection.
+An established, recheck-capable RTC cohort survives recoverable signaling loss, including when the whole logical peer
+loses service: the session retries registration on the retained peer instead of retiring its channels after backoff.
+A hub's negative signaling presence is not an instruction for a modern follower to destroy a healthy data path. Existing
+cohort verification can finish without public signaling, while new admission and solo inference retain registration and
+discovery requirements. Recovery does not migrate channels between providers or manufacture registration success.
+
+A genuinely closed/failed native DataChannel needs a new connection/PeerConnection. ICE `disconnected` and a delayed
+application heartbeat are soft suspicion for a previously established modern link, not immediate closure; its fresh durable
+recheck and active-only 90-second stalled window are described in [Synchronization](synchronization.md#recovery-and-truthful-ui).
+New admission/legacy channels retain their fixed bounds. The selected fallback channel does not rerace providers after
+closing; the session owns reconnection and only a real new channel runs a new admission exchange.
 
 A generic **WebRTC channel closed** message describes transport state, not its cause. An incompatible peer can reject a
 handshake locally with update/reload guidance and close the channel without sending a rejection reason to the other side.
@@ -123,7 +136,10 @@ Remote discovery sends an immediate request and at most four jittered retries (5
 Only explicitly marked, valid random runtime IDs receive the short claim window; room aliases retain the conservative
 window and all occupancy checks. The MQTT data path is an ordered, reliable, DTLS-encrypted RTCDataChannel carrying JSON.
 Editor text, tree payloads, and journal packets are **not MQTT publishes**. Broker loss fails unfinished negotiations but
-leaves already-open RTC links intact until their own lifecycle or session disposal ends them.
+leaves already-open RTC links intact until their own lifecycle or session disposal ends them. In-place recovery keeps the
+same signaling peer, logical instance and RTC channels, waits for the old startup/close to finish, then creates one new bus
+and repeats SUBACK/probe/claim. Epoch guards reject late connect/SUBACK callbacks. An injected one-shot bus without a
+replacement factory intentionally cannot recover; production supplies the factory.
 
 ## Current public services and ICE configuration
 
@@ -173,10 +189,11 @@ Changing scheme/host/port changes browser storage origin, so a new temporary tun
 [Browser network hooks](../../lib/network_status_web.dart) watch online/offline and visibility/resume/pageshow;
 [RoomPage](../../lib/ui/room_page.dart) also forwards Flutter lifecycle. `navigator.onLine` is only a hint: offline revokes
 online display, while online/foreground is not proof of a reachable provider or peer. The [native stub](../../lib/network_status_stub.dart)
-does not infer connectivity from an OS hint. A qualifying wake of a confirmed copy invalidates readiness and retires stale
-channels, then starts fresh discovery after a 200 ms debounce rather than waiting for the old 20-second liveness timer.
-Unfinished entry and explicit local-copy recovery still probe eligible settled links with six seconds for received
-heartbeat traffic; connecting, checkpoint-pending and assembling links keep normal deadlines.
+does not infer connectivity from an OS hint. A qualifying wake of a confirmed copy invalidates readiness, not healthy native
+RTC: negotiated links run a fresh nonce-correlated durable recheck in place. Missing/broken links resume discovery after a
+200 ms debounce rather than displaying stale history until the old liveness timeout. Ordinary focus switches only request
+a six-second receive-progress probe; a failed last-peer probe starts the fresh barrier but does not immediately close a
+native-connected modern link. Connecting and first-admission checkpoint/assembly work retain their fixed bounds.
 See [synchronization](synchronization.md#recovery-and-truthful-ui) for guards, backoff, and the full deadline table.
 
 When diagnosing, distinguish registration (`signalingService`), an actually open channel, a validated welcome/online actor,

@@ -37,6 +37,15 @@ abstract interface class SignalingPeer {
   void dispose();
 }
 
+/// Optional in-place registration recovery. Existing RTC channels and the
+/// logical peer identity must be retained; never create a parallel registration.
+abstract interface class SignalingRecovery {
+  /// Requests another registration attempt after signaling loss. Repeated calls
+  /// while registering, before initial registration, or after conflict/disposal
+  /// are harmless. Success is confirmed only by [SignalingPeer.onOpen].
+  void reconnect();
+}
+
 /// Optional registration coverage, separate from [SignalingPeer] so existing
 /// custom peers can continue to implement just the transport contract.
 abstract interface class SignalingDiscovery {

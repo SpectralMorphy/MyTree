@@ -29,7 +29,8 @@ SignalingPeer createSignalingPeer(String id, Map<String, dynamic> config) =>
 /// Registers the same identity with independent services, not isolated rooms.
 /// The standby is discoverable even while PeerJS works, so a newcomer whose
 /// PeerJS is blocked can still find an existing participant via MQTT.
-class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
+class FallbackSignalingPeer
+    implements SignalingPeer, SignalingDiscovery, SignalingRecovery {
   FallbackSignalingPeer({
     required this.id,
     required this.configuration,
@@ -107,19 +108,39 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
     }
   }
 
+  @override
+  void reconnect() {
+    if (!_started || _disposed || _conflict) return;
+    for (final backend in _backends) {
+      // Only a retained, previously registered peer may own live RTC channels.
+      // Never run its factory again or revive stopped cold-backend retries.
+      if (backend.failed &&
+          backend.registered &&
+          backend.peer is SignalingRecovery) {
+        _startBackend(backend, recover: true);
+      }
+    }
+  }
+
   bool _current(_Backend backend, int epoch) =>
       !_disposed && !_conflict && !backend.failed && backend.epoch == epoch;
 
-  void _startBackend(_Backend backend) {
+  void _startBackend(_Backend backend, {bool recover = false}) {
     if (_disposed || _conflict) return;
+    if (recover) {
+      for (final subscription in backend.subscriptions) {
+        unawaited(subscription.cancel());
+      }
+      backend.subscriptions.clear();
+    }
     final epoch = ++backend.epoch;
     backend.failed = false;
     backend.ready = false;
-    if (backend.retries > 0) _discoveryChanges.add(null);
+    if (recover || backend.retries > 0) _discoveryChanges.add(null);
     // MQTT startup includes connect (8s), parallel SUBACKs (4s), then
     // probe/claim (up to 1.5s). Do not abort its valid stages at 7 seconds.
     backend.deadline = Timer(
-      Duration(seconds: backend.index == 0 ? 3 : 14),
+      Duration(seconds: backend.index == 0 ? (recover ? 12 : 3) : 14),
       () {
         if (!backend.ready) {
           _failed(
@@ -135,39 +156,43 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
     );
     runZonedGuarded(
       () {
-        final peer = _factories[backend.index](id, configuration);
+        final peer = recover
+            ? backend.peer!
+            : _factories[backend.index](id, configuration);
         backend.peer = peer;
+        void registered(String? registeredId) {
+          if (!_current(backend, epoch)) return;
+          if (registeredId != id || peer.id != id) {
+            _failed(
+              backend,
+              epoch,
+              const SignalingFailure(
+                SignalingFailureKind.unavailable,
+                'Unexpected signaling identity',
+              ),
+            );
+            return;
+          }
+          final wasReady = backend.ready;
+          backend.ready = true;
+          backend.registered = true;
+          backend.deadline?.cancel();
+          if (!wasReady) _discoveryChanges.add(null);
+          if (backend.index == 0 || _backends.first.failed) {
+            _announce();
+          } else {
+            _preferenceTimer ??= Timer(preferenceDelay, _announce);
+          }
+          for (final failed in _backends) {
+            _scheduleRecovery(failed);
+          }
+          for (final channel in _pending.toList()) {
+            channel.providerReady();
+          }
+        }
+
         backend.subscriptions.addAll([
-          peer.onOpen.listen((registeredId) {
-            if (!_current(backend, epoch)) return;
-            if (registeredId != id || peer.id != id) {
-              _failed(
-                backend,
-                epoch,
-                const SignalingFailure(
-                  SignalingFailureKind.unavailable,
-                  'Unexpected signaling identity',
-                ),
-              );
-              return;
-            }
-            final wasReady = backend.ready;
-            backend.ready = true;
-            backend.registered = true;
-            backend.deadline?.cancel();
-            if (!wasReady) _discoveryChanges.add(null);
-            if (backend.index == 0 || _backends.first.failed) {
-              _announce();
-            } else {
-              _preferenceTimer ??= Timer(preferenceDelay, _announce);
-            }
-            for (final failed in _backends) {
-              _scheduleRecovery(failed);
-            }
-            for (final channel in _pending.toList()) {
-              channel.providerReady();
-            }
-          }),
+          peer.onOpen.listen(registered),
           peer.onConnection.listen((channel) {
             if (!_current(backend, epoch) || !open || !backend.ready) {
               scheduleMicrotask(channel.dispose);
@@ -176,6 +201,12 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
             }
           }),
           peer.onError.listen((error) {
+            // A retained peer can learn about an identity conflict even between
+            // owner retry requests. It is not a stale cold/replaced generation.
+            if (error.kind == SignalingFailureKind.idTaken) {
+              _failed(backend, epoch, error);
+              return;
+            }
             if (!_current(backend, epoch)) return;
             if (error.kind == SignalingFailureKind.remoteUnavailable) {
               for (final channel in _pending.toList()) {
@@ -215,7 +246,25 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
             }),
           );
         }
-        peer.start();
+        if (recover) {
+          (peer as SignalingRecovery).reconnect();
+          // A slow socket retirement may finish between owner retry requests,
+          // after this wrapper's earlier deadline. Only provider-validated
+          // coverage (never stale transport getters alone) can replay it.
+          if (peer is SignalingDiscovery) {
+            final discovery = peer as SignalingDiscovery;
+            scheduleMicrotask(() {
+              if (_current(backend, epoch) &&
+                  discovery.discoveryComplete &&
+                  peer.open &&
+                  !peer.disconnected) {
+                registered(peer.id);
+              }
+            });
+          }
+        } else {
+          peer.start();
+        }
       },
       (error, stack) => _failed(
         backend,
@@ -284,7 +333,11 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
   }
 
   void _failed(_Backend backend, int epoch, SignalingFailure error) {
-    if (!_current(backend, epoch)) return;
+    if (_disposed || _conflict || backend.epoch != epoch) return;
+    if (backend.failed &&
+        !(backend.registered && error.kind == SignalingFailureKind.idTaken)) {
+      return;
+    }
     backend.deadline?.cancel();
     // Contention is NOT an outage. Falling back on ID-taken creates a second
     // host in another namespace and bypasses the room's election policy.
@@ -313,8 +366,8 @@ class FallbackSignalingPeer implements SignalingPeer, SignalingDiscovery {
       _announce();
       _scheduleRecovery(backend);
     } else if (_announced) {
-      // Session owns whole-peer reconnects. Do not race its fresh instance with
-      // retries from this now-disconnected wrapper.
+      // Stop cold replacements when all signaling is lost. The owner chooses
+      // in-place recovery of retained peers or eventual whole-peer retirement.
       _stopRecovery();
       _announced = false;
       _disconnects.add(null);

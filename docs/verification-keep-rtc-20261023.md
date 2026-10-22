@@ -1,0 +1,49 @@
+# October 23, 2026 — Reverify history without replacing healthy RTC
+
+## Implemented behavior
+
+Ordinary tab/window switches retain confirmed readiness and existing native channels. A genuine execution pause or suspected last-peer loss still blocks a previously confirmed copy until fresh durable reconciliation, but no longer retires an admitted, usable, recheck-capable RTC generation merely to obtain that proof.
+
+The optional version-1 `recheckSync` capability enables a fresh `recheckId` on an inventory request and its checkpoint response. The response has a fixed durable snapshot and independent token: it cannot replace the responder's own tracked checkpoint during simultaneous rechecks. Readiness requires both the nonce-correlated remote inventory to be durable and the current local checkpoint to receive its matching ACK. Equal historical roots, old ACKs, old/absent echo nonces, presence and cached local-tab readiness are insufficient. A subsequent real suspension supersedes a pending nonce/revision; duplicate foreground hints do not restart the budget. Journal schemas, edit fingerprints, capability gates, guest permissions and membership-last admission are unchanged.
+
+The ordinary 5/12/20/25-second send/checkpoint/liveness/assembly watchdogs remain hard for initial admission and legacy channels. For an already established modern link they are soft suspicion; missing receive progress revokes online evidence without immediately closing native RTC. A stalled recheck is replaced after a separate 90-second uninterrupted foreground window. Hidden time/execution gaps do not count. A soft send timeout preserves the pending native send and the ordered queue, including chunk assembly; it cannot release later packets ahead of it. Regular heartbeats cannot indefinitely preserve a permanently blocked send.
+
+Recoverable public-signaling loss uses optional in-place `SignalingRecovery`, preserving logical identity and RTC. PeerJS bounds and serializes manual recovery; MQTT closes the old startup/bus before creating a replacement bus; fallback retains registered backends and guards attempts by epoch. Cold retry limits remain unchanged. Identity contention, actual native failure/closure and terminal integrity/storage errors are not relabeled as successful recovery. An already destroyed provider peer cannot be repaired in place.
+
+## Regression evidence
+
+Focused implementation checks exposed and corrected two new-round races: an independent response checkpoint could overwrite the other side's tracked checkpoint and prevent the final ready ACK; a one-sided recheck needed its response to serve as the remote contribution when no ordinary remote checkpoint was renewed. Tests separately cover simultaneous and one-sided exchanges.
+
+Added session cases cover:
+
+- a real 25-second execution jump, missing durable history and a held append while the same RTC peers remain alive;
+- a current local ACK still blocked until its matching fresh nonce response, including a second suspension and both older tokens/nonces;
+- a newly admitted non-fast member recovering a minute of silence on the same channels;
+- simultaneous rechecks preserving both offline contributions and complete immutable inventories;
+- a soft five-second send timeout preserving serialized chunks until native completion;
+- a permanently blocked send with continuing heartbeats, eventually replaced after the active grace without losing its durable edit;
+- in-place signaling recovery, no extra local-follower sockets, healthy other peers and bounded recovery of a genuinely stalled channel.
+
+Codec coverage includes omitted compatibility, strict optional field types/placement/nonces, unchanged inventory/checkpoint validation and fragmented round trips. Adapter tests cover stable IDs, duplicate recovery calls, late callbacks, occupancy/conflicts, deferred cancellation outside synchronous emitters, retained RTC and one-shot MQTT bus replacement.
+
+Read-only review found a send-stall escape: every ordinary heartbeat canceled the stalled deadline although the ordered send remained blocked. The fix retains that deadline during recheck/assembly, with the permanent-send regression above. A later review found an older queued inventory reaching `_sendInventory` after a force reset cleared its snapshot but before queued preparation: its null assertion closed healthy RTC. A regression reproduced `expected not disposed`, `actual disposed`; inventory sending now defers without setting its one-shot flag until the new durable cutoff exists. The first combined full run passed **2284 Flutter tests (2 skipped)**. A subsequent full verification/build command was intentionally stopped before accepting its results to fix that queued-inventory race.
+
+## Final combined-source verification
+
+After the queued-inventory regression passed, the final frozen source passed `flutter analyze` with no issues, the complete **2285-test suite (2 skipped)**, all **4 HTTP server tests**, and a fresh release web build. These checks include the completed patronymic, marriage/surname-history and stepparent-layout work already committed by the other sessions, not a lifecycle-only snapshot. Source remained unchanged throughout this final run.
+
+Local build stamp: **2026.10.22-212331 UTC**. `main.dart.js`: **3,713,625 bytes**, SHA-256 **`41ed9ab79587173e903465fb5f818ba2c13c77772c62beb28fd9e73bca5eed25`**. The actual local HTTP response matched that body. Flutter emitted its non-fatal CupertinoIcons font warning; MaterialIcons was present and tree-shaken. A later timestamped Pages artifact is checked separately and is not assumed byte-identical to this local build. Evidence: `E:/mytree-keep-rtc-20261022/release/` and the final verification task log.
+
+## Native headless release-browser evidence
+
+The first single bounded run verified both actual **3,713,625-byte / `41ed9ab…eed25`** bundles, with no service worker and no production-source/transport injection. Its independent **25-second phase passed**: native `Debugger.paused/resumed` and a **25,011 ms** hold / **25,573 ms** heartbeat gap, a real desktop UI edit, **59 loading/no-tree frames**, a fresh 32-hex inventory nonce/full checkpoint echo/ACK, and a separate new ordinary tracked checkpoint with its matching `roomReady:true` ACK. Both full journals contained the exact six-record immutable union. A real phone edit then converged to the exact seven-record union. Both sides kept their original **native-peer-0 / native-channel-0**, one open connected channel each, without close/error/replacement events. The relevant loading, final-name and two-profile live-edit PNGs were inspected.
+
+The overall first driver outcome remains **fail**, not a whole-suite pass: the 65-second phase paused natively but stopped after **2,929 ms** on its UI-input oracle. That helper checked only that some HTML input was focused, not that the current native element was stably attached to the requested name field with the expected preceding value. It recorded neither the actual input value nor a failure screenshot/readback at that point, so this does **not** establish a production text-loss defect. The intended 65-second hold, its recheck and both reloads were unrun. Native target activation again produced no trusted focus/visibility transition, separately recorded as unsupported/partial. There were no page/Flutter errors. Both contexts and the owned browser process closed; the report was not rewritten. Evidence: `E:/mytree-keep-rtc-20261022/run-final-41ed9ab/keep-rtc.json` and adjacent PNGs. The first report is not relabeled as a successful combined sequence.
+
+A single separately bounded, corrected **65-second-only attempt passed its independent pause/recheck/live-edit phase** on the same exact release. The driver first bound the real semantic name field to a stable native `TEXTAREA` with `aria-label="Имя"`, verified the previous value and complete native SelectAll range, then used real keyboard insertion. Native debugger events and **65,002.7 ms** real hold were recorded. **57 loading/no-tree frames**, a fresh nonce/full echoed inventory/ACK and a separate new tracked checkpoint with its matching `roomReady:true` ACK preceded completion. Both profiles retained their original single connected native peer/channel with no replacements, close or error events. Exact six-record journals converged, followed by a real phone UI edit and exact seven-record union.
+
+This second driver's overall raw outcome also remains **fail at its later reload helper**, not a whole-suite pass. Both real reloads returned HTTP **304**, while the helper incorrectly waited only for HTTP 200 before activating Flutter accessibility. Its 30-second response wait expired. Failure capture nevertheless retained both complete persisted seven-record journals exactly equal to the expected union, and connected native RTC after reload. Final visible-tree/accessibility assertions were unrun; no new reload attempt was made. Failure diagnostics include focused-input values/selections, semantics, full synthetic journals and PNGs. Both contexts and the owned browser process closed; the first run was unchanged. Evidence: `E:/mytree-keep-rtc-20261022/run-65-corrected-41ed9ab/keep-rtc-65-corrected.json` and adjacent PNGs. These two independent passing pause phases establish actual 25/65-second rechecks without RTC replacement; they do not turn either whole driver into a pass or prove physical-phone background behavior.
+
+## Coverage limits
+
+A browser/OS may still freeze, discard or terminate a page, close native RTC, or remove its network. No web application can guarantee an indefinitely live connection in those states. A headless debugger pause is genuine execution suspension but is not a trusted physical phone screen-off/foreground event. Browser results must distinguish that from ordinary hidden-tab behavior and must not infer native visibility transitions from accepted CDP commands.

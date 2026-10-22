@@ -620,6 +620,245 @@ void main() {
     },
   );
 
+  testWidgets(
+    'registration recovers after bus retirement without replacing live RTC',
+    (tester) async {
+      final hub = _Broker();
+      final rtc = _RtcNetwork();
+      final host = _peer('host', 'host-instance', hub.bus(), rtc: rtc);
+      final guest = MqttSignalingPeer(
+        id: 'guest',
+        config: {},
+        busFactory: hub.bus,
+        instanceId: 'guest-instance',
+        rtcFactory: rtc.create,
+      );
+      addTearDown(host.dispose);
+      addTearDown(guest.dispose);
+      final received = <Object?>[];
+      final incoming = <RoomChannel>[];
+      host.onConnection.listen((channel) {
+        incoming.add(channel);
+        channel.onData.listen(received.add);
+      });
+      final opens = <String?>[];
+      guest.onOpen.listen(opens.add);
+      guest.reconnect();
+      guest.start();
+      host.start();
+      guest.reconnect();
+      await _admit(tester);
+      final channel = guest.connect('host');
+      await tester.pump();
+      expect(channel.open, isTrue);
+      final oldBus = hub.buses.last;
+      final retired = Completer<void>();
+      oldBus.closeGate = retired;
+      oldBus.loseConnection();
+      await tester.pump();
+      expect(guest.discoveryComplete, isFalse);
+      guest.reconnect();
+      guest.reconnect();
+      await tester.pump();
+      expect(hub.buses, hasLength(2), reason: 'Await old bus retirement');
+      await channel.send({'edit': 'during signaling recovery'});
+      await tester.pump();
+      expect(received, [
+        {'edit': 'during signaling recovery'},
+      ]);
+      retired.complete();
+      await tester.pump();
+      expect(hub.buses, hasLength(3));
+      final replacement = hub.buses.last;
+      expect(replacement, isNot(same(oldBus)));
+      expect(replacement.clientId, oldBus.clientId);
+      expect(replacement.topics, {_presence('guest'), _mailbox('guest')});
+      expect(guest.open, isFalse);
+      guest.reconnect();
+      await tester.pump(const Duration(milliseconds: 500));
+      await tester.pump(const Duration(milliseconds: 999));
+      expect(guest.discoveryComplete, isFalse);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(guest.discoveryComplete, isTrue);
+      expect(opens, ['guest', 'guest']);
+      expect(rtc.peers, hasLength(2), reason: 'Keep the exact RTC handles');
+      expect(rtc.peers.every((pc) => !pc.closed && !pc.released), isTrue);
+      expect(channel.open, isTrue);
+      expect(channel.disposed, isFalse);
+      expect(incoming, hasLength(1));
+      guest.reconnect();
+      expect(hub.buses, hasLength(3));
+      guest.dispose();
+      host.dispose();
+      await tester.pump();
+    },
+  );
+
+  testWidgets(
+    'recovery repeats occupancy checks and cannot bypass a new owner',
+    (tester) async {
+      final hub = _Broker();
+      final peer = MqttSignalingPeer(
+        id: 'room',
+        config: {},
+        busFactory: hub.bus,
+        instanceId: 'old-instance',
+      );
+      final owner = _peer('room', 'new-instance', hub.bus());
+      addTearDown(peer.dispose);
+      addTearDown(owner.dispose);
+      final failures = <SignalingFailure>[];
+      peer.onError.listen(failures.add);
+      peer.start();
+      await _admit(tester);
+      hub.buses.first.loseConnection();
+      await tester.pump();
+      owner.start();
+      await _admit(tester);
+      expect(owner.open, isTrue);
+      peer.reconnect();
+      await _admit(tester);
+      expect(peer.open, isFalse);
+      expect(peer.discoveryComplete, isFalse);
+      expect(failures.map((failure) => failure.kind), [
+        SignalingFailureKind.unavailable,
+        SignalingFailureKind.idTaken,
+      ]);
+      final busCount = hub.buses.length;
+      peer.reconnect();
+      peer.start();
+      await tester.pump(const Duration(seconds: 10));
+      expect(hub.buses, hasLength(busCount));
+      peer.dispose();
+      owner.dispose();
+      await tester.pump();
+    },
+  );
+
+  testWidgets(
+    'failed bus construction can retry without reviving an old lifecycle',
+    (tester) async {
+      final hub = _Broker();
+      var constructions = 0;
+      final peer = MqttSignalingPeer(
+        id: 'room',
+        config: {},
+        instanceId: 'local',
+        busFactory: () {
+          if (++constructions == 2) throw StateError('Bus construction failed');
+          return hub.bus();
+        },
+      );
+      addTearDown(peer.dispose);
+      peer.start();
+      await _admit(tester);
+      hub.buses.single.loseConnection();
+      await tester.pump();
+      peer.reconnect();
+      await tester.pump();
+      expect(constructions, 2);
+      expect(peer.open, isFalse);
+      peer.reconnect();
+      await _admit(tester);
+      expect(constructions, 3);
+      expect(peer.discoveryComplete, isTrue);
+      expect(hub.buses.first.closed, isTrue);
+      peer.dispose();
+      await tester.pump();
+    },
+  );
+
+  testWidgets(
+    'a lost recovery waits for its pending connect before another bus',
+    (tester) async {
+      final hub = _Broker();
+      final gate = Completer<void>();
+      final peer = MqttSignalingPeer(
+        id: 'room',
+        config: {},
+        instanceId: 'local',
+        busFactory: () {
+          final bus = hub.bus();
+          if (hub.buses.length == 2) bus.connectGate = gate;
+          return bus;
+        },
+      );
+      addTearDown(peer.dispose);
+      peer.start();
+      await _admit(tester);
+      hub.buses.single.loseConnection();
+      await tester.pump();
+      peer.reconnect();
+      await tester.pump();
+      expect(hub.buses, hasLength(2));
+      final oldAttempt = hub.buses.last;
+      oldAttempt.loseConnection();
+      await tester.pump();
+      peer.reconnect();
+      peer.reconnect();
+      await tester.pump();
+      expect(hub.buses, hasLength(2), reason: 'Do not overlap connect futures');
+      gate.complete();
+      await _admit(tester);
+      expect(hub.buses, hasLength(3));
+      expect(
+        oldAttempt.topics,
+        isEmpty,
+        reason: 'Stale startup cannot subscribe',
+      );
+      expect(peer.discoveryComplete, isTrue);
+      peer.dispose();
+      await tester.pump();
+    },
+  );
+
+  testWidgets('dispose during bus retirement cancels queued recovery', (
+    tester,
+  ) async {
+    final hub = _Broker();
+    final peer = MqttSignalingPeer(
+      id: 'room',
+      config: {},
+      busFactory: hub.bus,
+      instanceId: 'local',
+    );
+    peer.start();
+    await _admit(tester);
+    final retired = Completer<void>();
+    final bus = hub.buses.single..closeGate = retired;
+    bus.loseConnection();
+    await tester.pump();
+    peer.reconnect();
+    peer.dispose();
+    retired.complete();
+    await tester.pump(const Duration(seconds: 5));
+    peer.reconnect();
+    expect(hub.buses, hasLength(1));
+    expect(peer.open, isFalse);
+  });
+
+  testWidgets('single injected bus is never reused after permanent close', (
+    tester,
+  ) async {
+    final hub = _Broker();
+    final bus = hub.bus();
+    final peer = _peer('room', 'local', bus);
+    peer.start();
+    await _admit(tester);
+    bus.loseConnection();
+    await tester.pump();
+    final published = hub.published.length;
+    peer.reconnect();
+    peer.reconnect();
+    await tester.pump(const Duration(seconds: 5));
+    expect(hub.buses, hasLength(1));
+    expect(bus.closed, isTrue);
+    expect(hub.published, hasLength(published));
+    expect(peer.open, isFalse);
+    peer.dispose();
+    await tester.pump();
+  });
+
   testWidgets('discovery retries find a host still claiming its alias', (
     tester,
   ) async {
@@ -887,6 +1126,7 @@ class _Bus implements MqttSignalingBus {
   final subscribeGates = <String, Completer<void>>{};
   String? clientId;
   Completer<void>? connectGate;
+  Completer<void>? closeGate;
   bool closed = false;
 
   @override
@@ -919,6 +1159,7 @@ class _Bus implements MqttSignalingBus {
     if (closed) return;
     closed = true;
     topics.clear();
+    await closeGate?.future;
     await incoming.close();
     await disconnects.close();
   }

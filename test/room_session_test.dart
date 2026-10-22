@@ -53,7 +53,7 @@ class _Network {
     final peer = _FakePeer(
       this,
       id,
-      PeerOptions(autoReconnect: false, config: configuration),
+      PeerOptions(autoReconnect: false, maxRetries: 1, config: configuration),
     );
     peers.add(peer);
     if (autoRegister) scheduleMicrotask(peer.register);
@@ -131,6 +131,17 @@ class _FakePeer with _Events implements Peer {
     open = false;
     disconnected = true;
     emit<String?>('disconnected', id);
+  }
+
+  int reconnectCalls = 0;
+
+  @override
+  bool tryReconnect() {
+    if (destroyed || !disconnected) return false;
+    reconnectCalls++;
+    emit<int>('reconnecting', 0);
+    scheduleMicrotask(register);
+    return true;
   }
 
   @override
@@ -233,6 +244,7 @@ class _FakeConnection with _Events implements DataConnection {
   final sent = <dynamic>[];
   bool closeCalled = false;
   bool dropData = false;
+  Completer<void>? sendGate;
 
   void openChannel() {
     if (disposed) return;
@@ -245,6 +257,9 @@ class _FakeConnection with _Events implements DataConnection {
   @override
   Future<void> send(dynamic data) async {
     if (!open || disposed) throw StateError('Send before channel ready');
+    final gate = sendGate;
+    if (gate != null) await gate.future;
+    if (!open || disposed) throw StateError('Channel closed while sending');
     // A real DataChannel transfers detached JSON, not mutable Dart objects.
     final detached = jsonDecode(jsonEncode(data));
     sent.add(detached);
@@ -4385,7 +4400,7 @@ void main() {
   );
 
   testRoomWidgets(
-    'host signaling loss elects again without asking saved members to join',
+    'host signaling recovers its registration without replacing admitted RTC',
     (tester) async {
       network.autoRegister = true;
       final host = session(actor: 'host');
@@ -4394,7 +4409,15 @@ void main() {
       final saved = session(member: false, actor: 'saved');
       await saved.start();
       await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(
+        [host.initialSyncComplete, saved.initialSyncComplete],
+        [true, true],
+      );
       final oldHostPeer = network.registered[_alias]!;
+      final peers = network.peers.toList();
+      final channels = network.connections.toList();
       oldHostPeer.loseSignaling();
       await host.edit('during outage');
       await settle(tester);
@@ -4402,11 +4425,17 @@ void main() {
         await tester.pump(const Duration(seconds: 1));
         await settle(tester);
       }
-      expect(network.registered[_alias], isNotNull);
-      expect(network.registered[_alias], isNot(same(oldHostPeer)));
+      expect(network.registered[_alias], same(oldHostPeer));
+      expect(oldHostPeer.reconnectCalls, 1);
+      expect(network.peers, orderedEquals(peers));
+      expect(network.connections, orderedEquals(channels));
+      expect(channels.every((channel) => !channel.disposed), isTrue);
       expect([host.joined, saved.joined], everyElement(isTrue));
       expect([host.text, saved.text], everyElement('during outage'));
       expect([host.onlineCount, saved.onlineCount], everyElement(2));
+      await saved.edit('after signaling recovery');
+      await settle(tester);
+      expect(host.text, 'after signaling recovery');
       expect(tester.takeException(), isNull);
     },
   );
@@ -4734,7 +4763,7 @@ void main() {
   );
 
   testRoomWidgets(
-    'simultaneous resume replaces silent incoming and stale outgoing channels within eight seconds and unions offline journals',
+    'stalled channels survive the focus grace then reconnect and union offline journals',
     (tester) async {
       network.autoRegister = true;
       var clock = DateTime.utc(2026, 10, 15);
@@ -4792,13 +4821,24 @@ void main() {
       host.resume();
       member.resume();
       await settle(tester);
-      expect([incoming.disposed, outgoing.disposed], [true, true]);
+      expect([incoming.disposed, outgoing.disposed], [false, false]);
       await tester.pump(const Duration(milliseconds: 200));
       await settle(tester);
+      await tester.pump(const Duration(seconds: 89));
+      await settle(tester);
+      expect([incoming.disposed, outgoing.disposed], [false, false]);
+      expect(
+        [host.initialSyncComplete, member.initialSyncComplete],
+        [false, false],
+      );
       await tester.pump(const Duration(seconds: 1));
       await settle(tester);
+      for (var retry = 0; retry < 4; retry++) {
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+      }
       expect([incoming.disposed, outgoing.disposed], [true, true]);
-      expect(oldPeers.every((peer) => peer.destroyed), isTrue);
+      expect(oldPeers.any((peer) => peer.destroyed), isTrue);
       expect([host.onlineCount, member.onlineCount], [2, 2]);
       expect(host.text, member.text);
       expect([host.historyLength, member.historyLength], [5, 5]);
@@ -4816,7 +4856,409 @@ void main() {
   );
 
   testRoomWidgets(
-    'wake hides stale copy until missed history and fresh ACK are durable',
+    'execution pause rechecks missed history on the same admitted RTC channel',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 22);
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final storage = _Store();
+      final member = session(
+        actor: 'member',
+        store: storage,
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final peers = network.peers.toList();
+      final outgoing = peers.last.outbound.single;
+      final incoming = outgoing.other!;
+      final staleAck = _ackLocal(outgoing, actor: 'host');
+      member.setForeground(false);
+      incoming.dropData = true;
+      await host.edit('missed while the event loop slept');
+      await settle(tester);
+      expect(member.text, isEmpty);
+      incoming.dropData = false;
+      final gate = storage.appendGate = Completer<void>();
+      clock = clock.add(const Duration(seconds: 25));
+      member.setForeground(true);
+      expect(member.initialSyncComplete, isFalse);
+      expect(member.verifyingAfterResume, isTrue);
+      outgoing.receive(staleAck);
+      outgoing.receive(_checkpoint(const [], actor: 'host'));
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(outgoing.disposed, isFalse);
+      expect(incoming.disposed, isFalse);
+      expect(network.peers, orderedEquals(peers));
+      expect(member.initialSyncComplete, isFalse);
+      expect(await storage.loadHistory(_roomId), isEmpty);
+      gate.complete();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(member.text, 'missed while the event loop slept');
+      expect(
+        roomHistoryInventory(member.changes),
+        roomHistoryInventory(host.changes),
+      );
+      expect(network.peers, orderedEquals(peers));
+      expect(peers.every((peer) => !peer.destroyed), isTrue);
+      expect(storage.membershipCalls, 0);
+      expect(
+        _sentMessages(outgoing).where((message) => message.recheckId != null),
+        isNotEmpty,
+      );
+    },
+  );
+
+  testRoomWidgets(
+    'fresh nonce is required even after the current local checkpoint is ACKed',
+    (tester) async {
+      var clock = DateTime.utc(2026, 10, 22);
+      final member = session(preferExistingHost: true, now: () => clock);
+      final channel = await standaloneFollower(tester, member);
+      channel.openChannel();
+      channel.receive({
+        ..._message('welcome', const []),
+        'durableSync': true,
+        'recheckSync': true,
+        'fastSync': true,
+        'historyDigest': roomHistoryDigest(const []),
+      });
+      await settle(tester);
+      channel.receive(_checkpoint(const []));
+      channel.receive(_ackLocal(channel));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final peer = network.peers.single;
+      final staleAck = _ackLocal(channel);
+      member.setForeground(false);
+      clock = clock.add(const Duration(seconds: 25));
+      member.setForeground(true);
+      await settle(tester);
+      final firstRequest = _sentMessages(channel).lastWhere(
+        (message) =>
+            message.type == RoomMessageType.inventory &&
+            message.recheckId != null,
+      );
+      final firstRoundAck = _ackLocal(channel);
+      member.setForeground(false);
+      clock = clock.add(const Duration(seconds: 25));
+      member.setForeground(true);
+      await settle(tester);
+      final request = _sentMessages(channel).lastWhere(
+        (message) =>
+            message.type == RoomMessageType.inventory &&
+            message.recheckId != null,
+      );
+      expect(request.recheckId, isNot(firstRequest.recheckId));
+      channel.receive(staleAck);
+      channel.receive(firstRoundAck);
+      channel.receive({
+        ..._checkpoint(const [], syncId: 'e' * 32),
+        'recheckId': firstRequest.recheckId,
+      });
+      channel.receive(_checkpoint(const []));
+      channel.receive(_ackLocal(channel));
+      await settle(tester);
+      expect(
+        member.initialSyncComplete,
+        isFalse,
+        reason:
+            'a current ACK proves only our contribution, not a fresh remote read',
+      );
+      channel.receive({
+        ..._checkpoint(const [], syncId: 'b' * 32),
+        'recheckId': 'c' * 32,
+      });
+      await settle(tester);
+      expect(member.initialSyncComplete, isFalse);
+      channel.receive({
+        ..._checkpoint(const [], syncId: 'd' * 32),
+        'recheckId': request.recheckId,
+      });
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(channel.disposed, isFalse);
+      expect(network.peers, [peer]);
+      expect(peer.destroyed, isFalse);
+    },
+  );
+
+  testRoomWidgets(
+    'queued inventory cannot close RTC while a new checkpoint is preparing',
+    (tester) async {
+      var clock = DateTime.utc(2026, 10, 23);
+      final storage = _Store();
+      final member = session(
+        store: storage,
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      final channel = await standaloneFollower(tester, member);
+      channel.openChannel();
+      channel.receive({
+        ..._message('welcome', const []),
+        'durableSync': true,
+        'recheckSync': true,
+        'fastSync': true,
+        'historyDigest': roomHistoryDigest(const []),
+      });
+      await settle(tester);
+      channel.receive(_checkpoint(const []));
+      channel.receive(_ackLocal(channel));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final gate = storage.appendGate = Completer<void>();
+      final imported = _edit('queued-before-resume', 'held incoming append');
+      channel.receive(_message('edits', [imported]));
+      await settle(tester);
+      channel.receive({
+        ..._message('inventory', const []),
+        'inventory': <String, String>{},
+      });
+      member.setForeground(false);
+      clock = clock.add(const Duration(seconds: 25));
+      member.setForeground(true);
+      expect(member.initialSyncComplete, isFalse);
+      gate.complete();
+      await settle(tester);
+      expect(
+        channel.disposed,
+        isFalse,
+        reason:
+            'an older inventory can precede the queued checkpoint preparation',
+      );
+      expect(network.peers, hasLength(1));
+      expect(member.initialSyncError, isNull);
+      final request = _sentMessages(channel).lastWhere(
+        (message) =>
+            message.type == RoomMessageType.inventory &&
+            message.recheckId != null,
+      );
+      channel.receive(_checkpoint([imported]));
+      channel.receive(_ackLocal(channel));
+      channel.receive({
+        ..._checkpoint([imported], syncId: 'f' * 32),
+        'recheckId': request.recheckId,
+      });
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(member.text, 'held incoming append');
+      expect(channel.disposed, isFalse);
+    },
+  );
+
+  testRoomWidgets(
+    'minute-long remote silence keeps native RTC and recovers exact history',
+    (tester) async {
+      network.autoRegister = true;
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final member = session(actor: 'member', member: false);
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final peers = network.peers.toList();
+      final outgoing = peers.last.outbound.single;
+      final incoming = outgoing.other!;
+      outgoing.dropData = true;
+      incoming.dropData = true;
+      member.setForeground(false);
+      await host.edit('latest while remote timers are silent');
+      for (var tick = 0; tick < 13; tick++) {
+        await tester.pump(const Duration(seconds: 5));
+        await settle(tester);
+      }
+      expect([outgoing.disposed, incoming.disposed], [false, false]);
+      expect(network.peers, orderedEquals(peers));
+      expect([host.onlineCount, member.onlineCount], [1, 1]);
+      outgoing.dropData = false;
+      incoming.dropData = false;
+      member.setForeground(true);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 5));
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(
+        [host.initialSyncComplete, member.initialSyncComplete],
+        [true, true],
+      );
+      expect(member.text, 'latest while remote timers are silent');
+      expect(
+        roomHistoryInventory(host.changes),
+        roomHistoryInventory(member.changes),
+      );
+      expect(network.peers, orderedEquals(peers));
+      expect([outgoing.disposed, incoming.disposed], [false, false]);
+    },
+  );
+
+  testRoomWidgets(
+    'soft send timeout retains ordered chunks until the native send completes',
+    (tester) async {
+      network.autoRegister = true;
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final member = session(actor: 'member', preferExistingHost: true);
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final peers = network.peers.toList();
+      final outgoing = peers.last.outbound.single;
+      final incoming = outgoing.other!;
+      final before = incoming.sent.length;
+      final gate = incoming.sendGate = Completer<void>();
+      final text = 'ж' * 16000;
+      await host.edit(text);
+      await tester.pump(const Duration(seconds: 6));
+      await settle(tester);
+      expect(
+        incoming.sent.length,
+        before,
+        reason: 'a soft timeout cannot release the pending native send',
+      );
+      expect([incoming.disposed, outgoing.disposed], [false, false]);
+      expect(network.peers, orderedEquals(peers));
+      incoming.sendGate = null;
+      gate.complete();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.text, text);
+      expect(host.storageError, isNull);
+      expect(member.storageError, isNull);
+      expect(
+        roomHistoryInventory(host.changes),
+        roomHistoryInventory(member.changes),
+      );
+      expect(network.peers, orderedEquals(peers));
+      expect([incoming.disposed, outgoing.disposed], [false, false]);
+      expect(
+        _sentMessages(
+          incoming,
+        ).where((message) => message.type == RoomMessageType.edits),
+        isNotEmpty,
+      );
+    },
+  );
+
+  testRoomWidgets(
+    'heartbeats cannot keep a permanently blocked native send alive forever',
+    (tester) async {
+      network.autoRegister = true;
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final member = session(actor: 'member', preferExistingHost: true);
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final outgoing = network.peers.last.outbound.single;
+      final incoming = outgoing.other!;
+      final gate = incoming.sendGate = Completer<void>();
+      await host.edit('saved before the native send stalled');
+      for (var tick = 0; tick < 18; tick++) {
+        await tester.pump(const Duration(seconds: 5));
+        await settle(tester);
+      }
+      expect(incoming.disposed, isFalse);
+      expect(incoming.sent.any((packet) => packet['type'] == 'edits'), isFalse);
+      await tester.pump(const Duration(seconds: 5));
+      await settle(tester);
+      expect(
+        incoming.disposed,
+        isTrue,
+        reason: 'receive-only heartbeat progress cannot unblock a native send',
+      );
+      gate.complete();
+      await settle(tester);
+      for (var retry = 0; retry < 4; retry++) {
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+      }
+      expect(member.text, 'saved before the native send stalled');
+      expect(
+        roomHistoryInventory(host.changes),
+        roomHistoryInventory(member.changes),
+      );
+    },
+  );
+
+  testRoomWidgets(
+    'simultaneous durable rechecks converge without replacing either RTC peer',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 22);
+      final host = session(actor: 'host', now: () => clock);
+      await host.start();
+      await settle(tester);
+      await host.edit('common history');
+      final member = session(
+        actor: 'member',
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final peers = network.peers.toList();
+      final outgoing = peers.last.outbound.single;
+      final incoming = outgoing.other!;
+      outgoing.dropData = true;
+      incoming.dropData = true;
+      host.setForeground(false);
+      member.setForeground(false);
+      await host.edit('host offline contribution');
+      await member.edit('member offline contribution');
+      await settle(tester);
+      outgoing.dropData = false;
+      incoming.dropData = false;
+      clock = clock.add(const Duration(seconds: 25));
+      host.setForeground(true);
+      member.setForeground(true);
+      expect(
+        [host.initialSyncComplete, member.initialSyncComplete],
+        [false, false],
+      );
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(
+        [host.initialSyncComplete, member.initialSyncComplete],
+        [true, true],
+      );
+      expect(
+        roomHistoryInventory(host.changes),
+        roomHistoryInventory(member.changes),
+      );
+      expect(host.historyLength, 3);
+      expect(network.peers, orderedEquals(peers));
+      expect([outgoing.disposed, incoming.disposed], [false, false]);
+      expect(peers.every((peer) => !peer.destroyed), isTrue);
+    },
+  );
+
+  testRoomWidgets(
+    'wake after a closed channel hides stale copy until history and fresh ACK are durable',
     (tester) async {
       network.autoRegister = true;
       var clock = DateTime.utc(2026, 10, 20);
@@ -4845,6 +5287,7 @@ void main() {
       expect(member.text, isEmpty);
       final gate = storage.appendGate = Completer<void>();
       clock = clock.add(const Duration(seconds: 25));
+      old.dispose();
       member.setForeground(true);
       expect(member.initialSyncComplete, isFalse);
       expect(member.verifyingAfterResume, isTrue);
@@ -4876,120 +5319,148 @@ void main() {
     },
   );
 
-  testRoomWidgets('fresh verification completed while hidden is not repeated on foreground', (tester) async {
-    network.autoRegister = true;
-    var clock = DateTime.utc(2026, 10, 22);
-    final host = session(actor: 'host');
-    await host.start();
-    await settle(tester);
-    final member = session(actor: 'member', preferExistingHost: true, now: () => clock);
-    await member.start();
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    member.setForeground(false);
-    clock = clock.add(const Duration(seconds: 25));
-    await tester.pump(const Duration(seconds: 5));
-    await settle(tester);
-    expect(member.initialSyncComplete, isFalse);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    expect(member.initialSyncComplete, isTrue);
-    final peers = network.peers.toList();
-    member.setForeground(true);
-    expect(member.initialSyncComplete, isTrue);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester);
-    expect(network.peers, orderedEquals(peers));
-  });
+  testRoomWidgets(
+    'fresh verification completed while hidden is not repeated on foreground',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 22);
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final member = session(
+        actor: 'member',
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      member.setForeground(false);
+      clock = clock.add(const Duration(seconds: 25));
+      await tester.pump(const Duration(seconds: 5));
+      await settle(tester);
+      // The in-place exchange can finish in the same turn; no reconnect delay
+      // is necessary once its new nonce and durable checkpoint are confirmed.
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final peers = network.peers.toList();
+      member.setForeground(true);
+      expect(member.initialSyncComplete, isTrue);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(network.peers, orderedEquals(peers));
+    },
+  );
 
-  testRoomWidgets('last peer closing during the focus probe cannot keep stale readiness', (tester) async {
-    network.autoRegister = true;
-    var clock = DateTime.utc(2026, 10, 22);
-    final host = session(actor: 'host');
-    await host.start();
-    await settle(tester);
-    final storage = _Store();
-    final member = session(actor: 'member', store: storage,
-      preferExistingHost: true, now: () => clock);
-    await member.start();
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    final old = network.peers.last.outbound.single;
-    old.dropData = true;
-    old.other!.dropData = true;
-    member.setForeground(false);
-    await host.edit('missed before deferred close');
-    await settle(tester);
-    clock = clock.add(const Duration(seconds: 4));
-    member.setForeground(true);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester);
-    expect(member.initialSyncComplete, isTrue);
-    final gate = storage.appendGate = Completer<void>();
-    old.open = false;
-    old.emit<void>('close', null);
-    await settle(tester);
-    expect(member.initialSyncComplete, isFalse);
-    expect(member.verifyingAfterResume, isTrue);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester);
-    expect(member.initialSyncComplete, isFalse);
-    gate.complete();
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    expect(member.initialSyncComplete, isTrue);
-    expect(member.text, 'missed before deferred close');
-  });
+  testRoomWidgets(
+    'last peer closing during the focus probe cannot keep stale readiness',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 22);
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final storage = _Store();
+      final member = session(
+        actor: 'member',
+        store: storage,
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final old = network.peers.last.outbound.single;
+      old.dropData = true;
+      old.other!.dropData = true;
+      member.setForeground(false);
+      await host.edit('missed before deferred close');
+      await settle(tester);
+      clock = clock.add(const Duration(seconds: 4));
+      member.setForeground(true);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final gate = storage.appendGate = Completer<void>();
+      old.open = false;
+      old.emit<void>('close', null);
+      await settle(tester);
+      expect(member.initialSyncComplete, isFalse);
+      expect(member.verifyingAfterResume, isTrue);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(member.initialSyncComplete, isFalse);
+      gate.complete();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(member.text, 'missed before deferred close');
+    },
+  );
 
-  testRoomWidgets('short focus return escalates a silent last peer to durable verification', (tester) async {
-    network.autoRegister = true;
-    var clock = DateTime.utc(2026, 10, 22);
-    final host = session(actor: 'host');
-    await host.start();
-    await settle(tester);
-    final storage = _Store();
-    final member = session(actor: 'member', store: storage,
-      preferExistingHost: true, now: () => clock);
-    await member.start();
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    final old = network.peers.last.outbound.single;
-    old.dropData = true;
-    old.other!.dropData = true;
-    member.setForeground(false);
-    await host.edit('missed during a short pause');
-    await settle(tester);
-    clock = clock.add(const Duration(seconds: 4));
-    member.setForeground(true);
-    expect(member.initialSyncComplete, isTrue);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester);
-    await tester.pump(const Duration(milliseconds: 5999));
-    await settle(tester);
-    expect(member.initialSyncComplete, isTrue);
-    final saved = storage.appendGate = Completer<void>();
-    await tester.pump(const Duration(milliseconds: 1));
-    await settle(tester);
-    expect(member.initialSyncComplete, isFalse);
-    expect(member.verifyingAfterResume, isTrue);
-    expect(old.disposed, isTrue);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settle(tester);
-    expect(member.initialSyncComplete, isFalse);
-    saved.complete();
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    expect(member.initialSyncComplete, isTrue);
-    expect(member.text, 'missed during a short pause');
-    expect(roomHistoryInventory(member.changes), roomHistoryInventory(host.changes));
-  });
+  testRoomWidgets(
+    'short focus return escalates a silent last peer to durable verification',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 22);
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final storage = _Store();
+      final member = session(
+        actor: 'member',
+        store: storage,
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final old = network.peers.last.outbound.single;
+      old.dropData = true;
+      old.other!.dropData = true;
+      member.setForeground(false);
+      await host.edit('missed during a short pause');
+      await settle(tester);
+      clock = clock.add(const Duration(seconds: 4));
+      member.setForeground(true);
+      expect(member.initialSyncComplete, isTrue);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      await tester.pump(const Duration(milliseconds: 5999));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      final saved = storage.appendGate = Completer<void>();
+      await tester.pump(const Duration(milliseconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isFalse);
+      expect(member.verifyingAfterResume, isTrue);
+      expect(old.disposed, isFalse);
+      old.dropData = false;
+      old.other!.dropData = false;
+      member.resume();
+      await tester.pump(const Duration(milliseconds: 200));
+      await settle(tester);
+      expect(member.initialSyncComplete, isFalse);
+      saved.complete();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(member.initialSyncComplete, isTrue);
+      expect(member.text, 'missed during a short pause');
+      expect(
+        roomHistoryInventory(member.changes),
+        roomHistoryInventory(host.changes),
+      );
+    },
+  );
 
   testRoomWidgets(
     'resumed solo cannot substitute discovery for synchronization',
@@ -5082,7 +5553,7 @@ void main() {
   );
 
   testRoomWidgets(
-    'host resume drops only silent channels and retains a healthy incoming peer',
+    'host resume isolates a silent channel without replacing healthy incoming peers',
     (tester) async {
       network.autoRegister = true;
       final host = session(actor: 'host');
@@ -5110,7 +5581,8 @@ void main() {
       expect(silentIncoming.sent.last['type'], 'presence');
       await tester.pump(const Duration(seconds: 6));
       await settle(tester);
-      expect(silentIncoming.disposed, isTrue);
+      expect(silentIncoming.disposed, isFalse);
+      expect(host.onlineCount, 2);
       expect(
         [healthyIncoming.disposed, healthyOutgoing.disposed],
         [false, false],
@@ -5136,41 +5608,48 @@ void main() {
     },
   );
 
-  testRoomWidgets('healthy Alt+Tab keeps readiness and channels across long hides', (tester) async {
-    network.autoRegister = true;
-    var clock = DateTime.utc(2026, 10, 22);
-    final host = session(actor: 'host');
-    await host.start();
-    await settle(tester);
-    final member = session(actor: 'member', preferExistingHost: true, now: () => clock);
-    await member.start();
-    await settle(tester);
-    await tester.pump(const Duration(seconds: 1));
-    await settle(tester);
-    final peers = network.peers.toList();
-    final readiness = <bool>[];
-    member.addListener(() => readiness.add(member.initialSyncComplete));
-    for (var hide = 0; hide < 3; hide++) {
-      member.setForeground(false);
-      for (var tick = 0; tick < 6; tick++) {
-        clock = clock.add(const Duration(seconds: 5));
-        await tester.pump(const Duration(seconds: 5));
+  testRoomWidgets(
+    'healthy Alt+Tab keeps readiness and channels across long hides',
+    (tester) async {
+      network.autoRegister = true;
+      var clock = DateTime.utc(2026, 10, 22);
+      final host = session(actor: 'host');
+      await host.start();
+      await settle(tester);
+      final member = session(
+        actor: 'member',
+        preferExistingHost: true,
+        now: () => clock,
+      );
+      await member.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final peers = network.peers.toList();
+      final readiness = <bool>[];
+      member.addListener(() => readiness.add(member.initialSyncComplete));
+      for (var hide = 0; hide < 3; hide++) {
+        member.setForeground(false);
+        for (var tick = 0; tick < 6; tick++) {
+          clock = clock.add(const Duration(seconds: 5));
+          await tester.pump(const Duration(seconds: 5));
+          await settle(tester);
+        }
+        member.setForeground(true);
+        await tester.pump(const Duration(milliseconds: 200));
         await settle(tester);
+        expect(member.initialSyncComplete, isTrue);
+        expect(member.verifyingAfterResume, isFalse);
+        expect(network.peers, orderedEquals(peers));
+        await host.edit('still connected $hide');
+        await settle(tester);
+        expect(member.text, 'still connected $hide');
       }
-      member.setForeground(true);
-      await tester.pump(const Duration(milliseconds: 200));
-      await settle(tester);
-      expect(member.initialSyncComplete, isTrue);
-      expect(member.verifyingAfterResume, isFalse);
-      expect(network.peers, orderedEquals(peers));
-      await host.edit('still connected $hide');
-      await settle(tester);
-      expect(member.text, 'still connected $hide');
-    }
-    expect(readiness, isNotEmpty);
-    expect(readiness, everyElement(isTrue));
-    expect(peers.every((peer) => !peer.destroyed), isTrue);
-  });
+      expect(readiness, isNotEmpty);
+      expect(readiness, everyElement(isTrue));
+      expect(peers.every((peer) => !peer.destroyed), isTrue);
+    },
+  );
 
   testRoomWidgets(
     'healthy hide shorter than three seconds does not probe or create peers',
@@ -5313,32 +5792,35 @@ void main() {
     },
   );
 
-  testRoomWidgets('healthy local follower Alt+Tab keeps readiness without asking owner to resync', (tester) async {
-    final hub = _TabsHub();
-    final owner = roomTabs(hub);
-    await owner.start();
-    owner.publish(_tabState(const [], online: 2));
-    final tab = roomTabs(hub);
-    var clock = DateTime.utc(2026, 10, 22);
-    final follower = session(tabCoordinator: tab, now: () => clock);
-    await follower.start();
-    await settleTabs(tester);
-    final ready = <bool>[];
-    follower.addListener(() => ready.add(follower.initialSyncComplete));
-    follower.setForeground(false);
-    for (var tick = 0; tick < 8; tick++) {
-      clock = clock.add(const Duration(seconds: 5));
-      await tester.pump(const Duration(seconds: 5));
+  testRoomWidgets(
+    'healthy local follower Alt+Tab keeps readiness without asking owner to resync',
+    (tester) async {
+      final hub = _TabsHub();
+      final owner = roomTabs(hub);
+      await owner.start();
+      owner.publish(_tabState(const [], online: 2));
+      final tab = roomTabs(hub);
+      var clock = DateTime.utc(2026, 10, 22);
+      final follower = session(tabCoordinator: tab, now: () => clock);
+      await follower.start();
       await settleTabs(tester);
-    }
-    follower.setForeground(true);
-    await tester.pump(const Duration(milliseconds: 200));
-    await settleTabs(tester);
-    expect(follower.initialSyncComplete, isTrue);
-    expect(ready, everyElement(isTrue));
-    expect(tab.resyncRequests, isEmpty);
-    expect(network.peers, isEmpty);
-  });
+      final ready = <bool>[];
+      follower.addListener(() => ready.add(follower.initialSyncComplete));
+      follower.setForeground(false);
+      for (var tick = 0; tick < 8; tick++) {
+        clock = clock.add(const Duration(seconds: 5));
+        await tester.pump(const Duration(seconds: 5));
+        await settleTabs(tester);
+      }
+      follower.setForeground(true);
+      await tester.pump(const Duration(milliseconds: 200));
+      await settleTabs(tester);
+      expect(follower.initialSyncComplete, isTrue);
+      expect(ready, everyElement(isTrue));
+      expect(tab.resyncRequests, isEmpty);
+      expect(network.peers, isEmpty);
+    },
+  );
 
   testRoomWidgets(
     'local follower resume rejects cached ready state until correlated fresh proof',
@@ -5432,8 +5914,6 @@ void main() {
       expect(follower.initialSyncComplete, isFalse);
       await tester.pump(const Duration(milliseconds: 200));
       await settleTabs(tester);
-      expect(owner.initialSyncComplete, isFalse);
-      expect(follower.initialSyncComplete, isFalse);
       await tester.pump(const Duration(milliseconds: 200));
       await settle(tester);
       await tester.pump(const Duration(seconds: 1));
@@ -5448,9 +5928,9 @@ void main() {
       );
       expect(
         network.peers.length,
-        peersBefore + 2,
+        peersBefore,
         reason:
-            'The owner tries the occupied alias, then follows; the local follower opens no sockets',
+            'The owner rechecks its existing RTC; the local follower opens no sockets',
       );
       expect(
         roomHistoryInventory(follower.changes),

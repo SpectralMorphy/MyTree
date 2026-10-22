@@ -181,6 +181,9 @@ class RoomSession extends ChangeNotifier {
   static const _checkpointDeadline = Duration(seconds: 12);
   static const _assemblyDeadline = Duration(seconds: 25);
   static const _livenessDeadline = Duration(seconds: 20);
+  // Background timers can be delayed for a minute while native RTC stays open.
+  // Count only an uninterrupted foreground window before replacing such a link.
+  static const _stalledChannelDeadline = Duration(seconds: 90);
 
   late final RoomHistory _history;
   late final YandexDiskClient _diskClient;
@@ -277,6 +280,7 @@ class RoomSession extends ChangeNotifier {
   bool _registered = false;
   bool _signalingReady = false;
   bool _peerFailed = false;
+  bool _recoveringSignaling = false;
   String _requestedId = '';
   String? _error;
   String? _networkIssue;
@@ -1458,6 +1462,7 @@ class RoomSession extends ChangeNotifier {
         actorId,
         for (final state in _connections.values)
           if (state.ready &&
+              state.responsive &&
               state.connection.open &&
               _live(state) &&
               state.actor != null)
@@ -1467,6 +1472,7 @@ class RoomSession extends ChangeNotifier {
     final host = _hostConnection;
     if (host != null &&
         host.ready &&
+        host.responsive &&
         host.connection.open &&
         _live(host) &&
         host.actor != null) {
@@ -1569,6 +1575,7 @@ class RoomSession extends ChangeNotifier {
     return !_hosting &&
         host != null &&
         host.ready &&
+        host.responsive &&
         host.actor != null &&
         host.connection.open &&
         _live(host);
@@ -1579,6 +1586,7 @@ class RoomSession extends ChangeNotifier {
   bool get hasValidatedOnlinePeer => _connections.values.any(
     (state) =>
         state.ready &&
+        state.responsive &&
         state.actor != null &&
         state.actor != actorId &&
         state.connection.open &&
@@ -1602,13 +1610,16 @@ class RoomSession extends ChangeNotifier {
         actorId,
         for (final state in _connections.values)
           if (state.ready &&
+              state.responsive &&
               state.connection.open &&
               _live(state) &&
               state.actor != null)
             state.actor!,
       }.length;
     }
-    return _hostConnection?.ready == true && _live(_hostConnection!)
+    return _hostConnection?.ready == true &&
+            _hostConnection!.responsive &&
+            _live(_hostConnection!)
         ? _remoteOnline
         : 1;
   }
@@ -1648,8 +1659,17 @@ class RoomSession extends ChangeNotifier {
       final previous = _lastExecutionAt;
       _lastExecutionAt = tick;
       if (previous != null && tick.difference(previous) > _livenessDeadline) {
-        if (_initialSyncComplete) _beginResumeVerification();
+        for (final state in _connections.values) {
+          state.stalledDeadline?.cancel();
+          state.stalledDeadline = null;
+        }
+        if (_initialSyncComplete || _resumeVerification) {
+          _beginResumeVerification(afterSuspension: true);
+        }
         resume();
+      }
+      for (final state in _connections.values) {
+        if (!state.responsive || state.rechecking) _watchStalledChannel(state);
       }
     });
     _networkSubscription = watchNetworkOnlineHint().listen((online) {
@@ -2186,6 +2206,7 @@ class RoomSession extends ChangeNotifier {
         _live(host) &&
         host.ready &&
         host.remoteImported &&
+        _freshRecheckImported(host) &&
         host.localAcknowledged &&
         host.remoteRoomReady;
   }
@@ -2234,14 +2255,17 @@ class RoomSession extends ChangeNotifier {
     });
   }
 
-  void _beginInitialWait({bool resuming = false}) {
+  void _beginInitialWait({
+    bool resuming = false,
+    bool preserveLocalCopy = false,
+  }) {
     _resumeVerification = resuming;
     _entryAttempt++;
     _entryExpired = false;
     _initialTimer?.cancel();
     _initialSyncComplete = false;
     _initialSyncFromDisk = false;
-    _localCopyOpened = false;
+    if (!preserveLocalCopy) _localCopyOpened = false;
     _initialSyncError = null;
     _soloCheckpoint = null;
     _failedInitialConnection = false;
@@ -2330,6 +2354,10 @@ class RoomSession extends ChangeNotifier {
         _backgroundNetworkAvailable = networkAvailable;
         _backgroundConnectionLost = false;
       }
+      for (final state in _connections.values) {
+        state.stalledDeadline?.cancel();
+        state.stalledDeadline = null;
+      }
       return;
     }
     final hiddenAt = _backgroundedAt;
@@ -2342,7 +2370,9 @@ class RoomSession extends ChangeNotifier {
     final execution = _lastExecutionAt;
     final suspended =
         execution != null && now().difference(execution) > _livenessDeadline;
-    if (_initialSyncComplete && (suspended || lostNetwork || lostConnection)) {
+    if (suspended && (_initialSyncComplete || _resumeVerification)) {
+      _beginResumeVerification(afterSuspension: true);
+    } else if (_initialSyncComplete && (lostNetwork || lostConnection)) {
       _beginResumeVerification();
     } else if (hiddenAt != null &&
         (now().difference(hiddenAt) >= const Duration(seconds: 3) ||
@@ -2367,13 +2397,17 @@ class RoomSession extends ChangeNotifier {
         );
   }
 
-  void _beginResumeVerification() {
-    if (_disposed || !_joined || !_history.loaded || _resumeVerification) {
+  void _beginResumeVerification({bool afterSuspension = false}) {
+    if (_disposed ||
+        !_joined ||
+        !_history.loaded ||
+        (_resumeVerification && !afterSuspension)) {
       return;
     }
     _lastExecutionAt = now();
+    _resumeTimer?.cancel();
+    _resumeTimer = null;
     _resumeProbes.clear();
-    _stopNetwork();
     _tabState = null;
     _verifiedTabState = null;
     _publishedTabState = null;
@@ -2381,8 +2415,142 @@ class RoomSession extends ChangeNotifier {
     _updateDiskSync();
     _resumeRecoveryPending = true;
     if (_isTabFollower) _tabResyncId = createRoomId();
-    _beginInitialWait(resuming: true);
+    _beginInitialWait(
+      resuming: true,
+      preserveLocalCopy: afterSuspension && _localCopyOpened,
+    );
+    _settledHosting = false;
+    _soloCheckpoint = null;
+    _soloTimer?.cancel();
+    _soloTimer = null;
+    // Invalidate every old contribution before any queued flush/reply can run.
+    // Admission, ordered sends, assemblies and native RTC are independent.
+    for (final state in _connections.values.toList()) {
+      if (!state.ready) continue;
+      if (_canRecheck(state)) {
+        _beginConnectionRecheck(state, force: true);
+      } else {
+        _dropConnection(state, 'Требуется новое подтверждение истории');
+      }
+    }
     resume();
+  }
+
+  bool _canRecheck(_RoomConnection state) =>
+      _live(state) &&
+      state.ready &&
+      state.recheckSync &&
+      state.durableSync &&
+      state.connection.open &&
+      state.connection.connectivity != ChannelConnectivity.failed &&
+      state.connection.connectivity != ChannelConnectivity.closed;
+
+  void _beginConnectionRecheck(_RoomConnection state, {bool force = false}) {
+    if (!_canRecheck(state) || (state.rechecking && !force)) return;
+    final revision = ++state.recheckRevision;
+    state.recheckId = createRoomId();
+    state.rechecking = true;
+    state.recheckCheckpoint = null;
+    state.recheckImported = false;
+    state.recheckRemoteSyncId = null;
+    state.recheckRemoteSyncDigest = null;
+    state.recheckAcknowledged = false;
+    state.remoteCheckpoint = null;
+    state.remoteSyncId = null;
+    state.remoteSyncDigest = null;
+    state.remoteImported = false;
+    state.localAcknowledged = false;
+    state.remoteRoomReady = false;
+    state.localSyncId = null;
+    state.localSyncDigest = null;
+    state.initialHistory = null;
+    state.inventorySent = false;
+    state.finalCheckpointSent = false;
+    state.ackedRemoteId = null;
+    state.ackedRoomReady = null;
+    state.stalledDeadline?.cancel();
+    state.stalledDeadline = null;
+    _cancelCheckpointDeadline(state);
+    _messages = _messages.then((_) async {
+      if (!_live(state) || state.recheckRevision != revision) return;
+      if (!await _prepareCheckpoint(state, revision: revision)) return;
+      _updateCheckpointDeadline(state);
+      _sendRecheckRequest(state);
+      _watchStalledChannel(state);
+    });
+  }
+
+  void _sendRecheckRequest(_RoomConnection state) {
+    if (!_live(state) || !state.rechecking || state.initialHistory == null) {
+      return;
+    }
+    unawaited(
+      _send(
+        state,
+        _message(
+          RoomMessageType.inventory,
+          const [],
+          inventory: roomHistoryInventory(state.initialHistory!),
+          recheckId: state.recheckId,
+        ),
+      ),
+    );
+    unawaited(_sendCheckpoint(state, includeInventory: true));
+  }
+
+  Future<void> _answerRecheck(
+    _RoomConnection state,
+    RoomMessage request,
+  ) async {
+    if (!state.recheckSync || !state.durableSync) {
+      throw const FormatException('Повторная проверка истории не согласована');
+    }
+    final newRequest = state.answeredRecheckId != request.recheckId;
+    if (newRequest) {
+      final cutoff = _history.knownEdits;
+      await _history.flush();
+      if (!_live(state)) return;
+      state.recheckResponseHistory = completeRoomAuthorHistory(
+        cutoff,
+        _history.durableHistory,
+      );
+      state.recheckResponseSyncId = createRoomId();
+      state.answeredRecheckId = request.recheckId;
+    }
+    final history = state.recheckResponseHistory!;
+    unawaited(
+      _send(
+        state,
+        _message(
+          RoomMessageType.inventory,
+          const [],
+          inventory: roomHistoryInventory(history),
+        ),
+      ),
+    );
+    missingRoomEdits(_history.knownEdits, request.inventory!);
+    final missing = missingRoomEdits(history, request.inventory!);
+    if (missing.isNotEmpty) {
+      unawaited(_send(state, _message(RoomMessageType.edits, missing)));
+    }
+    // A response has its own fixed token. It must not supersede this side's
+    // tracked checkpoint when both devices request a recheck simultaneously.
+    unawaited(
+      _send(
+        state,
+        _message(
+          RoomMessageType.checkpoint,
+          const [],
+          syncId: state.recheckResponseSyncId,
+          syncDigest: roomHistoryDigest(history),
+          inventory: roomHistoryInventory(history),
+          recheckId: request.recheckId,
+        ),
+      ),
+    );
+    // A peer returning from a long pause can have missed our own request.
+    // Repeat its existing nonce once per new remote request, never a new round.
+    if (newRequest) _sendRecheckRequest(state);
   }
 
   Future<void> _resumeVerifiedCopy() async {
@@ -2398,7 +2566,16 @@ class RoomSession extends ChangeNotifier {
     _error = null;
     _networkIssue = null;
     _retryAttempt = 0;
-    _startNetwork();
+    if (!_running) {
+      _startNetwork();
+    } else if (_connections.isEmpty) {
+      _resumePeer();
+    } else if (_peerFailed) {
+      _reconnect('Восстанавливаем поиск участников');
+    }
+    for (final state in _connections.values) {
+      _sendRecheckRequest(state);
+    }
     await _enterFromDisk(attempt);
     if (_disposed || attempt != _entryAttempt) return;
     _diskEntryPending = false;
@@ -2410,10 +2587,10 @@ class RoomSession extends ChangeNotifier {
   void resume() {
     if (_disposed || !_joined || !_history.loaded) return;
     final heartbeat = _lastExecutionAt;
-    if (_initialSyncComplete &&
+    if ((_initialSyncComplete || _resumeVerification) &&
         heartbeat != null &&
         now().difference(heartbeat) > _livenessDeadline) {
-      _beginResumeVerification();
+      _beginResumeVerification(afterSuspension: true);
       return;
     }
     if (!_networkOnlineHint) return;
@@ -2451,6 +2628,9 @@ class RoomSession extends ChangeNotifier {
           connectivity == ChannelConnectivity.closed ||
           (state.opened && !state.connection.open)) {
         _dropConnection(state, 'Проверка связи после пробуждения');
+      } else if (state.rechecking) {
+        _sendRecheckRequest(state);
+        _watchStalledChannel(state);
       } else if (state.ready &&
           !_checkpointPending(state) &&
           !state.decoder.assembling) {
@@ -2504,10 +2684,13 @@ class RoomSession extends ChangeNotifier {
         // A silent last peer can have missed live edits. Retire its old proof
         // before reconnecting, rather than leaving the stale copy marked ready.
         _beginResumeVerification();
+        for (final state in silent) {
+          _channelTimedOut(state, 'Участник не ответил после пробуждения');
+        }
         return;
       }
       for (final state in silent) {
-        _dropConnection(state, 'Участник не ответил после пробуждения');
+        _channelTimedOut(state, 'Участник не ответил после пробуждения');
       }
       // A newly arriving peer may still be saving its welcome/hello. Its own
       // handshake/assembly deadline must finish before another election.
@@ -2674,9 +2857,7 @@ class RoomSession extends ChangeNotifier {
         }
         _peerSubscriptions.add(
           peer.onOpen.listen((id) {
-            if (_current(generation) && !_peerFailed) {
-              _peerOpened(generation, id);
-            }
+            if (_current(generation)) _peerOpened(generation, id);
           }),
         );
         _peerSubscriptions.add(
@@ -2693,14 +2874,16 @@ class RoomSession extends ChangeNotifier {
         );
         _peerSubscriptions.add(
           peer.onError.listen((error) {
-            if (!_current(generation) || _peerFailed) return;
-            if (_hosting && error.kind == SignalingFailureKind.idTaken) {
+            if (!_current(generation)) return;
+            if (error.kind == SignalingFailureKind.idTaken) {
+              // Identity contention is never a recoverable signaling outage,
+              // including a late conflict while registration is being retried.
               _retirePeer();
               final nextGeneration = _generation;
               scheduleMicrotask(() {
                 if (_current(nextGeneration)) _beginPeer(tryAlias: false);
               });
-            } else {
+            } else if (!_peerFailed) {
               _reconnect('$error');
             }
           }),
@@ -2736,13 +2919,22 @@ class RoomSession extends ChangeNotifier {
   }
 
   void _peerOpened(int generation, String? id) {
-    if (!_current(generation) || _registered || _peerFailed) return;
+    if (!_current(generation) ||
+        (_registered && _signalingReady) ||
+        (_peerFailed && !_recoveringSignaling)) {
+      return;
+    }
     if (id != _requestedId) {
       _reconnect('Signaling вернул неожиданный ID');
       return;
     }
+    final recovered = _registered;
     _registered = true;
     _signalingReady = true;
+    _peerFailed = false;
+    _recoveringSignaling = false;
+    _retryTimer?.cancel();
+    _retryTimer = null;
     final peer = _peer;
     _discoveryComplete =
         peer is SignalingDiscovery &&
@@ -2752,6 +2944,10 @@ class RoomSession extends ChangeNotifier {
     _updateEntryBarrier();
     _changed();
     if (_hosting) return;
+    final host = _hostConnection;
+    if (recovered && host != null && _live(host) && host.connection.open) {
+      return;
+    }
     scheduleMicrotask(() {
       final peer = _peer;
       if (!_current(generation) ||
@@ -2784,8 +2980,8 @@ class RoomSession extends ChangeNotifier {
     _registrationTimer?.cancel();
     _networkIssue = reason;
     _record(reason);
-    // Existing channels still work during the backoff, but an alias holder
-    // which lost signaling asks saved followers to participate in election.
+    // Discovery failure is not a transport failure. Keep admitted RTC while
+    // recovering this registration; a closed/stalled cohort still elects anew.
     if (_hosting) {
       _broadcast(
         _message(
@@ -2803,7 +2999,23 @@ class RoomSession extends ChangeNotifier {
     );
     _retryTimer = Timer(delay, () {
       _retryTimer = null;
-      if (_current(generation)) _beginPeer(tryAlias: _joined);
+      if (!_current(generation)) return;
+      if (_connections.values.any(
+        (state) => state.established && _canRecheck(state),
+      )) {
+        final peer = _peer;
+        try {
+          if (peer is SignalingRecovery) {
+            _recoveringSignaling = true;
+            (peer as SignalingRecovery).reconnect();
+          }
+        } catch (error) {
+          _record('Не удалось восстановить signaling: $error');
+        }
+        if (_current(generation) && _peerFailed) _reconnect(reason);
+      } else {
+        _beginPeer(tryAlias: _joined);
+      }
     });
     _changed();
   }
@@ -2871,7 +3083,7 @@ class RoomSession extends ChangeNotifier {
     } else if (connectivity == ChannelConnectivity.disconnected) {
       state.iceDeadline ??= Timer(const Duration(seconds: 5), () {
         if (_live(state)) {
-          _dropConnection(state, 'WebRTC/ICE потерял связь');
+          _channelTimedOut(state, 'WebRTC/ICE потерял связь');
         }
       });
     } else {
@@ -3018,6 +3230,7 @@ class RoomSession extends ChangeNotifier {
     String? syncDigest,
     bool? roomReady,
     Map<String, String>? inventory,
+    String? recheckId,
   }) => RoomMessage(
     roomId: roomId,
     type: type,
@@ -3052,6 +3265,9 @@ class RoomSession extends ChangeNotifier {
     authorHistory:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
     diskSync: type == RoomMessageType.hello || type == RoomMessageType.welcome,
+    recheckSync:
+        type == RoomMessageType.hello || type == RoomMessageType.welcome,
+    recheckId: recheckId,
     onlineActors:
         _hosting &&
             networkAvailable &&
@@ -3068,7 +3284,12 @@ class RoomSession extends ChangeNotifier {
   /// Snapshot after admission: includes writes which completed while this
   /// channel was not ready. Later durable edits use the ordinary broadcast.
   Future<void> _sendInventory(_RoomConnection state) {
-    if (state.inventorySent) return Future<void>.value();
+    if (state.inventorySent ||
+        (state.durableSync && state.initialHistory == null)) {
+      // A previously queued inventory can precede the new round's preparation.
+      // Its fresh request will repeat this exchange once the cutoff is durable.
+      return Future<void>.value();
+    }
     state.inventorySent = true;
     return _send(
       state,
@@ -3084,13 +3305,17 @@ class RoomSession extends ChangeNotifier {
 
   /// Freeze the entry contribution at admission, including already-started
   /// local appends. Subsequent typing uses broadcasts and cannot move this goal.
-  Future<bool> _prepareCheckpoint(_RoomConnection state) async {
+  Future<bool> _prepareCheckpoint(
+    _RoomConnection state, {
+    int? revision,
+  }) async {
+    revision ??= state.recheckRevision;
     // Drafts have immutable IDs/core clocks, but acquire their canonical proof
     // only during the atomic append. Freeze the logical cutoff, not draft JSON.
     final cutoff = _history.knownEdits;
     try {
       await _history.flush();
-      if (!_live(state)) return false;
+      if (!_live(state) || state.recheckRevision != revision) return false;
       state.initialHistory = completeRoomAuthorHistory(
         cutoff,
         _history.durableHistory,
@@ -3154,17 +3379,24 @@ class RoomSession extends ChangeNotifier {
     throw const FormatException('Нет списка для контрольной точки истории');
   }
 
-  bool _hasDurableCheckpoint(_RoomConnection state) {
-    final expected = state.remoteCheckpoint;
+  bool _containsDurableInventory(Map<String, String>? expected) {
     if (expected == null) return false;
     final durable = _durableTabInventory;
     return expected.entries.every((entry) => durable[entry.key] == entry.value);
   }
 
+  bool _hasDurableCheckpoint(_RoomConnection state) =>
+      _containsDurableInventory(state.remoteCheckpoint);
+
+  bool _freshRecheckImported(_RoomConnection state) =>
+      state.recheckId == null || state.recheckImported;
+
   bool _checkpointPending(_RoomConnection state) =>
       state.ready &&
       state.durableSync &&
-      (!state.remoteImported || !state.localAcknowledged);
+      (!state.remoteImported ||
+          !state.localAcknowledged ||
+          !_freshRecheckImported(state));
 
   void _cancelCheckpointDeadline(_RoomConnection state) {
     state.checkpointDeadline?.cancel();
@@ -3178,12 +3410,15 @@ class RoomSession extends ChangeNotifier {
       _cancelCheckpointDeadline(state);
       return;
     }
-    if (state.decoder.assembling) return;
+    if (state.decoder.assembling ||
+        (state.rechecking && state.localSyncId == null)) {
+      return;
+    }
     // Presence/liveness and repeated checkpoint packets never renew this timer.
     // roomReady:false can mean another cohort member is pending, not this one.
     state.checkpointDeadline ??= Timer(_checkpointDeadline, () {
       if (_live(state) && _checkpointPending(state)) {
-        _dropConnection(state, 'Не подтверждена контрольная точка истории');
+        _channelTimedOut(state, 'Не подтверждена контрольная точка истории');
       }
     });
   }
@@ -3197,7 +3432,7 @@ class RoomSession extends ChangeNotifier {
     // accepted fragments cannot stretch checkpoint waiting indefinitely.
     state.checkpointAssemblyDeadline ??= Timer(_assemblyDeadline, () {
       if (_live(state) && _checkpointPending(state)) {
-        _dropConnection(state, 'Не подтверждена контрольная точка истории');
+        _channelTimedOut(state, 'Не подтверждена контрольная точка истории');
       }
     });
   }
@@ -3238,6 +3473,17 @@ class RoomSession extends ChangeNotifier {
   }
 
   bool get _hostBarrierReachable {
+    // Rechecking an admitted cohort needs fresh peer proof, not a new public
+    // registration. Discovery remains mandatory for admission/solo inference.
+    if (_hosting &&
+        _connections.values.any(
+          (state) => state.established && state.recheckId != null,
+        ) &&
+        _connections.values.any(
+          (state) => state.ready && state.connection.open && _live(state),
+        )) {
+      return true;
+    }
     if (!_validatedHostRegistration) return false;
     // A real durable peer exchange is already evidence of synchronization.
     // Complete multi-backend coverage is needed only to infer absence (solo).
@@ -3268,6 +3514,7 @@ class RoomSession extends ChangeNotifier {
             state.ready &&
             state.durableSync &&
             state.remoteImported &&
+            _freshRecheckImported(state) &&
             !state.decoder.assembling,
       );
 
@@ -3281,13 +3528,45 @@ class RoomSession extends ChangeNotifier {
       if (state.durableSync && _hasDurableCheckpoint(state)) {
         state.remoteImported = true;
       }
+      if (state.recheckId != null &&
+          _containsDurableInventory(state.recheckCheckpoint)) {
+        state.recheckImported = true;
+        if (!state.recheckAcknowledged) {
+          state.recheckAcknowledged = true;
+          unawaited(
+            _send(
+              state,
+              _message(
+                RoomMessageType.syncAck,
+                const [],
+                syncId: state.recheckRemoteSyncId,
+                syncDigest: state.recheckRemoteSyncDigest,
+                roomReady: !_hosting || _settledHosting,
+              ),
+            ),
+          );
+        }
+      }
+      if (state.remoteImported &&
+          state.localAcknowledged &&
+          _freshRecheckImported(state) &&
+          (_hosting ? _settledHosting : state.remoteRoomReady)) {
+        state.established = true;
+        state.rechecking = false;
+        if (state.responsive) {
+          state.stalledDeadline?.cancel();
+          state.stalledDeadline = null;
+        }
+      }
       _updateCheckpointDeadline(state);
     }
     if (!_hosting) {
       final state = _hostConnection;
       if (state != null && state.remoteImported) {
         _ackCheckpoint(state, roomReady: true);
-        if (state.localAcknowledged && state.remoteRoomReady) {
+        if (state.localAcknowledged &&
+            state.remoteRoomReady &&
+            _freshRecheckImported(state)) {
           _completeInitialSync();
         }
       }
@@ -3361,7 +3640,7 @@ class RoomSession extends ChangeNotifier {
         state.deadline?.cancel();
         state.assemblyDeadline = Timer(_assemblyDeadline, () {
           if (_live(state) && state.decoder.assembling) {
-            _dropConnection(state, 'Передача истории не завершена');
+            _channelTimedOut(state, 'Передача истории не завершена');
           }
         });
         _allowCheckpointAssembly(state);
@@ -3516,6 +3795,7 @@ class RoomSession extends ChangeNotifier {
         _failInitialSync(reason);
         throw const FormatException(reason);
       }
+      state.recheckSync = message.recheckSync;
       state.marriageHistory = message.marriageHistory;
       state.patronymics = message.patronymics;
       state.lifeStatus = message.lifeStatus;
@@ -3617,8 +3897,34 @@ class RoomSession extends ChangeNotifier {
         throw const FormatException('Подтверждение сохранения не согласовано');
       }
       if (message.type == RoomMessageType.checkpoint) {
+        if (message.recheckId != null) {
+          if (!state.recheckSync) {
+            throw const FormatException('Повторная проверка не согласована');
+          }
+          if (message.recheckId != state.recheckId) return;
+        }
         final inventory = _checkpointInventory(state, message);
         missingRoomEdits(_history.knownEdits, inventory);
+        if (message.recheckId != null) {
+          state.recheckCheckpoint = inventory;
+          state.recheckRemoteSyncId = message.syncId;
+          state.recheckRemoteSyncDigest = message.syncDigest;
+          state.recheckAcknowledged = false;
+          if (state.remoteCheckpoint == null) {
+            // A one-sided recheck has no new ordinary checkpoint from the
+            // responder. Its correlated response is also a valid contribution.
+            // Never supersede the other side's tracked checkpoint in a crossed
+            // recheck: that token still needs its final roomReady acknowledgment.
+            state.remoteCheckpoint = inventory;
+            state.remoteSyncId = message.syncId;
+            state.remoteSyncDigest = message.syncDigest;
+            state.remoteImported = false;
+            _settledHosting = false;
+          }
+          _updateEntryBarrier();
+          _changed();
+          return;
+        }
         state.remoteCheckpoint = inventory;
         state.remoteSyncId = message.syncId;
         state.remoteSyncDigest = message.syncDigest;
@@ -3634,7 +3940,11 @@ class RoomSession extends ChangeNotifier {
       return;
     }
     if (message.type == RoomMessageType.inventory) {
-      if (!state.fastSync) {
+      if (message.recheckId != null) {
+        await _answerRecheck(state, message);
+        return;
+      }
+      if (!state.fastSync && !(state.recheckSync && state.durableSync)) {
         throw const FormatException('Список изменений не согласован');
       }
       final inventory = message.inventory!;
@@ -3808,7 +4118,7 @@ class RoomSession extends ChangeNotifier {
     } else if (message.type == RoomMessageType.presence && !state.incoming) {
       _remoteOnline = message.online!;
       _remoteActors = message.onlineActors?.toSet();
-      if (message.hosting == false && _joined) {
+      if (message.hosting == false && _joined && !state.recheckSync) {
         _reconnect('Хост потерял signaling; выбираем онлайн-участника');
       }
       _changed();
@@ -3882,9 +4192,62 @@ class RoomSession extends ChangeNotifier {
 
   void _touch(_RoomConnection state) {
     state.receivedPackets++;
+    final wasResponsive = state.responsive;
+    state.responsive = true;
+    if (!state.rechecking && !state.decoder.assembling) {
+      state.stalledDeadline?.cancel();
+      state.stalledDeadline = null;
+    }
     state.liveness?.cancel();
     state.liveness = Timer(_livenessDeadline, () {
-      if (_live(state)) _dropConnection(state, 'Участник перестал отвечать');
+      if (_live(state)) _channelTimedOut(state, 'Участник перестал отвечать');
+    });
+    if (!wasResponsive) {
+      _changed();
+      _broadcastPresence();
+    }
+  }
+
+  void _channelTimedOut(_RoomConnection state, String reason) {
+    if (!_live(state)) return;
+    if (!state.established || !_canRecheck(state)) {
+      _dropConnection(state, reason);
+      return;
+    }
+    final wasResponsive = state.responsive;
+    state.responsive = false;
+    if (_backgroundedAt != null && !hasValidatedOnlinePeer) {
+      _backgroundConnectionLost = true;
+    }
+    _networkIssue = reason;
+    if (wasResponsive) _record(reason);
+    // Silence revokes online evidence, but is not proof of a dead native link.
+    // Preserve an in-flight ordered assembly and its send/receive state.
+    if (!state.decoder.assembling) _beginConnectionRecheck(state);
+    _watchStalledChannel(state);
+    _changed();
+    if (wasResponsive) _broadcastPresence();
+  }
+
+  void _watchStalledChannel(_RoomConnection state) {
+    if (!_live(state) ||
+        !state.established ||
+        (state.rechecking && state.localSyncId == null) ||
+        _backgroundedAt != null ||
+        state.stalledDeadline != null) {
+      return;
+    }
+    state.stalledDeadline = Timer(_stalledChannelDeadline, () {
+      state.stalledDeadline = null;
+      if (!_live(state) || _backgroundedAt != null) return;
+      final execution = _lastExecutionAt;
+      if (execution == null ||
+          now().difference(execution) > _livenessDeadline) {
+        // A delayed callback is not ninety seconds of active waiting.
+        _watchStalledChannel(state);
+        return;
+      }
+      _dropConnection(state, 'Участник не ответил на повторную проверку связи');
     });
   }
 
@@ -3912,6 +4275,25 @@ class RoomSession extends ChangeNotifier {
   Future<void> _send(_RoomConnection state, RoomMessage message) {
     if (!_live(state) || !state.opened || !state.connection.open) {
       return Future<void>.value();
+    }
+    final actors = message.onlineActors;
+    final recipient = state.actor;
+    if (message.type == RoomMessageType.presence &&
+        actors != null &&
+        recipient != null &&
+        !actors.contains(recipient)) {
+      // A retained silent channel is excluded from everyone else's roster, but
+      // its directed heartbeat must still name the recipient if it wakes up.
+      final roster = {...actors, recipient}.toList()..sort();
+      message = RoomMessage(
+        roomId: roomId,
+        type: RoomMessageType.presence,
+        actor: actorId,
+        history: const [],
+        online: roster.length,
+        onlineActors: roster,
+        hosting: message.hosting,
+      );
     }
     final Iterable<Map<String, dynamic>> packets;
     try {
@@ -4021,9 +4403,23 @@ class RoomSession extends ChangeNotifier {
           }
           for (final packet in packets) {
             if (!_live(state) || !state.connection.open) return;
-            await state.connection
-                .send(packet)
-                .timeout(const Duration(seconds: 5));
+            final sending = state.connection.send(packet);
+            if (state.established && state.recheckSync) {
+              final watchdog = Timer(const Duration(seconds: 5), () {
+                if (_live(state)) {
+                  _channelTimedOut(state, 'Отправка истории задерживается');
+                }
+              });
+              try {
+                // A soft timeout cannot release this ordered queue while the
+                // native send (possibly a chunk) is still pending.
+                await sending;
+              } finally {
+                watchdog.cancel();
+              }
+            } else {
+              await sending.timeout(const Duration(seconds: 5));
+            }
           }
         })
         .catchError((Object error) {
@@ -4113,6 +4509,8 @@ class RoomSession extends ChangeNotifier {
     state.poll?.cancel();
     state.iceDeadline?.cancel();
     state.assemblyDeadline?.cancel();
+    state.stalledDeadline?.cancel();
+    state.recheckRevision++;
     _cancelCheckpointDeadline(state);
     state.decoder.reset();
     _cancelSubscriptions(state.subscriptions);
@@ -4140,6 +4538,7 @@ class RoomSession extends ChangeNotifier {
     _retryTimer = null;
     _registered = false;
     _signalingReady = false;
+    _recoveringSignaling = false;
     final peer = _peer;
     _peer = null;
     _cancelSubscriptions(_peerSubscriptions);
@@ -4279,6 +4678,20 @@ class _RoomConnection {
   Future<void> sending = Future<void>.value();
   bool opened = false;
   int receivedPackets = 0;
+  bool responsive = true;
+  bool established = false;
+  bool recheckSync = false;
+  int recheckRevision = 0;
+  String? recheckId;
+  bool rechecking = false;
+  Map<String, String>? recheckCheckpoint;
+  bool recheckImported = false;
+  String? recheckRemoteSyncId;
+  String? recheckRemoteSyncDigest;
+  bool recheckAcknowledged = false;
+  String? answeredRecheckId;
+  List<RoomEdit>? recheckResponseHistory;
+  String? recheckResponseSyncId;
   bool admissionStarted = false;
   bool ready = false;
   bool offeredFastSync = false;
@@ -4321,4 +4734,5 @@ class _RoomConnection {
   Timer? assemblyDeadline;
   Timer? checkpointDeadline;
   Timer? checkpointAssemblyDeadline;
+  Timer? stalledDeadline;
 }
