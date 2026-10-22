@@ -5433,8 +5433,8 @@ void main() {
                 expect(
                   row.blocks.expand((block) => block.people).map((p) => p.id),
                   selected == rootTreePersonId
-                      ? ['veronika', 'natalia', 'oleg', 'roman', 'nekto']
-                      : ['veronika', 'natalia', 'nekto', 'roman', 'oleg'],
+                      ? ['veronika', 'natalia', 'oleg', 'nekto', 'roman']
+                      : ['veronika', 'natalia', 'nekto', 'oleg', 'roman'],
                   reason: reason,
                 );
                 _expectCanonicalRowGeometry(tester, layout, portrait: portrait);
@@ -8513,6 +8513,54 @@ void main() {
                 '${mode.name} changes ordering/centering, never edge identities.',
           );
           _expectCanonicalRowGeometry(tester, current, portrait: portrait);
+          for (final id in ['Отчим', 'Мачеха']) {
+            expect(_filterOf(tester, id), _filterOf(tester, 'Кузен-0'));
+            expect(
+              _washOf(tester, fixture, id),
+              const Color(0xFF85884A).withValues(alpha: .14),
+            );
+          }
+          final canvas = tester.getRect(find.byKey(const Key('tree-canvas')));
+          final drawing = _ConnectionCanvas();
+          _linkPainter(tester).paint(drawing, canvas.size);
+          for (final (parent, child) in [
+            ('Отчим', 'Материнская полусестра'),
+            ('Мать', 'Материнская полусестра'),
+            ('Мачеха', 'Полубрат'),
+            ('Отец', 'Полубрат'),
+          ]) {
+            final rect = tester.getRect(_person(parent)).shift(-canvas.topLeft);
+            final source = portrait
+                ? Offset(rect.center.dx + 30, rect.top + 36)
+                : Offset(rect.center.dx, rect.top + 66);
+            final targetRect = tester
+                .getRect(_blockFor(fixture, child))
+                .shift(-canvas.topLeft);
+            final target = portrait
+                ? targetRect.centerLeft
+                : targetRect.topCenter;
+            final indices = [
+              for (var i = 0; i < drawing.paths.length; i++)
+                if ((_pathStart(drawing.paths[i]) - source).distance < .1 &&
+                    (_pathEnd(drawing.paths[i]) - target).distance < .1)
+                  i,
+            ];
+            expect(indices, hasLength(1), reason: '$parent → $child');
+            final muted = parent == 'Отчим' || parent == 'Мачеха';
+            final palette = fixture.document.person(parent)!.sex == TreeSex.male
+                ? const Color(0xFFAE742C)
+                : const Color(0xFF338B64);
+            final expected =
+                (muted
+                        ? Color.lerp(const Color(0xFF686C65), palette, .35)!
+                        : palette)
+                    .withValues(alpha: muted ? .40 : .60);
+            _expectPaintRgb(drawing.colors[indices.single], expected);
+            expect(
+              drawing.colors[indices.single].a,
+              closeTo(muted ? .40 : .60, 1 / 255),
+            );
+          }
           expect(session.operations, isEmpty);
           expect(identical(fixture.document.people, peopleBefore), isTrue);
         }
@@ -8684,18 +8732,25 @@ void main() {
                 final anchor = portrait
                     ? Offset(parent.center.dx + 30, parent.top + 36)
                     : Offset(parent.center.dx, parent.top + 66);
+                final paths = incoming
+                    .where((path) => (_pathStart(path) - anchor).distance < .1)
+                    .toList();
                 expect(
-                  incoming.any(
-                    (path) => (_pathStart(path) - anchor).distance < .1,
-                  ),
-                  isTrue,
+                  paths,
+                  hasLength(1),
                   reason:
                       '${mode.name}, selected $selected: missing $parentId → ${entry.key}.',
                 );
-              }
-              for (final path in incoming) {
-                final color = drawing.colors[drawing.paths.indexOf(path)];
-                expect(color.a, closeTo(.60, 1 / 255));
+                final color =
+                    drawing.colors[drawing.paths.indexOf(paths.single)];
+                expect(
+                  color.a,
+                  closeTo(
+                    selectedParents.contains(parentId) ? .60 : .40,
+                    1 / 255,
+                  ),
+                  reason: 'Only the additional half-sibling parent is muted.',
+                );
               }
             }
           }

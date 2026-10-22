@@ -140,7 +140,15 @@ class TreeLayout {
     final auntsAndUncles = <String>{
       for (final parent in parents[selectedId]!) ...siblingsOf(parent),
     }..removeAll(parents[selectedId]!);
+    final parentIds = parents[selectedId]!.toSet();
+    final stepparents = <String>{
+      for (final (a, b) in coParentPairs) ...[
+        if (parentIds.contains(a)) b,
+        if (parentIds.contains(b)) a,
+      ],
+    }..removeAll(parentIds);
     final cousins = <String>{
+      ...stepparents,
       for (final relative in auntsAndUncles) ...children[relative]!,
       // The same muted family context includes nieces/nephews of full or half
       // siblings. Normal ancestry/descendant emphasis below always wins.
@@ -223,6 +231,7 @@ class TreeLayout {
         rolePreferences[index] ?? const [],
         selectedId: selectedId,
         siblingIds: siblings,
+        parentIds: stepparents.isEmpty ? const {} : parentIds,
         couples: coParentPairs,
         descendantIds: mode == TreeTrunkMode.both && index > ranks[selectedId]!
             ? descendants
@@ -1040,6 +1049,7 @@ List<_SiblingDraft> _orderParentCohorts(
   List<(String, String)> preferences, {
   required String selectedId,
   required Set<String> siblingIds,
+  required Set<String> parentIds,
   required Set<(String, String)> couples,
   required Set<String> descendantIds,
   required Map<String, int> descendantSides,
@@ -1253,6 +1263,7 @@ List<_SiblingDraft> _orderParentCohorts(
     (indices) =>
         roleLocks.every((pair) => indices[pair.$1]! < indices[pair.$2]!),
     siblingIds: siblingIds,
+    parentIds: parentIds,
     lockedCohorts: [...exactAccepted, ...accepted],
     preservesBlocks: (proposal) =>
         hardAllows(proposal) &&
@@ -1516,9 +1527,9 @@ List<_SiblingDraft> _orderParentPairs(
 }
 
 /// Refine partner proximity without changing members or stronger row invariants.
-/// Own co-parents take priority over siblings' co-parents in every mode. Only
-/// deterministic improving whole-block relocations are considered; the final
-/// caller additionally locks structural family/descendant intervals and corridors.
+/// Own co-parents take priority over siblings' co-parents, then the parents' family
+/// cluster. Only deterministic improving whole-block relocations are considered;
+/// the final caller also locks structural family/descendant intervals and corridors.
 List<_SiblingDraft> _orderSelectedPartners(
   List<_SiblingDraft> blocks,
   String selectedId,
@@ -1526,6 +1537,7 @@ List<_SiblingDraft> _orderSelectedPartners(
   List<(String, String)> parentPairs,
   bool Function(Map<String, int>) allowsRoles, {
   Set<String> siblingIds = const {},
+  Set<String> parentIds = const {},
   Iterable<Set<_SiblingDraft>> lockedCohorts = const [],
   bool Function(List<_SiblingDraft>)? preservesBlocks,
 }) {
@@ -1547,9 +1559,19 @@ List<_SiblingDraft> _orderSelectedPartners(
             (siblingIds.contains(pair.$1) || siblingIds.contains(pair.$2)),
       )
       .toList();
-  if (pairs.isEmpty && siblingPairs.isEmpty) return blocks;
+  final parentPartnerPairs = localCouples
+      .where(
+        (pair) => parentIds.contains(pair.$1) || parentIds.contains(pair.$2),
+      )
+      .toList();
+  if (pairs.isEmpty && siblingPairs.isEmpty && parentPartnerPairs.isEmpty) {
+    return blocks;
+  }
   final focus = <String>{
-    for (final pair in [...pairs, ...siblingPairs]) ...[pair.$1, pair.$2],
+    for (final pair in [...pairs, ...siblingPairs, ...parentPartnerPairs]) ...[
+      pair.$1,
+      pair.$2,
+    ],
   };
   final blockOf = {
     for (var i = 0; i < blocks.length; i++)
@@ -1561,6 +1583,12 @@ List<_SiblingDraft> _orderSelectedPartners(
   };
   final siblingBlocks = {
     for (final pair in siblingPairs) ...[blockOf[pair.$1]!, blockOf[pair.$2]!],
+  };
+  final parentBlocks = {
+    for (final pair in parentPartnerPairs) ...[
+      blockOf[pair.$1]!,
+      blockOf[pair.$2]!,
+    ],
   };
   final cohortMoves = <Set<int>>[
     for (final members in lockedCohorts)
@@ -1627,6 +1655,7 @@ List<_SiblingDraft> _orderSelectedPartners(
       siblingSeparation,
       holes(siblingBlocks),
       siblingReversed,
+      holes(parentBlocks),
       collateral,
       ...order,
     ];
@@ -1640,7 +1669,7 @@ List<_SiblingDraft> _orderSelectedPartners(
   }
 
   final initialCost = cost(order)!;
-  if (initialCost.take(6).every((value) => value == 0)) return blocks;
+  if (initialCost.take(7).every((value) => value == 0)) return blocks;
   while (true) {
     var bestOrder = order;
     var bestCost = cost(order)!;
@@ -1663,6 +1692,7 @@ List<_SiblingDraft> _orderSelectedPartners(
     for (final members in [
       ownBlocks,
       siblingBlocks,
+      parentBlocks,
       focusedBlocks,
       ...cohortMoves,
     ]) {

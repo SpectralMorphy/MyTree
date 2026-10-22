@@ -101,8 +101,10 @@ members' masks, so a block's branch can differ from an individual member's branc
 - `normal`: selection, all ancestors, all descendants, and anyone sharing a known parent or the model's
   sibling group with selection (including explicit parentless siblings and half siblings).
 - `cousin`: full/half siblings of every direct ancestor (aunts/uncles and their equivalents at higher
-  ancestral generations), children of the selected person's immediate aunts/uncles, and nephews/nieces
-  (children of full or half siblings). Actual ancestors and other normal membership take precedence.
+  ancestral generations), children of the selected person's immediate aunts/uncles, nephews/nieces
+  (children of full or half siblings), and co-parents of either direct parent other than the selected
+  person's actual parents (stepparents). Actual ancestors and other normal membership take precedence.
+  A stepparent's own ancestors, siblings, or other co-parents do not gain emphasis through this exception.
 - `distant`: everyone else, including cousins' children, further collateral descendants without another
   qualifying relationship, and unrelated people. Missing parents alone never establish sibling relationships;
   an explicit sibling component can establish them without inventing an unknown parent.
@@ -308,6 +310,11 @@ that later grouping cannot accidentally undo partner priority or vice versa:
   Every member permutation is preserved exactly as received from parent-pair ordering (canonical chronology
   or an actual `both` ancestor seam). A selected person, sibling, or partner cannot move to a member boundary
   just for proximity. Intervening siblings can make literal card adjacency impossible even when blocks touch.
+- When a direct parent has an additional co-parent, the parents and their co-parents additionally request
+  a compact whole-block cluster after own/sibling co-parent objectives. Unrelated blocks cannot occupy
+  a compatible gap between the selected person's parents and stepparents. This adds no literal
+  stepparent-card adjacency, member reorder, ancestry edge, or rank constraint; stronger structural
+  locks still win. Without a stepparent, this extra focus objective is absent.
 - Remaining ties avoid increasing other context-couple gaps, then retain the incoming canonical block
   order. Child IDs and prior layouts do not break ties. Strict improvement prevents oscillation; no
   sibling-member permutations or factorial searches are performed.
@@ -318,9 +325,10 @@ that later grouping cannot accidentally undo partner priority or vice versa:
 The priority is indivisible full-sibling blocks and genuine ancestor role sides, then accepted actual
 parent seams and the ancestor corridor in `both` mode. Structural **common-parent child cohorts in every
 mode** come next; the selected-descendant convenience corridor must respect those accepted intervals.
-After those structural stages, own-partner proximity precedes sibling-partner proximity in every mode,
-while preserving the accepted role sides still satisfied by the structural result. Other context-partner
-preferences and minimal movement are lower-priority tie-breaks. Only the actual
+After those structural stages, own-partner proximity precedes sibling-partner proximity and then the
+parent/stepparent cluster in every mode, while preserving the accepted role sides still satisfied by
+the structural result. Other context-partner preferences and minimal movement are lower-priority tie-breaks.
+Only the actual
 ancestral parent-seam operation may change sibling members; structural cohorts move whole blocks only.
 Four partners in the same opposite parent role and separate blocks must all remain on one side of the
 selection, so only one can touch; proximity cannot buy a reversal or a sibling reorder. Focus refinement
@@ -331,8 +339,11 @@ or equal dates their canonical sibling order is **Veronika before Natalia**, reg
 Olga is Oleg/Natalia's daughter, Anastasia is Nekto/Natalia's daughter, and Nikita is Roman/Veronika's son.
 For this name-sorted fixture, cold `both` builds put the parents' row in these orders:
 
-- Olga: `[Veronika, Natalia] – Oleg – Roman – Nekto`.
-- Anastasia: `[Veronika, Natalia] – Nekto – Roman – Oleg`.
+- Olga: `[Veronika, Natalia] – Oleg – Nekto – Roman`.
+- Anastasia: `[Veronika, Natalia] – Nekto – Oleg – Roman`.
+
+The additional father is cousin-style stepparent context. The parent/stepparent cluster keeps Roman's
+unrelated block outside rather than between the two father blocks.
 
 Roman/Veronika focus also retains `[Veronika, Natalia]` and puts Roman's whole block immediately after
 it: Natalia remains between the actual partner cards. Proximity cannot reverse the sisters. Selecting

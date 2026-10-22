@@ -1,5 +1,6 @@
 # Completed Verification
 
+- [October 22 — Stepparent emphasis and parental-family proximity](verification-stepparents-20261022.md)
 - [October 22 — Derived patronymics and name presentation](verification-patronymics-20261022.md)
 - [October 22 — Healthy focus switches versus suspension](verification-alt-tab-20261022.md)
 

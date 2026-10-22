@@ -1,4 +1,4 @@
-// Usage: node tool/check_tree_canvas.cjs <playwright-module> <base-url> <artifacts-directory> [all|canvas|middle-pan|middle-pan-portrait|editing|zoom|stability|surnames|kinship|toolbar|compact-search|compact-search-mobile|compact-search-rotation|compact-search-focus-diagnostic|alignment|alignment-mobile|trunk-modes|parent-adjacency|partner-proximity|own-partner-priority|clipped-selection-centering|descendant-branches|ancestor-corridor|shared-parent-cohorts|parent-row-stability|selection-frame-stability|minimum-avatar-zoom|explicit-siblings|collateral-child-ranks|personal-family-controls|ordering-guest-controls|editor-refinements|editor-refinements-desktop]
+// Usage: node tool/check_tree_canvas.cjs <playwright-module> <base-url> <artifacts-directory> [all|canvas|middle-pan|middle-pan-portrait|editing|zoom|stability|surnames|kinship|toolbar|compact-search|compact-search-mobile|compact-search-rotation|compact-search-focus-diagnostic|alignment|alignment-mobile|trunk-modes|parent-adjacency|partner-proximity|own-partner-priority|clipped-selection-centering|descendant-branches|ancestor-corridor|shared-parent-cohorts|parent-row-stability|selection-frame-stability|minimum-avatar-zoom|explicit-siblings|step-parent-kinship|collateral-child-ranks|personal-family-controls|ordering-guest-controls|editor-refinements|editor-refinements-desktop]
 // Runs the production app, headless only. No internal app APIs are invoked.
 // The optional focus diagnostic forwards/logs native DOM focus/blur without changing app behavior.
 // The fixture uses WebRoomStore's actual v1 keys and RoomEdit/tree-operation formats.
@@ -8,7 +8,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 const [playwrightModule, base, outputArgument, suite = 'all'] = process.argv.slice(2);
-assert.ok(['all', 'canvas', 'middle-pan', 'middle-pan-portrait', 'editing', 'zoom', 'stability', 'surnames', 'kinship', 'toolbar', 'compact-search', 'compact-search-mobile', 'compact-search-rotation', 'compact-search-focus-diagnostic', 'alignment', 'alignment-mobile', 'trunk-modes', 'parent-adjacency', 'partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite), 'Unknown focused browser suite.');
+assert.ok(['all', 'canvas', 'middle-pan', 'middle-pan-portrait', 'editing', 'zoom', 'stability', 'surnames', 'kinship', 'toolbar', 'compact-search', 'compact-search-mobile', 'compact-search-rotation', 'compact-search-focus-diagnostic', 'alignment', 'alignment-mobile', 'trunk-modes', 'parent-adjacency', 'partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite), 'Unknown focused browser suite.');
 if (!playwrightModule || !base || !outputArgument) {
   throw new Error('Pass the Playwright module, production application URL, and artifacts directory.');
 }
@@ -20,7 +20,7 @@ const body = (page) => page.locator('body').ariaSnapshot();
 const node = (page, name) => page.getByRole('button', { name: `Выбрать ${name}`, exact: true });
 const round = (value) => Math.round(value * 1000) / 1000;
 const report = { application: base, suite, headless: true, scenarios: [], pageErrors: [], consoleErrors: [] };
-const tracedLocalLayout = ['own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls'].includes(suite);
+const tracedLocalLayout = ['own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls'].includes(suite);
 if (tracedLocalLayout) Object.assign(report, {
   flutterErrors: [], consoleMessages: [], network: { localAssetsOnly: true, http: [], webSockets: [] },
 });
@@ -77,7 +77,38 @@ function fixture({ family = 'canvas', role = 'editor' } = {}) {
     add('participantName', 'Гость проверки', { author: guestActor });
     add('participantRole', 'guest', { targetActor: guestActor });
   }
-  if (['shared-parent-cohorts', 'parent-row-stability'].includes(family)) {
+  if (family === 'step-parent-kinship') {
+    person('natalia', 'Наталья', 'female', 0);
+    value('natalia', 'birthDate', '1960-01-01');
+    // createSibling creates BOTH the person and explicit edge; there is no
+    // linkSiblings operation. Neither sister has known parents to copy.
+    people.push({ id: 'veronika', name: 'Вероника', sex: 'female', generation: 0 });
+    names.veronika = 'Вероника';
+    operation({ type: 'createSibling', personId: 'veronika', siblingId: 'natalia',
+      name: 'Вероника', sex: 'female', birthDate: '1962-01-01' });
+    // One compact distant sibling block lies chronologically BETWEEN Natalia's
+    // block and both fathers. Roman is Nikita's father, but remains distant to
+    // Olga/Nastyusha: related clustering must not promote an entire graph.
+    person('elena', 'Елена', 'female', 0);
+    value('elena', 'birthDate', '1965-01-01');
+    for (const [id, name, birthDate] of [
+      ['stepan', 'Степан', '1966-01-01'], ['roman', 'Роман', '1967-01-01'],
+    ]) {
+      people.push({ id, name, sex: 'male', generation: 0 });
+      names[id] = name;
+      operation({ type: 'createSibling', personId: id, siblingId: 'elena', name, sex: 'male', birthDate });
+    }
+    person('oleg', 'Олег', 'male', 0);
+    value('oleg', 'birthDate', '1970-01-01');
+    person('sergey', 'Сергей', 'male', 0);
+    value('sergey', 'birthDate', '1972-01-01');
+    person('root', 'Ольга', 'female', 1);
+    person('nastyusha', 'Настюша', 'female', 1);
+    person('nikita', 'Никита', 'male', 1);
+    parents('root', 'oleg', 'natalia');
+    parents('nastyusha', 'sergey', 'natalia');
+    parents('nikita', 'roman', 'veronika');
+  } else if (['shared-parent-cohorts', 'parent-row-stability'].includes(family)) {
     // Only the screenshot family: separate father blocks deliberately compete
     // with Natalia's common-parent cohort. No extra ancestors/context chains.
     person('lydia', 'Лидия', 'female', 1);
@@ -508,9 +539,9 @@ async function activate(page) {
 }
 
 async function loadRoom(page, seeded, expectedName = seeded.focusName) {
-  const expectedBundle = ['own-partner-priority', 'clipped-selection-centering', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings'].includes(suite)
+  const expectedBundle = ['own-partner-priority', 'clipped-selection-centering', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship'].includes(suite)
     ? process.env.MYTREE_EXPECTED_BUNDLE_SHA256 : null;
-  if (['own-partner-priority', 'clipped-selection-centering', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings'].includes(suite)) assert.match(expectedBundle || '', /^[0-9a-f]{64}$/,
+  if (['own-partner-priority', 'clipped-selection-centering', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship'].includes(suite)) assert.match(expectedBundle || '', /^[0-9a-f]{64}$/,
     'The finite browser run requires its explicitly authorized bundle hash.');
   const actualBundle = expectedBundle ? page.waitForResponse((response) =>
     response.url() === new URL('main.dart.js', `${base.replace(/\/$/, '')}/`).href && response.status() === 200,
@@ -3809,12 +3840,138 @@ async function parentCurvePixels({ base64, boxes, connections, portrait }) {
   });
 }
 
+async function stepParentKinshipFrame(page, seeded, title, portrait, focus) {
+  await assertNoGestureSelection(page, seeded.names[focus]);
+  const state = await branchCapture(page, seeded, title), boxes = {};
+  for (const person of seeded.people) {
+    assert.ok(state.nodes[person.name], `${title}: ${person.name} is clipped; the full row must be measured.`);
+    boxes[person.id] = state.nodes[person.name];
+  }
+  const row = order(state, 0, portrait), axis = portrait ? 'y' : 'x';
+  const relevant = ['natalia', 'veronika', 'oleg', 'sergey'].map((id) => seeded.names[id]);
+  const indices = relevant.map((name) => row.indexOf(name));
+  const cluster = row.slice(Math.min(...indices), Math.max(...indices) + 1);
+  const stepParent = focus === 'root' ? 'sergey' : 'oleg';
+  const normalFather = focus === 'root' ? 'oleg' : 'sergey';
+  const connections = [
+    { parent: 'natalia', target: 'root' }, { parent: 'oleg', target: 'root' },
+    { parent: 'natalia', target: 'nastyusha' }, { parent: 'sergey', target: 'nastyusha' },
+    { parent: 'veronika', target: 'nikita' },
+  ].map((link) => ({ ...link, endpoint: link.target === focus ? 'avatar' : 'block',
+    muted: link.parent === stepParent || link.target === 'nikita',
+    rgb: ['oleg', 'sergey'].includes(link.parent) ? [174, 116, 44] : [51, 139, 100] }));
+  const png = await fs.readFile(path.join(output, `${title}.png`));
+  const pixels = await page.evaluate(async ({ base64, boxes, normalFather, stepParent }) => {
+    const image = new Image(); image.src = `data:image/png;base64,${base64}`; await image.decode();
+    const canvas = document.createElement('canvas'); canvas.width = image.width; canvas.height = image.height;
+    const context = canvas.getContext('2d'); context.drawImage(image, 0, 0);
+    const pixel = (x, y) => [...context.getImageData(Math.round(x), Math.round(y), 1, 1).data].slice(0, 3);
+    const background = pixel(2, image.height - 5);
+    const blend = (rgb, alpha) => rgb.map((value, c) => value * alpha + background[c] * (1 - alpha));
+    const mean = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
+    const ids = [normalFather, stepParent, 'nikita', 'elena'];
+    const photos = Object.fromEntries(ids.map((id) => {
+      const samples = [];
+      for (let y = 18; y < 53; y += 3) for (let x = 37; x < 72; x += 3) {
+        samples.push(pixel(boxes[id].x + x, boxes[id].y + y));
+      }
+      return [id, samples];
+    }));
+    const chroma = (id) => mean(photos[id].map((rgb) => Math.max(...rgb) - Math.min(...rgb)));
+    const normalChroma = chroma(normalFather);
+    // Reuse kinshipFollowup's real cousin palette/filter and clean wash patches.
+    const styles = ids.map((id) => {
+      const saturation = id === normalFather ? 1 : id === 'elena' ? 0 : .35;
+      const box = boxes[id], blockSamples = [];
+      for (const x of [1, 3, 8, 12, 16]) for (const y of [18, 24, 30, 42, 48, 54]) {
+        blockSamples.push(pixel(box.x + x, box.y + y));
+      }
+      const block = [0, 1, 2].map((c) => blockSamples.map((rgb) => rgb[c]).sort((a, b) => a - b)[15]);
+      const rgb = id === 'elena' ? [40, 100, 75] : [135, 88, 38];
+      const grey = rgb[0] * .2126 + rgb[1] * .7152 + rgb[2] * .0722;
+      return { id, saturation, chromaRatio: chroma(id) / normalChroma, block, blockSamples,
+        photoDifferenceFromCousin: mean(photos[id].flatMap((rgb, index) =>
+          rgb.map((channel, c) => Math.abs(channel - photos.nikita[index][c])))),
+        ring: [[25, 30], [25, 36], [26, 42], [81, 30], [82, 36]].map(([x, y]) => pixel(box.x + x, box.y + y)),
+        expectedRing: rgb.map((channel) => grey * (1 - saturation) + channel * saturation),
+        expectedBlock: blend(id === 'elena' ? [104, 108, 101] : [133, 136, 74], saturation === .35 ? .14 : .24) };
+    });
+    return { background, normalChroma, styles };
+  }, { base64: png.toString('base64'), boxes, normalFather, stepParent });
+  pixels.lines = await page.evaluate(parentCurvePixels, { base64: png.toString('base64'), boxes, connections, portrait });
+  // Explicitly reject the bug's normal .60 edge, not merely a missing line.
+  pixels.normalStepParentCandidate = (await page.evaluate(parentCurvePixels, {
+    base64: png.toString('base64'), boxes, portrait,
+    connections: connections.map((link) => link.parent === stepParent ? { ...link, muted: false } : link),
+  })).find((link) => link.parent === stepParent);
+  await fs.writeFile(path.join(output, `${title}-pixels.json`), JSON.stringify(pixels, null, 2));
+  report.scenarios.push({ name: title, focus, stepParent, state, parentRow: row, relevantCluster: cluster, pixels });
+  assert.deepEqual([...cluster].sort(), [...relevant].sort(),
+    `${title}: a distant sibling block intrudes between relevant parental family blocks: ${row.join(' / ')}.`);
+  for (let index = 1; index < cluster.length; index++) assert.ok(
+    state.nodes[cluster[index]][axis] - state.nodes[cluster[index - 1]][axis] <= 156 + 1.5,
+    `${title}: relevant family blocks are not packed together (108px card + at most 48px block gap).`);
+  for (const ids of [['natalia', 'veronika'], ['elena', 'stepan', 'roman']]) {
+    const members = ids.map((id) => boxes[id]).sort((a, b) => a[axis] - b[axis]);
+    for (let index = 1; index < members.length; index++) assert.ok(
+      Math.abs(members[index][axis] - members[index - 1][axis] - 132) <= 1.5,
+      `${title}: explicit sibling block ${ids.join('/')} was split.`);
+  }
+  assert.ok(pixels.normalChroma > 20, `${title}: the identical colorful PNG did not paint.`);
+  for (const style of pixels.styles) {
+    assert.ok(Math.abs(style.chromaRatio - style.saturation) < .07,
+      `${title}: ${style.id} must use ${style.saturation === .35 ? 'cousin, not distant/normal' : 'control'} card style: ${JSON.stringify(style)}`);
+    if (style.saturation === .35) assert.ok(style.photoDifferenceFromCousin < 4,
+      `${title}: ${style.id} does not match the real cousin Nikita's photo filter.`);
+    assert.ok(style.ring.every((rgb) => rgb.every((channel, c) => Math.abs(channel - style.expectedRing[c]) <= 6)),
+      `${title}: ${style.id} has wrong card ring saturation.`);
+    assert.ok(style.block.every((channel, c) => Math.abs(channel - style.expectedBlock[c]) <= 3),
+      `${title}: ${style.id} has wrong existing olive/grey block wash: ${JSON.stringify(style)}`);
+  }
+  for (const link of pixels.lines) assert.ok(link.samples.length >= 3 && link.matching >= 3,
+    `${title}: missing/wrong ${link.muted ? 'muted cousin .40' : 'normal .60'} ${link.parent}→${link.target} route: ${JSON.stringify(link)}`);
+  assert.ok(pixels.normalStepParentCandidate.matching < 3,
+    `${title}: the step-parent edge incorrectly uses normal .60 paint.`);
+  return state;
+}
+
+async function stepParentKinship(page, seeded, label, portrait) {
+  const journal = [...seeded.records].sort((a, b) => a.id.localeCompare(b.id));
+  await loadRoom(page, seeded);
+  assert.deepEqual(await history(page, seeded), journal, `${label}: loaded complete journal differs from the fixture.`);
+  await fs.writeFile(path.join(output, `${label}-journal-before.json`), JSON.stringify(journal, null, 2));
+  await chooseTrunk(page, 'Обе линии');
+  await setTreeZoom(page, 100);
+  await alignAll(page).click();
+  await settle(page);
+  const cold = await stepParentKinshipFrame(page, seeded, `${label}-initial-olga`, portrait, 'root');
+  await toolbarSearchBrowse(page, seeded, `${label}-select-nastyusha`, 'Настюша Сергеевна', false, 'Настюша');
+  await stepParentKinshipFrame(page, seeded, `${label}-selected-nastyusha`, portrait, 'nastyusha');
+  assert.deepEqual(await history(page, seeded), journal, `${label}: selecting Nastyusha changed the complete journal.`);
+  await toolbarSearchBrowse(page, seeded, `${label}-return-olga`, 'Ольга Олеговна', false, 'Ольга');
+  const restored = await stepParentKinshipFrame(page, seeded, `${label}-returned-olga`, portrait, 'root');
+  sameCurrentLayout(cold, restored, portrait, `${label}: returning to Olga changed family geometry`);
+  const after = await history(page, seeded);
+  await fs.writeFile(path.join(output, `${label}-journal-after.json`), JSON.stringify(after, null, 2));
+  assert.deepEqual(after, journal, `${label}: view-only browsing changed the complete immutable journal.`);
+  await loadRoom(page, seeded);
+  assert.deepEqual(await history(page, seeded), journal, `${label}: reload changed the complete journal.`);
+  await alignAll(page).click();
+  await settle(page);
+  const reloaded = await stepParentKinshipFrame(page, seeded, `${label}-reloaded-olga`, portrait, 'root');
+  sameCurrentLayout(cold, reloaded, portrait, `${label}: reload changed the same-focus family layout`);
+  assert.deepEqual(await history(page, seeded), journal, `${label}: passive reload inspection changed the complete journal.`);
+  report.scenarios.push({ name: `${label}-summary`, wholeJournalUnchanged: true, reloadUnchanged: true,
+    immutableOperations: journal.length, selection: ['Ольга', 'Настюша', 'Ольга'],
+    limitation: 'Finite local desktop rendering only; no public-network synchronization or arbitrary graph coverage.' });
+}
+
 async function kinshipFollowup(page, seeded, label, portrait) {
   await loadRoom(page, seeded);
   const journal = await history(page, seeded);
-  const cousinIds = ['cousin', 'uncle', 'aunt', 'grand-aunt', 'higher-aunt', 'nephew', 'niece'];
+  const cousinIds = ['cousin', 'uncle', 'aunt', 'grand-aunt', 'higher-aunt', 'nephew', 'niece', 'half-father', 'half-mother'];
   const partnerIds = ['partner-a', 'partner-b', 'partner-c'];
-  const distantIds = ['half-father', 'half-mother', 'partner-father', 'partner-mother', 'partner-sibling'];
+  const distantIds = ['partner-father', 'partner-mother', 'partner-sibling'];
   const styles = seeded.people.map((person) => ({ ...person,
     saturation: cousinIds.includes(person.id) ? .35 : distantIds.includes(person.id) ? 0 : 1,
     distantBlock: distantIds.includes(person.id) || partnerIds.includes(person.id),
@@ -3825,9 +3982,9 @@ async function kinshipFollowup(page, seeded, label, portrait) {
     { parent: 'father', target: 'root', endpoint: 'avatar' },
     { parent: 'mother', target: 'root', endpoint: 'avatar' },
     { parent: 'mother', target: 'maternal-half', endpoint: 'block' },
-    { parent: 'half-father', target: 'maternal-half', endpoint: 'block' },
+    { parent: 'half-father', target: 'maternal-half', endpoint: 'block', muted: true },
     { parent: 'father', target: 'paternal-half', endpoint: 'block' },
-    { parent: 'half-mother', target: 'paternal-half', endpoint: 'block' },
+    { parent: 'half-mother', target: 'paternal-half', endpoint: 'block', muted: true },
     // Retain the prior normal and muted ancestry/descendant link coverage.
     { parent: 'great', target: 'grandparent', endpoint: 'avatar' },
     { parent: 'great', target: 'ancestor-aunt', endpoint: 'avatar' },
@@ -3988,7 +4145,7 @@ async function assertCollapsedToolbar(page, label) {
   return { opener: await toolbarToggle(page, false).boundingBox(), semantics };
 }
 
-async function toolbarSearchBrowse(page, seeded, label, name, picker = false) {
+async function toolbarSearchBrowse(page, seeded, label, name, picker = false, cardName = name) {
   await type(page, treeSearch(page), name);
   const option = searchOption(page, name);
   await option.waitFor();
@@ -3998,7 +4155,7 @@ async function toolbarSearchBrowse(page, seeded, label, name, picker = false) {
   await page.screenshot({ path: path.join(output, `${label}-search-results.png`), animations: 'disabled' });
   await option.click();
   await settle(page);
-  await assertNoGestureSelection(page, name);
+  await assertNoGestureSelection(page, cardName);
   if (picker) {
     assert.equal(await page.getByRole('button', { name: 'Отмена выбора', exact: true }).count(), 1,
       'Search browsing accidentally committed the graphical picker.');
@@ -6527,7 +6684,7 @@ async function independentlyPannedPinch(page, seeded, label) {
   } finally { await cdp.detach(); }
 }
 
-async function roomPage(browser, seeded, viewport, mobile = false, isolated = ['compact-search', 'compact-search-mobile', 'compact-search-rotation', 'compact-search-focus-diagnostic', 'parent-adjacency', 'partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite)) {
+async function roomPage(browser, seeded, viewport, mobile = false, isolated = ['compact-search', 'compact-search-mobile', 'compact-search-rotation', 'compact-search-focus-diagnostic', 'parent-adjacency', 'partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite)) {
   const context = await browser.newContext({ viewport,
     deviceScaleFactor: suite === 'minimum-avatar-zoom' && mobile ? 3 : 1,
     isMobile: mobile, hasTouch: mobile,
@@ -6538,7 +6695,7 @@ async function roomPage(browser, seeded, viewport, mobile = false, isolated = ['
       const url = new URL(route.request().url());
       // These finite suites require the existing local release build, including
       // its renderer/fonts: do not make even asset requests to public services.
-      const localAssetsOnly = ['partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite);
+      const localAssetsOnly = ['partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite);
       const renderer = !localAssetsOnly && url.hostname === 'www.gstatic.com' && url.pathname.startsWith('/flutter-canvaskit/');
       const font = !localAssetsOnly && ['fonts.gstatic.com', 'fonts.googleapis.com'].includes(url.hostname);
       const allowed = url.origin === origin || renderer || font;
@@ -6628,7 +6785,7 @@ async function roomPage(browser, seeded, viewport, mobile = false, isolated = ['
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   let page;
   try {
-    if (!['own-partner-priority', 'clipped-selection-centering', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings'].includes(suite)) page = await roomPage(browser, seeded, { width: 1440, height: 900 });
+    if (!['own-partner-priority', 'clipped-selection-centering', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship'].includes(suite)) page = await roomPage(browser, seeded, { width: 1440, height: 900 });
     for (const [label, viewport, portrait] of ['all', 'canvas'].includes(suite) ? [
       ['landscape', { width: 1440, height: 900 }, false],
       ['portrait', { width: 1000, height: 1300 }, true],
@@ -6816,6 +6973,29 @@ async function roomPage(browser, seeded, viewport, mobile = false, isolated = ['
         }
         throw error;
       } finally { clearTimeout(deadline); }
+    }
+    if (suite === 'step-parent-kinship') {
+      const seed = fixture({ family: 'step-parent-kinship' });
+      const dataUrl = `data:image/png;base64,${(await fs.readFile(path.join(__dirname, '..', 'assets', 'tree-mark.png'))).toString('base64')}`;
+      for (const id of ['oleg', 'sergey', 'nikita', 'elena']) {
+        seed.operation({ type: 'addPhoto', personId: id, itemId: `photo-${id}`, dataUrl,
+          caption: 'Identical real PNG: normal, step-parent, cousin, distant controls', afterId: null, beforeId: null });
+        seed.value(id, 'avatarPhotoId', `photo-${id}`);
+      }
+      const kinship = seed.finish();
+      report.fixture = { family: 'step-parent-kinship', room: kinship.room, actor: kinship.actor,
+        people: kinship.people, immutableOperations: kinship.records.length };
+      await fs.writeFile(path.join(output, 'step-parent-kinship-stored-fixture.json'), JSON.stringify(kinship, null, 2));
+      // One local room/context, desktop input, two orientations; no extra matrix.
+      page = await roomPage(browser, kinship, { width: 1800, height: 1200 }, false, true);
+      for (const [label, viewport, portrait] of [
+        ['step-parent-kinship-landscape', { width: 1800, height: 1200 }, false],
+        ['step-parent-kinship-portrait', { width: 1200, height: 1800 }, true],
+      ]) {
+        await page.setViewportSize(viewport);
+        await stepParentKinship(page, kinship, label, portrait);
+      }
+      await page.context().close();
     }
     if (suite === 'minimum-avatar-zoom') {
       report.fixture = { family: 'minimum-avatar-zoom', profiles: [] };
@@ -7157,7 +7337,7 @@ async function roomPage(browser, seeded, viewport, mobile = false, isolated = ['
       page = establishedPage;
     }
     assert.deepEqual(report.pageErrors, [], 'The real browser raised uncaught application errors.');
-    if (['parent-adjacency', 'partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite)) assert.deepEqual(report.consoleErrors, [], 'The isolated browser logged console errors.');
+    if (['parent-adjacency', 'partner-proximity', 'own-partner-priority', 'clipped-selection-centering', 'descendant-branches', 'ancestor-corridor', 'shared-parent-cohorts', 'parent-row-stability', 'selection-frame-stability', 'minimum-avatar-zoom', 'explicit-siblings', 'step-parent-kinship', 'collateral-child-ranks', 'personal-family-controls', 'ordering-guest-controls', 'editor-refinements', 'editor-refinements-desktop'].includes(suite)) assert.deepEqual(report.consoleErrors, [], 'The isolated browser logged console errors.');
     if (tracedLocalLayout) {
       assert.deepEqual(report.flutterErrors, [], 'Flutter logged a rendering failure at a console level, including log/warning.');
       assert.ok(report.network.http.every((request) => !request.allowed || new URL(request.url).origin === origin),

@@ -3174,6 +3174,130 @@ void main() {
       }
     });
 
+    test(
+      'parents’ partners use cousin emphasis without extending ancestry',
+      () {
+        final family = _cousinFamily(anastasiaFather: true)
+          ..add('stepmother')
+          ..add('paternal-half')
+          ..add('stepparent-parent')
+          ..add('stepparent-sibling')
+          ..parents('paternal-half', father: 'oleg', mother: 'stepmother')
+          ..parents('nekto', father: 'stepparent-parent')
+          ..parents('stepparent-sibling', father: 'stepparent-parent');
+        final people = family.document.people;
+        final events = family.events.toList();
+        for (final mode in TreeTrunkMode.values) {
+          final layout = family.layout(rootTreePersonId, mode);
+          for (final id in ['nekto', 'stepmother']) {
+            expect(layout.positions[id]!.emphasis, TreeEmphasis.cousin);
+            expect(_blockFor(layout, id).emphasis, TreeEmphasis.cousin);
+            expect(layout.trunkIds, isNot(contains(id)));
+          }
+          for (final id in ['natalia', 'oleg', 'anastasia', 'paternal-half']) {
+            expect(layout.positions[id]!.emphasis, TreeEmphasis.normal);
+          }
+          for (final id in [
+            'stepparent-parent',
+            'stepparent-sibling',
+            'roman',
+          ]) {
+            expect(layout.positions[id]!.emphasis, TreeEmphasis.distant);
+          }
+          _expectDescendingLinks(layout);
+          _expectNoOverlap(layout);
+        }
+        expect(identical(family.document.people, people), isTrue);
+        expect(family.events, events);
+      },
+    );
+
+    test('parents and stepparents keep unrelated sibling blocks outside', () {
+      _Family make(bool reverse) {
+        final family = _cousinFamily(
+          anastasiaFather: true,
+          reverseInsertion: reverse,
+        );
+        for (final (id, name) in [
+          ('natalia', 'Наталья'),
+          ('veronika', 'Вероника'),
+          ('oleg', 'Олег'),
+          ('nekto', 'Сергей'),
+          ('roman', 'Роман'),
+        ]) {
+          family._apply(
+            family.document.editText(id, TreeTextField.name, name)!,
+          );
+        }
+        family
+          ..add('unrelated-father')
+          ..add('unrelated-mother');
+        final intruders = ['Елена', 'Наталья другая', 'Степан'];
+        for (final id in reverse ? intruders.reversed : intruders) {
+          family
+            ..add(id)
+            ..parents(
+              id,
+              father: 'unrelated-father',
+              mother: 'unrelated-mother',
+            );
+        }
+        family.parents(
+          'roman',
+          father: 'unrelated-father',
+          mother: 'unrelated-mother',
+        );
+        return family;
+      }
+
+      final family = make(false);
+      final reverse = make(true);
+      final people = family.document.people;
+      final events = family.events.toList();
+      final baseline = family.layout(rootTreePersonId);
+      for (final mode in TreeTrunkMode.values) {
+        for (final selected in [
+          rootTreePersonId,
+          'anastasia',
+          rootTreePersonId,
+        ]) {
+          final layout = family.layout(selected, mode, baseline);
+          _expectConsecutive(layout, ['natalia', 'oleg', 'nekto']);
+          expect(_blockFor(layout, 'roman').people.map((person) => person.id), [
+            'Елена',
+            'Наталья другая',
+            'roman',
+            'Степан',
+          ]);
+          expect(layout.positions.keys, unorderedEquals(people.keys));
+          expect(_snapshot(layout), _snapshot(reverse.layout(selected, mode)));
+          expect(
+            _snapshot(layout),
+            _snapshot(
+              TreeLayout.build(
+                family.reload(),
+                selectedId: selected,
+                mode: mode,
+              ),
+            ),
+          );
+          _expectSameRanks(baseline, layout);
+          _expectDescendingLinks(layout);
+          _expectNoOverlap(layout);
+          if (mode == TreeTrunkMode.both) {
+            _expectAncestorCorridors(layout);
+            _expectParentCardsAdjacent(
+              layout,
+              'natalia',
+              selected == rootTreePersonId ? 'oleg' : 'nekto',
+            );
+          }
+        }
+      }
+      expect(identical(family.document.people, people), isTrue);
+      expect(family.events, events);
+    });
+
     test('full and half siblings of every ancestor use cousin colors', () {
       final family = _Family();
       final relatives = <String>[];
