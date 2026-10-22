@@ -452,11 +452,15 @@ void main() {
     final field = find.byKey(const Key('person-surname-field'));
     final decline = find.byKey(const Key('surname-decline'));
     expect(field, findsOneWidget);
-    expect(tester.widget<TextField>(field).decoration!.labelText, 'Фамилия');
+    expect(
+      tester.widget<TextField>(field).decoration!.labelText,
+      'Фамилия при рождении',
+    );
     expect(
       find.byWidgetPredicate(
         (widget) =>
-            widget is TextField && widget.decoration?.labelText == 'Фамилия',
+            widget is TextField &&
+            widget.decoration?.labelText == 'Фамилия при рождении',
       ),
       findsOneWidget,
     );
@@ -687,6 +691,35 @@ void main() {
       },
     );
   }
+
+  testWidgets(
+    'family history is directly after relatives and before facts in read and edit modes',
+    (tester) async {
+      seedRelatives();
+      await mount(tester);
+      for (final editing in [false, true]) {
+        if (editing) await edit(tester);
+        final history = find.byKey(const Key('person-family-history'));
+        await reveal(tester, history);
+        final relatives = find.byKey(const Key('person-relatives'));
+        expect(
+          tester.getBottomLeft(relatives).dy,
+          lessThan(tester.getTopLeft(history).dy),
+        );
+        await reveal(tester, find.text('Факты и воспоминания'));
+        expect(
+          tester.getBottomLeft(history).dy,
+          lessThan(tester.getTopLeft(find.text('Факты и воспоминания')).dy),
+        );
+        expect(find.text('Фамилии и браки'), findsOneWidget);
+        expect(
+          find.byKey(const Key('add-marriage')),
+          editing ? findsOneWidget : findsNothing,
+        );
+      }
+      expect(session.operations, isEmpty);
+    },
+  );
 
   testWidgets('a missing person is handled without editing or binding', (
     tester,

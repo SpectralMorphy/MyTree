@@ -795,7 +795,9 @@ void main() {
         );
         for (final id in ['father', root, 'child']) {
           final person = client.doc.person(id)!;
-          expect(person.surname, 'Иванова');
+          // This test concerns birth inheritance. A female co-parent can now
+          // have a different current surname through an implied marriage.
+          expect(person.effectiveSurname?.formForSex(person.sex), 'Иванова');
           expect(person.effectiveSurname!.text, 'Иванов');
           expect(person.familySurname, isNull);
           expect(person.surnameInheritedFrom, person.fatherId);

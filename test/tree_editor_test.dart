@@ -987,6 +987,252 @@ void main() {
   }
 
   for (final portrait in [false, true]) {
+    for (final brightness in Brightness.values) {
+      testWidgets(
+        '${portrait ? 'portrait' : 'landscape'} ${brightness.name} childless spouses use existing partner colors and whole blocks without marital curves',
+        (tester) async {
+          final fixture = _coParentFamily()
+            ..add('Супруг', sex: TreeSex.female)
+            ..add('Супруг сестры');
+          fixture
+            ..apply(
+              fixture.document.setValue(rootTreePersonId, 'sex', 'female'),
+            )
+            ..apply(
+              fixture.document.createSibling(
+                'Супруг',
+                'Сестра супруга',
+                name: 'Сестра супруга',
+                sex: TreeSex.female,
+              ),
+            );
+          for (final id in ['Супруг', 'Сестра супруга', 'Супруг сестры']) {
+            fixture
+              ..apply(fixture.document.addPhoto(id, 'portrait', dataUrl: _png))
+              ..apply(
+                fixture.document.setValue(id, 'avatarPhotoId', 'portrait'),
+              );
+          }
+          final session = _Session(fixture.document);
+          await _mount(
+            tester,
+            session,
+            brightness: brightness,
+            size: portrait ? const Size(1700, 2500) : const Size(2500, 1700),
+          );
+          final before = _layoutOf(fixture);
+          final curvesBefore = _renderedConnections(
+            tester,
+            before,
+            portrait: portrait,
+          );
+          final distantFilter = _filterOf(tester, 'Супруг');
+          expect(before.positions['Супруг']!.level, 0);
+          expect(_filterOf(tester, 'Сестра супруга'), distantFilter);
+
+          Future<void> remoteChange(TreeOperation operation) async {
+            fixture.apply(operation);
+            session.changed();
+            await tester.pumpAndSettle();
+            expect(session.operations, isEmpty);
+          }
+
+          await remoteChange(
+            fixture.document.addMarriage(rootTreePersonId, 'Супруг', id: 'own'),
+          );
+          await remoteChange(
+            fixture.document.addMarriage(
+              'Сестра-0',
+              'Супруг сестры',
+              id: 'sibling',
+            ),
+          );
+          final people = fixture.document.people;
+          for (final zoom in [100, 150]) {
+            if (zoom == 150) await _zoomSteps(tester, 5);
+            for (final mode in TreeTrunkMode.values) {
+              await _chooseMode(tester, mode);
+              for (final selected in [
+                rootTreePersonId,
+                'Сестра-0',
+                rootTreePersonId,
+              ]) {
+                await _selectPerson(tester, selected);
+                final layout = _layoutOf(
+                  fixture,
+                  selectedId: selected,
+                  mode: mode,
+                );
+                final spouse = selected == rootTreePersonId
+                    ? 'Супруг'
+                    : 'Супруг сестры';
+                final other = selected == rootTreePersonId
+                    ? 'Супруг сестры'
+                    : 'Супруг';
+                _expectFullColorPhotoNode(
+                  tester,
+                  spouse,
+                  selected == rootTreePersonId
+                      ? const Color(0xFF28644B)
+                      : const Color(0xFF686C65),
+                );
+                expect(_filterOf(tester, other), distantFilter);
+                expect(_filterOf(tester, 'Сестра супруга'), distantFilter);
+                expect(
+                  layout.positions[spouse]!.emphasis,
+                  TreeEmphasis.distant,
+                );
+                expect(
+                  layout.positions[spouse]!.level,
+                  layout.positions[selected]!.level,
+                );
+                expect(
+                  _washOf(tester, fixture, spouse),
+                  const Color(0xFF686C65).withValues(alpha: .24),
+                  reason:
+                      'Only the selected spouse card regains color, not its block.',
+                );
+                final row = layout.levels.singleWhere(
+                  (level) => level.index == layout.positions[selected]!.level,
+                );
+                int slot(String id) => row.blocks.indexWhere(
+                  (block) => block.id == layout.positions[id]!.blockId,
+                );
+                final own = {
+                  slot(selected),
+                  slot(spouse),
+                  if (selected == rootTreePersonId) ...[
+                    slot('Партнёр'),
+                    slot('Кузина-партнёр'),
+                  ],
+                }.toList()..sort();
+                expect(own.last - own.first + 1, own.length);
+                expect(
+                  slot(other),
+                  isNot(inInclusiveRange(own.first, own.last)),
+                );
+                expect(
+                  row.blocks[slot('Супруг')].people.map((person) => person.id),
+                  ['Сестра супруга', 'Супруг'],
+                  reason:
+                      'Marriage proximity must not change sibling chronology.',
+                );
+                _expectCanonicalRowGeometry(tester, layout, portrait: portrait);
+                final rendered = _renderedConnections(
+                  tester,
+                  layout,
+                  portrait: portrait,
+                );
+                expect(rendered.any((link) => link.$1 == 'Супруг'), isFalse);
+                expect(
+                  rendered.any((link) => link.$1 == 'Супруг сестры'),
+                  isFalse,
+                );
+                if (selected == rootTreePersonId) {
+                  expect(rendered, curvesBefore);
+                  _expectFullColorPhotoNode(
+                    tester,
+                    'Партнёр',
+                    const Color(0xFF28644B),
+                  );
+                }
+                expect(
+                  layout.links.map((link) => (link.parentId, link.childId)),
+                  before.links.map((link) => (link.parentId, link.childId)),
+                );
+                expect(tester.takeException(), isNull);
+              }
+            }
+          }
+          expect(identical(fixture.document.people, people), isTrue);
+          await remoteChange(
+            fixture.document.removeMarriage(rootTreePersonId, 'own'),
+          );
+          expect(_filterOf(tester, 'Супруг'), distantFilter);
+          expect(_layoutOf(fixture).positions['Супруг']!.level, 0);
+          _expectFullColorPhotoNode(tester, 'Партнёр', const Color(0xFF28644B));
+          final coParentMarriage = fixture.document
+              .marriagesOf(rootTreePersonId)
+              .singleWhere(
+                (marriage) =>
+                    marriage.otherPersonId(rootTreePersonId) == 'Партнёр',
+              );
+          await remoteChange(
+            fixture.document.removeMarriage(
+              rootTreePersonId,
+              coParentMarriage.id,
+            ),
+          );
+          _expectFullColorPhotoNode(tester, 'Партнёр', const Color(0xFF28644B));
+          expect(
+            _layoutOf(fixture).positions['Партнёр']!.level,
+            _layoutOf(fixture).positions[rootTreePersonId]!.level,
+          );
+          expect(session.operations, isEmpty);
+          expect(tester.takeException(), isNull);
+        },
+      );
+    }
+
+    testWidgets(
+      '${portrait ? 'portrait' : 'landscape'} childless spouse bands retain independent scrolling and parent-only painter caching',
+      (tester) async {
+        final fixture = _family(siblings: 14, children: 14)
+          ..add('Супруг', sex: TreeSex.male);
+        fixture.apply(
+          fixture.document.addMarriage(rootTreePersonId, 'Супруг', id: 'own'),
+        );
+        final session = _Session(fixture.document);
+        await _mount(
+          tester,
+          session,
+          size: portrait ? const Size(430, 900) : const Size(1100, 700),
+        );
+        final layout = _layoutOf(fixture);
+        final painter = _linkPainter(tester);
+        final people = fixture.document.people;
+        final controllers = {
+          for (final level in layout.levels)
+            level.index: _levelController(tester, level.index),
+        };
+        final selectedLevel = layout.positions[rootTreePersonId]!.level;
+        final selected = controllers[selectedLevel]!;
+        expect(selected.position.maxScrollExtent, greaterThan(80));
+        selected.jumpTo(selected.position.maxScrollExtent / 2);
+        await tester.pump();
+        final offsets = {
+          for (final entry in controllers.entries)
+            entry.key: entry.value.offset,
+        };
+        final main = _mainController(tester).offset;
+        selected.jumpTo(selected.offset + 40);
+        await tester.pump();
+        expect(selected.offset, closeTo(offsets[selectedLevel]! + 40, .1));
+        for (final entry in controllers.entries) {
+          if (entry.key != selectedLevel) {
+            expect(entry.value.offset, offsets[entry.key]);
+          }
+        }
+        expect(_mainController(tester).offset, main);
+        expect(identical(_linkPainter(tester), painter), isTrue);
+        expect(identical(fixture.document.people, people), isTrue);
+        final drawing = _ConnectionCanvas();
+        painter.paint(
+          drawing,
+          tester.getSize(find.byKey(const Key('tree-links'))),
+        );
+        expect(drawing.paths, isNotEmpty);
+        expect(
+          layout.links.any(
+            (link) => link.parentId == 'Супруг' || link.childId == 'Супруг',
+          ),
+          isFalse,
+        );
+        expect(session.operations, isEmpty);
+        expect(tester.takeException(), isNull);
+      },
+    );
+
     testWidgets(
       '${portrait ? 'portrait' : 'landscape'} explicit siblings update grouping, parent curves, and split semantics without navigation writes',
       (tester) async {

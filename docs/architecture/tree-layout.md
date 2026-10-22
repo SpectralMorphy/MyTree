@@ -39,13 +39,16 @@ The document normally prevents these through its [acyclic projection](tree-model
 Model-projected sibling groups first form rigid generation components: computed full siblings and
 active explicit sibling components with incomplete parents. The model guarantees coherent accepted
 father/mother roles and an acyclic ancestry quotient for every group; layout does not repair sibling
-claims or reinterpret them as parents. Co-parent pairs, deduplicated and sorted by
-canonical person IDs, merge their current components only when neither component can reach the other
-in the quotient parent DAG. A merge that would collapse ancestry or create a directed cycle is skipped.
+claims or reinterpret them as parents. Partner pairs combine actual co-parents with the endpoints of
+all projected `TreeDocument.marriages`, including childless and completed historical marriages. Multiple
+episodes of one pair count once. Pairs are deduplicated and sorted by canonical person IDs, then merge
+their current components only when neither component can reach the other in the quotient parent DAG.
+A merge that would collapse ancestry or create a directed cycle is skipped. Marriage is a soft rank-equality
+request, never a parent edge, ancestry shortcut, sibling claim, or sex/parent-role constraint.
 Kahn's topological traversal first computes each component's earliest feasible rank from its longest
 parent path. The resulting quotient DAG then minimizes **total edge slack**:
 `sum(rank(child) - rank(parent) - 1)` over distinct quotient edges, subject to every real parent edge
-strictly descending and the already established sibling/co-parent equalities. Duplicate full-sibling
+strictly descending and the already established sibling/partner equalities. Duplicate full-sibling
 links do not weight one cohort more heavily. No source or terminal is frozen at its first feasible rank.
 
 The compactor uses iterative minimum-weight closure, solved by an integer residual minimum cut. Raising
@@ -102,19 +105,30 @@ members' masks, so a block's branch can differ from an individual member's branc
   sibling group with selection (including explicit parentless siblings and half siblings).
 - `cousin`: full/half siblings of every direct ancestor (aunts/uncles and their equivalents at higher
   ancestral generations), children of the selected person's immediate aunts/uncles, nephews/nieces
-  (children of full or half siblings), and co-parents of either direct parent other than the selected
-  person's actual parents (stepparents). Actual ancestors and other normal membership take precedence.
-  A stepparent's own ancestors, siblings, or other co-parents do not gain emphasis through this exception.
+  (children of full or half siblings), and partners of either direct parent other than the selected
+  person's actual parents (stepparents). Both co-parent and explicit-marriage pairs qualify, including
+  childless marriages; hiding an implied co-parent marriage does not remove that relationship.
+  Actual ancestors and other normal membership take precedence. A stepparent's own ancestors,
+  siblings, or other partners do not gain emphasis through this exception.
 - `distant`: everyone else, including cousins' children, further collateral descendants without another
   qualifying relationship, and unrelated people. Missing parents alone never establish sibling relationships;
   an explicit sibling component can establish them without inventing an unknown parent.
 
 A block takes its most prominent member's emphasis. These labels do not remove nodes or links from
 layout output; the [UI](ui.md) decides how strongly to draw context and which connections to paint.
-The UI also gives the selected person's co-parents normal color on their individual cards only; it does
-not change their model emphasis or sibling block. The layout separately uses actual shared children
-for partner proximity in **every mode**: the selected person's co-parents first, then their full/half/explicit
-siblings' co-parents. This ordering preference does not promote sibling partners' color or emphasis.
+The UI also gives the selected person's partners normal color on their individual cards only, using
+`TreeDocument.partnersOf`: both co-parents and explicit marriage partners, of any sex. This keeps the existing
+full-color photo, name, and avatar treatment; it does not change model emphasis, sibling-block wash, palette,
+or legend. The layout uses the same combined pairs for proximity in **every mode**: the selected person's
+partners first, then their full/half/explicit siblings' partners. This ordering preference does not promote
+sibling partners' color or emphasis. Removing a childless marriage removes its equality/proximity and
+card-color exception; detached people remain present as ordinary neutral context. Removing a marriage
+from co-parents' history (`noMarriage`) does not remove the existing shared-child partner policy.
+
+A previously disconnected childless spouse therefore joins the selected partner's feasible generation
+and neighboring whole-block cluster without becoming a descendant, blood relative, or trunk ancestor.
+Actual ancestry and stricter structural invariants still win when equality or literal adjacency is
+impossible. Marriage endpoints do not enter branch-mask propagation or blood-relative connection filtering.
 
 ## Sibling blocks and canonical family backbone
 
@@ -153,10 +167,11 @@ Each rank establishes a structural backbone before considering focus:
    priority parent is the corresponding known parent, falling back to the other. In `both` mode it is
    the older parent by that same unknown-date-first/date/name/ID comparator. Parentless blocks retain
    individual groups. Selecting a member no longer exempts its block from this grouping.
-3. Actual co-parent links join these groups into contiguous partner components on that rank.
+3. Co-parent and explicit marriage pairs join these groups into contiguous partner components on that rank.
    Cross-generation unions do not introduce a horizontal constraint across different ranks.
 4. Within each component, deterministic insertion and improving whole-group relocations minimize
-   the number of people separating co-parents. Ties prefer maternal-before-paternal orientation, then
+   the number of people separating partners. Only actual co-parents contribute maternal-before-paternal
+   orientation ties; childless marriages have no directional preference. Remaining ties use
    the canonical birth/name/ID order. No random seed, previous geometry, child ID, graph distance from the
    selection, or emphasis priority supplies an ordering tie-break.
 
@@ -296,13 +311,15 @@ Partner refinement runs in **father, mother, and both modes**. The original `bot
 an initial backbone refinement; a final guarded call runs after structural parent/descendant cohorts so
 that later grouping cannot accidentally undo partner priority or vice versa:
 
-- Co-parents are inferred only from actual children naming both distinct parents. There is no spouse
-  field, inferred romantic relationship, or artificial horizontal edge across ranks.
-- The selected person's co-parents take priority. The objective first compacts their whole blocks,
-  minimizes selected-pair card separation, then prefers maternal-before-paternal orientation.
-- Next come the co-parents of the selection's siblings, using the same full/half/explicit-group scope as
+- Co-parents are inferred only from actual children naming both distinct parents. Explicit marriage
+  episodes additionally supply undirected partner pairs, including when there are no shared children.
+  Neither source creates a painted horizontal edge across or within ranks.
+- The selected person's partners take priority. The objective first compacts their whole blocks,
+  minimizes selected-pair card separation, then prefers maternal-before-paternal orientation only for
+  actual co-parents. Childless pairs never supply parental-role directions or canonical mother/father slots.
+- Next come the partners of the selection's siblings, using the same full/half/explicit-group scope as
   sibling emphasis. Their aggregate card separation and block compactness improve only without worsening
-  the selected person's objective. This also works when selection has no co-parent at all.
+  the selected person's objective. This also works when selection has no partner at all.
 - Every accepted structural parent interval, accepted descendant interval, actual ancestral card seam,
   ancestor corridor, and currently satisfied accepted role inequality is locked. A partner preference
   cannot reverse an accepted maternal/paternal side or split a stronger family cohort.
@@ -310,8 +327,8 @@ that later grouping cannot accidentally undo partner priority or vice versa:
   Every member permutation is preserved exactly as received from parent-pair ordering (canonical chronology
   or an actual `both` ancestor seam). A selected person, sibling, or partner cannot move to a member boundary
   just for proximity. Intervening siblings can make literal card adjacency impossible even when blocks touch.
-- When a direct parent has an additional co-parent, the parents and their co-parents additionally request
-  a compact whole-block cluster after own/sibling co-parent objectives. Unrelated blocks cannot occupy
+- When a direct parent has an additional partner, the parents and their partners additionally request
+  a compact whole-block cluster after own/sibling partner objectives. Unrelated blocks cannot occupy
   a compatible gap between the selected person's parents and stepparents. This adds no literal
   stepparent-card adjacency, member reorder, ancestry edge, or rank constraint; stronger structural
   locks still win. Without a stepparent, this extra focus objective is absent.
@@ -327,8 +344,8 @@ parent seams and the ancestor corridor in `both` mode. Structural **common-paren
 mode** come next; the selected-descendant convenience corridor must respect those accepted intervals.
 After those structural stages, own-partner proximity precedes sibling-partner proximity and then the
 parent/stepparent cluster in every mode, while preserving the accepted role sides still satisfied by
-the structural result. Other context-partner preferences and minimal movement are lower-priority tie-breaks.
-Only the actual
+the structural result. Other context-partner
+preferences and minimal movement are lower-priority tie-breaks. Only the actual
 ancestral parent-seam operation may change sibling members; structural cohorts move whole blocks only.
 Four partners in the same opposite parent role and separate blocks must all remain on one side of the
 selection, so only one can touch; proximity cannot buy a reversal or a sibling reorder. Focus refinement
@@ -477,8 +494,10 @@ these are separate from the model's canonical structural order and are not share
 ## Relation links and the UI boundary
 
 `TreeLink` records every real parent-child relation, with the child's block ID for shared sibling
-connection handling. Layout does not substitute the priority parent for the real pair, discard long
-edges, select avatar endpoints, or calculate connection paths.
+connection handling. Marriage episodes never create a `TreeLink`, marital curve, or extra parent curve;
+connection identities, filtering, geometry, and the painter's sex colors remain unchanged. Layout does
+not substitute the priority parent for the real pair, discard long edges, select avatar endpoints,
+or calculate connection paths.
 
 [tree_editor.dart](../../lib/ui/tree_editor.dart) owns connection filtering, relevant-person avatar-edge
 or descendant-block-center endpoints, curves, clipping, and scroll-offset projection. It also owns
@@ -530,5 +549,10 @@ parentless sibling/cousin emphasis and collateral side propagation without ances
 malformed within-group parent cycles, all-mode own-before-sibling partner conflicts, sibling-only partner
 refinement for full/half/explicit siblings, two rigid sibling blocks under unknown/equal/reversed DOB,
 unchanged emphasis/ranks/links/history, document edits, and metrics without overlap.
+Explicit-marriage fixtures additionally cover detached childless partners of every sex, neutral
+orientation, duplicate/reversed episodes, cold/reloaded rank determinism, conflicting spouse chains,
+rigid sibling blocks, own-before-sibling partner priority, and removal with/without shared children.
 [tree_editor_test.dart](../../test/tree_editor_test.dart) covers the separate UI contract, including
-orientation, scrolling, alignment, zoom, screen-position stability, and real parent connections.
+orientation, scrolling, alignment, zoom, screen-position stability, and real parent connections;
+childless spouses retain existing light/dark full-color node treatment, neutral block washes, parent-only
+curves, live removal/noMarriage behavior, and independently scrolled cached painter geometry.

@@ -91,7 +91,23 @@ class TreeLayout {
       }
     }
 
-    final ranks = _generationRanks(ids, parents, drafts.values);
+    final coParentPairs = <(String, String)>{
+      for (final id in ids)
+        if (people[id]!.motherId case final mother?)
+          if (people[id]!.fatherId case final father?)
+            if (mother != father) (mother, father),
+    };
+    final partnerPairs = <(String, String)>{...coParentPairs};
+    for (final marriage in document.marriages) {
+      final a = marriage.personId;
+      final b = marriage.partnerId;
+      // Shared children retain their genuine maternal/paternal orientation.
+      // Childless marriages request proximity only, never a parental role.
+      if (!coParentPairs.contains((a, b)) && !coParentPairs.contains((b, a))) {
+        partnerPairs.add(a.compareTo(b) < 0 ? (a, b) : (b, a));
+      }
+    }
+    final ranks = _generationRanks(ids, parents, drafts.values, partnerPairs);
     final rolePreferences = _descendantRolePreferences(
       ids,
       people,
@@ -131,18 +147,12 @@ class TreeLayout {
     };
     final descendants = _reachable(selectedId, children)..remove(selectedId);
     final siblings = siblingsOf(selectedId).toSet();
-    final coParentPairs = <(String, String)>{
-      for (final id in ids)
-        if (people[id]!.motherId case final mother?)
-          if (people[id]!.fatherId case final father?)
-            if (mother != father) (mother, father),
-    };
     final auntsAndUncles = <String>{
       for (final parent in parents[selectedId]!) ...siblingsOf(parent),
     }..removeAll(parents[selectedId]!);
     final parentIds = parents[selectedId]!.toSet();
     final stepparents = <String>{
-      for (final (a, b) in coParentPairs) ...[
+      for (final (a, b) in partnerPairs) ...[
         if (parentIds.contains(a)) b,
         if (parentIds.contains(b)) a,
       ],
@@ -223,6 +233,8 @@ class TreeLayout {
         parentPairs,
         selectedId,
         rolePreferences[index] ?? const [],
+        partnerPairs,
+        coParentPairs,
       );
       blocks = _orderParentCohorts(
         blocks,
@@ -232,7 +244,8 @@ class TreeLayout {
         selectedId: selectedId,
         siblingIds: siblings,
         parentIds: stepparents.isEmpty ? const {} : parentIds,
-        couples: coParentPairs,
+        couples: partnerPairs,
+        coParentPairs: coParentPairs,
         descendantIds: mode == TreeTrunkMode.both && index > ranks[selectedId]!
             ? descendants
             : const {},
@@ -394,15 +407,16 @@ class TreeLink {
   final String blockId;
 }
 
-/// Full siblings are rigid generation units. Co-parents share a generation
+/// Full siblings are rigid generation units. Partners share a generation
 /// whenever merging their units preserves the ancestry DAG. Conflicting unions
-/// use canonical parent-ID pair order, never selection, birth dates, child IDs,
+/// use canonical person-ID pair order, never selection, birth dates, child IDs,
 /// or map iteration order. This is a maximal compatible set, not a maximum one:
-/// a later incompatible union retains its real cross-generation parent links.
+/// a later incompatible union never flattens real cross-generation parent links.
 Map<String, int> _generationRanks(
   List<String> ids,
   Map<String, List<String>> parents,
   Iterable<_SiblingDraft> blocks,
+  Set<(String, String)> partnerPairs,
 ) {
   final components = <String, String>{};
   for (final block in blocks) {
@@ -432,19 +446,15 @@ Map<String, int> _generationRanks(
   final predecessors = <String, Set<String>>{
     for (final id in successors.keys) id: {},
   };
-  final couples = <(String, String)>{};
   for (final id in ids) {
-    final known = parents[id]!;
-    for (final parent in known) {
+    for (final parent in parents[id]!) {
       successors[component(parent)]!.add(component(id));
       predecessors[component(id)]!.add(component(parent));
     }
-    if (known.length == 2) {
-      final a = known[0];
-      final b = known[1];
-      couples.add(a.compareTo(b) < 0 ? (a, b) : (b, a));
-    }
   }
+  final couples = {
+    for (final (a, b) in partnerPairs) a.compareTo(b) < 0 ? (a, b) : (b, a),
+  };
   final orderedCouples = couples.toList()
     ..sort((a, b) {
       final first = a.$1.compareTo(b.$1);
@@ -925,6 +935,8 @@ List<_SiblingDraft> _orderedBlocks(
   List<(String, String)> parentPairs,
   String selectedId,
   List<(String, String)> preferences,
+  Set<(String, String)> partnerPairs,
+  Set<(String, String)> coParentPairs,
 ) {
   blocks.sort(_compareBlocks);
   final grouped = <(bool, String), List<_SiblingDraft>>{};
@@ -944,15 +956,13 @@ List<_SiblingDraft> _orderedBlocks(
   final neighbors = <int, Set<int>>{
     for (var i = 0; i < families.length; i++) i: {},
   };
-  for (final person in people.values) {
-    final mother = person.motherId;
-    final father = person.fatherId;
-    final a = familyOf[mother];
-    final b = familyOf[father];
-    // Cross-generation unions keep their genuine long edges, not an artificial
-    // horizontal constraint between different generations.
+  for (final pair in partnerPairs) {
+    final a = familyOf[pair.$1];
+    final b = familyOf[pair.$2];
+    // Cross-generation unions never request a horizontal constraint between
+    // different generations; only actual parent links can span those bands.
     if (a == null || b == null) continue;
-    couples.add((mother!, father!));
+    couples.add(pair);
     if (a == b) continue;
     neighbors[a]!.add(b);
     neighbors[b]!.add(a);
@@ -971,11 +981,17 @@ List<_SiblingDraft> _orderedBlocks(
       }
     }
     members.sort();
-    final ordered = _orderPartners(members, families, couples, familyOf);
+    final ordered = _orderPartners(
+      members,
+      families,
+      couples,
+      familyOf,
+      coParentPairs,
+    );
     final component = [for (final member in ordered) ...families[member]];
     components.add(
       mode == TreeTrunkMode.both
-          ? _canonicalParentBoundary(component, couples)
+          ? _canonicalParentBoundary(component, coParentPairs)
           : component,
     );
   }
@@ -986,7 +1002,7 @@ List<_SiblingDraft> _orderedBlocks(
   // A side repair can move the shared mother block past her canonical father
   // slot. Restore that focus-independent slot when the role inequalities allow
   // it, so half-sibling selections still exchange only their fathers' slots.
-  final boundary = _canonicalParentBoundary(sided, couples);
+  final boundary = _canonicalParentBoundary(sided, coParentPairs);
   final normalized = roles.allows(_personIndices(boundary)) ? boundary : sided;
   final adjacent = _orderParentPairs(normalized, parentPairs, roles);
   final focused = _orderSelectedPartners(
@@ -995,6 +1011,7 @@ List<_SiblingDraft> _orderedBlocks(
     couples,
     parentPairs,
     roles.allows,
+    coParentPairs: coParentPairs,
   );
   return _orderBranchCorridor(focused, (block) => block.ancestorMask != 0);
 }
@@ -1051,6 +1068,7 @@ List<_SiblingDraft> _orderParentCohorts(
   required Set<String> siblingIds,
   required Set<String> parentIds,
   required Set<(String, String)> couples,
+  required Set<(String, String)> coParentPairs,
   required Set<String> descendantIds,
   required Map<String, int> descendantSides,
 }) {
@@ -1262,6 +1280,7 @@ List<_SiblingDraft> _orderParentCohorts(
     parentPairs,
     (indices) =>
         roleLocks.every((pair) => indices[pair.$1]! < indices[pair.$2]!),
+    coParentPairs: coParentPairs,
     siblingIds: siblingIds,
     parentIds: parentIds,
     lockedCohorts: [...exactAccepted, ...accepted],
@@ -1527,7 +1546,7 @@ List<_SiblingDraft> _orderParentPairs(
 }
 
 /// Refine partner proximity without changing members or stronger row invariants.
-/// Own co-parents take priority over siblings' co-parents, then the parents' family
+/// Own partners take priority over siblings' partners, then the parents' family
 /// cluster. Only deterministic improving whole-block relocations are considered;
 /// the final caller also locks structural family/descendant intervals and corridors.
 List<_SiblingDraft> _orderSelectedPartners(
@@ -1536,6 +1555,7 @@ List<_SiblingDraft> _orderSelectedPartners(
   Set<(String, String)> couples,
   List<(String, String)> parentPairs,
   bool Function(Map<String, int>) allowsRoles, {
+  required Set<(String, String)> coParentPairs,
   Set<String> siblingIds = const {},
   Set<String> parentIds = const {},
   Iterable<Set<_SiblingDraft>> lockedCohorts = const [],
@@ -1627,15 +1647,21 @@ List<_SiblingDraft> _orderSelectedPartners(
 
     var separation = 0;
     var reversed = 0;
-    for (final (mother, father) in pairs) {
-      separation += (indices[mother]! - indices[father]!).abs() - 1;
-      if (indices[mother]! > indices[father]!) reversed++;
+    for (final pair in pairs) {
+      separation += (indices[pair.$1]! - indices[pair.$2]!).abs() - 1;
+      if (coParentPairs.contains(pair) &&
+          indices[pair.$1]! > indices[pair.$2]!) {
+        reversed++;
+      }
     }
     var siblingSeparation = 0;
     var siblingReversed = 0;
-    for (final (mother, father) in siblingPairs) {
-      siblingSeparation += (indices[mother]! - indices[father]!).abs() - 1;
-      if (indices[mother]! > indices[father]!) siblingReversed++;
+    for (final pair in siblingPairs) {
+      siblingSeparation += (indices[pair.$1]! - indices[pair.$2]!).abs() - 1;
+      if (coParentPairs.contains(pair) &&
+          indices[pair.$1]! > indices[pair.$2]!) {
+        siblingReversed++;
+      }
     }
     var collateral = 0;
     for (final (mother, father) in localCouples) {
@@ -1710,9 +1736,9 @@ List<_SiblingDraft> _orderSelectedPartners(
 }
 
 /// Use structural adjacency, not child IDs or selection priority. The cost is
-/// the number of people separating real co-parents, then canonical maternal-
-/// before-paternal orientation, then the birth/name/ID backbone. Whole role groups
-/// move together: chronology and full-sibling indivisibility are never traded
+/// the number of people separating partners, then maternal-before-paternal
+/// orientation for actual co-parents only, then the birth/name/ID backbone.
+/// Whole role groups move together: chronology and full-sibling indivisibility are never traded
 /// for a shorter edge. Deterministic insertion plus improving relocations also
 /// handles spouse chains without enumerating their permutations.
 List<int> _orderPartners(
@@ -1720,6 +1746,7 @@ List<int> _orderPartners(
   List<List<_SiblingDraft>> families,
   Set<(String, String)> couples,
   Map<String, int> familyOf,
+  Set<(String, String)> coParentPairs,
 ) {
   if (members.length < 2) return members;
   final relevant = couples
@@ -1745,14 +1772,14 @@ List<int> _orderPartners(
     }
     var separation = 0;
     var reversed = 0;
-    for (final (mother, father) in relevant) {
-      final a = starts[familyOf[mother]];
-      final b = starts[familyOf[father]];
+    for (final pair in relevant) {
+      final a = starts[familyOf[pair.$1]];
+      final b = starts[familyOf[pair.$2]];
       if (a == null || b == null) continue;
-      final first = a + offsets[mother]!;
-      final second = b + offsets[father]!;
+      final first = a + offsets[pair.$1]!;
+      final second = b + offsets[pair.$2]!;
       separation += (first - second).abs() - 1;
-      if (first > second) reversed++;
+      if (coParentPairs.contains(pair) && first > second) reversed++;
     }
     return (separation, reversed);
   }

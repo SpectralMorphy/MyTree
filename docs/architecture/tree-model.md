@@ -1,8 +1,9 @@
 # Tree model and merge semantics
 
-The current domain model is [tree_document.dart](../../lib/tree/tree_document.dart).
-It has no Flutter, storage, or transport dependency. `TreeDocument` owns a mutable set of immutable
-operations and rebuilds immutable `people`, `bindings`, and room `patronymicOverrides` projections from that set.
+The current domain model is [tree_document.dart](../../lib/tree/tree_document.dart), with pure immutable
+surname/marriage/history values in [family_history.dart](../../lib/tree/family_history.dart).
+Neither module depends on Flutter, storage, or transport. `TreeDocument` owns a mutable set of immutable
+operations and rebuilds immutable people, relationship/history, binding, and room patronymic projections.
 
 Related: [tree layout](tree-layout.md), [UI](ui.md),
 [history and storage](history-and-storage.md), [rooms and identity](rooms-and-identity.md).
@@ -62,13 +63,15 @@ concerns; see [history and storage](history-and-storage.md).
 content or stamp throws before any event in that batch is accepted. A changed event set causes a full
 sorted rebuild, not mutation in arrival order:
 
-1. Create the virtual root and gather person identities, then fact/photo identities.
+1. Create the virtual root and gather person identities (including atomic new marriage partners), then fact/photo identities.
 2. Seed new identities from the earliest create/add in total order; later duplicate creations do not
    replace them. Gathering identities first lets an edit/removal be replayed before its add arrives.
 3. Replay text edits, scalar registers, room patronymic overrides, removals, placements, and actor claims
    using their own rules. Room registers are handled independently of person lookup or visibility.
 4. Collect permanent person tombstones, drop references to deleted people, resolve parent cycles,
-   derive surnames/patronymics from accepted father edges, order lists, and publish immutable visible snapshots.
+   derive birth surnames/patronymics from accepted father edges, and project family histories/current
+   surnames using the accepted live graph and independent marriage/suppression records. Order lists
+   and publish immutable visible snapshots.
 
 Events targeting identities not yet present stay in the event set; a later rebuild can apply them.
 Equal event sets therefore converge independently of delivery order or duplicate delivery.
@@ -149,6 +152,10 @@ payloads and do not propagate ordinary parent operations inside components.
 | --- | --- |
 | Name, biography, fact text, photo caption | Independent anchored text sequences, not whole-string LWW. |
 | Birth surname, legacy family/maiden surnames | Atomic nullable per-person LWW `(text, decline)` configuration. Historical family-keyed registers remain read-only fallback until any personal register exists; maiden stays independent and non-rendered. |
+| Marriage episode | Stable room-global ID and immutable undirected endpoints; shared period is atomic LWW, surname choice/snapshot is independent LWW per endpoint; deletion is remove-wins. |
+| Pair `noMarriage` | Endpoint/root-independent LWW suppression of common-child marriage fallback; valid fresh episode add clears, remove sets. |
+| Independent surname change | Person-scoped stable ID; atomic LWW `(canonical surname, date, reason)` record; deletion is remove-wins. |
+| Current surname | Projection from chronological changes, falling back to birth. Never inherited by children. |
 | Room patronymic dictionary | Per-normalized-name LWW nullable `(male, female)` pair; null resets to the built-in dictionary/algorithm. Independent of any person. |
 | Person patronymic | Projection only, from the accepted father's given-name text, room overrides, and child's sex; unknown sex gives an empty string. |
 | Sex | Atomic last-writer-wins (LWW) register; clearing means `unknown`, not `null`. |
@@ -163,11 +170,11 @@ one another. Text is not accepted through `setValue`; list ordering is not an at
 
 ## Canonical surnames
 
-The surname is a person's surname at birth, not later married or changed names. The UI exposes one
-per-person field, with no shared-sibling ownership or separate-surname mode, and does not record
-subsequent surnames. Legacy `family` and `maiden` operations remain valid immutable journal data;
-opening a tree does not migrate them, rewrite history, or save synthesized personal values. Historical
-maiden values are no longer edited, displayed separately, or searched.
+The original surname registers describe a person's **surname at birth**. Later marriage and independent
+surname changes are separate history records; they never rewrite those birth registers or feed paternal
+inheritance. Legacy `family` and `maiden` operations remain valid immutable journal data; opening a tree
+does not migrate them, parse historical names, rewrite history, or save synthesized personal values.
+Historical maiden values remain independent compatibility data.
 
 `TreeSurname` is an immutable canonical base `text` plus `decline`. The model constructor retains its
 historical **false** default; commands serialize the explicit flag. The new UI input defaults to **true**
@@ -237,14 +244,157 @@ deleting a parent removes that edge before resolving the surname. Because old su
 interpret null clears differently, sessions negotiate the separate `personalSurnames` capability before
 admission/history exchange; see [capability compatibility](synchronization.md#capability-compatibility).
 
-`TreePerson.surname` renders the effective configuration for sex. `fullName` puts the existing trimmed
+`TreePerson.currentSurname` is the latest chronological history configuration, falling back to birth
+`effectiveSurname`. `surname` renders **currentSurname** for sex. `fullName` puts the existing trimmed
 name first and appends that surname, using the unnamed fallback if needed. Existing name text may contain
 given name and patronymic; it is neither split nor migrated. This compatibility property remains
 name-first without appending the derived patronymic; `nameForMode` supplies the alternate order described
-below. Stored fields and old operation payloads are unchanged. `surnameForBlock` uses effective configurations: empty for
-no members/all missing, the sex-specific form for one member, plural for several equal non-null
-configurations, and `разные фамилии` (“different surnames”) for mixed configurations, including a missing
-value among non-missing ones. Equality includes `decline`, not merely displayed text.
+below. Stored name fields and old operation payloads are unchanged. `surnameForBlock` deliberately uses
+**birth effective configurations**, including its singleton sex-specific form: empty for no members/all
+missing, plural for several equal non-null configurations, and `разные фамилии` (“different surnames”)
+for mixed configurations, including a missing value among non-missing ones. Equality includes `decline`,
+not merely displayed text. A father's later surname change therefore changes his full name, but not his
+children's inherited birth surnames or the family's birth-surname block footer.
+
+## Marriages and surname history
+
+### Values and read projections
+
+`TreeMarriage` identifies an undirected **episode**, not an ancestry edge. It contains immutable `id`,
+`personId`, `partnerId`, nullable `startDate`/`endDate`, `TreeMarriageEndMode` (`unknown`, `lifelong`,
+`date`), `isImplied`, `orderingDate`, and an unmodifiable per-person `surnameChoices` map.
+`otherPersonId(id)` returns the other endpoint, or null for a nonmember. Episodes with the same pair may
+coexist; their IDs and endpoints never change. No monogamy, sex, generation, or kinship restriction is
+imposed. The only invalid pair is a self pair. Marriage cannot introduce an ancestry cycle.
+
+`TreeMarriageSurnameChoice` contains `changeSurname`, nullable canonical `adoptedSurname`, and
+`isExplicit` (the person has an explicit choice rather than an inferred/default one).
+`TreeSurnameChange` contains `id`, `personId`, canonical `surname`, nullable actual `date`, `reason`,
+optional `marriageId`/`partnerId`, `isImplied`, `orderingDate`, and projection-only `changesSurname`.
+Actual change compares the preceding and new **rendered forms for that person's current sex**. A
+canonical `decline`-only adjustment can therefore update the saved configuration without repeating an
+identical visible surname. A generic reason record remains editable in that case with `changesSurname`
+false; a marriage with no actual change has no surname-change row at all. The raw canonical configuration
+still becomes the current surname and is not discarded merely because its rendered text is unchanged.
+
+All document lookups return unmodifiable snapshots; unknown/deleted person lookups return empty lists:
+
+- `marriages` contains all undeleted episodes whose **two endpoints are visible**, including ended
+  marriages. It is suitable for layout adjacency, not for ancestry.
+- `marriagesOf(personId)` is that person's historical episodes. Explicit episodes remain editable for
+  a surviving person even after the partner is deleted; their immutable partner ID is retained. No
+  person is resurrected. Implied episodes disappear when a partner/accepted common child disappears.
+- `partnersOf(personId)` returns visible people in `compareTreePeopleByBirth` order, deduplicating both
+  marriage endpoints and accepted live co-parents. Pair suppression removes a marital assertion, not
+  the fact of shared parenthood or co-parent navigation/layout adjacency.
+- `surnameChangesOf(personId)` contains chronological surname records: generic records (even no-op
+  reason records) and only actual marriage changes. `historyOf(personId)` contains sorted
+  `TreeFamilyHistoryEntry(id, marriage?, surnameChange?)` rows. A marriage row optionally contains its
+  actual surname change; there is no duplicate independent surname row for that marriage.
+
+Neither surname computation nor relationship inference appends events or saves a migration.
+
+### Commands and exact operation payloads
+
+Commands create operations, never mutate the document. Every new operation is **person-scoped**;
+`isRoomScoped` remains limited to patronymic dictionary operations. The caller stamps/merges each
+operation using the existing event-set workflow.
+
+- `addMarriage(personId, partnerId, {id, startDate, endDate, endMode = unknown, changeSurname,
+  adoptedSurname, newPartner})` creates an episode; omitted ID gets a fresh generated identity. Omitted
+  surname choice defaults to adoption for women and keeping for male/unknown sex. `changeSurname`
+  and `adoptedSurname` control only the initiating endpoint; they do not overwrite the other's choice.
+- Optional `TreeNewMarriagePartner(name = '', sex = unknown, birthDate, birthSurname)` creates the
+  supplied fresh `partnerId`, DOB and canonical birth surname in the **same** operation. Earliest
+  creation gathering includes these identities, so delayed edits/creations behave like other person
+  identities. A deleted/used partner ID cannot be reused locally. Existing partners require null
+  `newPartner`; no separate create-person/DOB/marriage writes are needed.
+- `updateMarriage(personId, marriageId, {required startDate, required endDate, endMode = unknown})`
+  updates the atomic shared period only. `setMarriageSurname(personId, marriageId,
+  {required changeSurname, adoptedSurname})` updates only that endpoint's atomic choice/snapshot.
+  Both commands materialize an implied episode under its existing deterministic ID.
+- `removeMarriage(personId, marriageId)` permanently removes the observed episode and writes pair
+  `noMarriage = true`. It does not alter parenthood, children, another episode's ID, or a person's birth
+  surname. Update/remove require a visible initiating person and an observed episode, but not a
+  still-visible partner. A fresh add for the same pair clears suppression without reviving old IDs.
+- `addSurnameChange(personId, {id, required surname, date, reason = ''})`,
+  `updateSurnameChange(personId, id, {required surname, date, reason = ''})`, and
+  `removeSurnameChange(personId, id)` manage an independent person-scoped history identity. An update
+  atomically replaces that record's surname/date/reason, not another record or the entire history.
+  Removing a marriage-derived change uses `setMarriageSurname(... changeSurname: false)` or removes
+  the marriage itself; generic history commands cannot edit a derived marriage row.
+
+Every wire key below is required, including nullable values; extra/missing keys are rejected.
+`Surname` means exact `{text: String, decline: bool}` and `Choice` means exact
+`{changeSurname: bool, surname: Surname?}`:
+
+| Type | Exact keys beyond `type` |
+| --- | --- |
+| `addMarriage` | `personId, partnerId, itemId, startDate, endDate, endMode, surnameChoices, newPartner` |
+| `setMarriageDates` | `personId, partnerId, itemId, startDate, endDate, endMode` |
+| `setMarriageSurname` | `personId, partnerId, itemId, changeSurname, surname` |
+| `removeMarriage` | `personId, partnerId, itemId` |
+| `addSurnameChange`, `setSurnameChange` | `personId, itemId, surname, date, reason` |
+| `removeSurnameChange` | `personId, itemId` |
+
+`addMarriage.surnameChoices` has exactly the two endpoint IDs as keys and `Choice` values.
+The initial other-endpoint default is a frozen snapshot, not a later whole-pair editable register;
+subsequent updates from either endpoint preserve the other's register. `newPartner` is null or exact
+`{name, sex, birthDate, birthSurname}`. Independent surname IDs are person-scoped; episode IDs are
+room-global. Explicit IDs have the normal 256-UTF-16-unit bound. Reserved implied IDs are
+`implied:<canonical pair key>`, where the two IDs sort lexically and are length-prefixed with UTF-16
+lengths; that namespace allows up to 550 units. Endpoints containing colons/astral Unicode remain
+unambiguous. A reserved ID for a different pair is rejected.
+
+Dates are nullable strict valid `yyyy-MM-dd` calendar strings. `endMode: date` requires an end date;
+other end modes forbid one. The start/end/mode triple is one LWW register, so concurrent changes
+cannot assemble an invalid range. A known start later than a known end is rejected both locally and
+on wire decode. End-only periods do not supply an ordering start. `unknown` is the default, not
+lifelong. For `lifelong`, `lifelongEndDate(personDeath, partnerDeath)` returns the earliest known death;
+with no death the UI distinguishes living/current from unknown using the existing `alive` fields.
+`hasExplicitDates` is false if both actual dates are absent, even when a child supplies an ordering hint.
+
+New history strings must be well-formed Unicode without C0/C1 controls, except that reason text allows
+interior LF/CR line breaks. Surnames are trimmed, nonempty, at most 200 runes; reasons are trimmed, may
+be empty or multiline, and are at most 1,000 runes (`maxTreeSurnameReasonLength`). Atomic new-partner
+names are trimmed, may be empty, and are bounded
+at 200 runes. Helpers trim reasons/new-partner names; wire decoding requires canonical text. Keeping
+a surname requires a null adopted snapshot. Adoption may have a null snapshot when the partner has
+no surname: that does **not** clear the person's existing surname.
+
+### Inference, snapshots, ordering and deletion
+
+A pair of distinct accepted live parents of a visible child implies one stable marriage only when no
+explicit episode exists and the pair is not suppressed. Inference follows the final cycle-filtered,
+sibling-propagated live parent graph, not raw/rejected parent registers. It uses the oldest **known
+common child's** DOB as an ordering hint only: no inferred date is displayed or persisted as a marriage
+start/surname-change date. Other children, deleted children and unknown dates do not supply a false
+boundary. Either partner may explicitly uncheck adoption; materializing that choice prevents later
+children, renames, or unrelated date edits from restoring the female default.
+
+Explicit adopted surnames are canonical configuration snapshots. Default implied transfers use the
+partner's latest **concrete** configuration: birth plus generic changes and persisted explicit-episode
+snapshots, excluding every inferred/default-derived transfer. This two-stage calculation never follows
+spouses' current surnames recursively; female/female unions and marriage loops cannot cycle. A partner
+rename, changed birth surname, death, or deletion does not rewrite an already persisted snapshot.
+Divorce/death does not roll back a surname; a later explicit change can restore any canonical value.
+
+Surname chronology sorts undated records before dated records; date means actual change/marriage
+start, or the common-child ordering hint for a startless marriage. Ties compare canonical surname text,
+marriage-before-generic kind, stable ID and person ID. Projection walks that deterministic order from
+the birth surname to find actual changes and the latest current value. For history presentation,
+undated marriages with no actual surname change and no ordering date come first, sorted by the partner's
+birth/name/ID seniority; other undated records sort by surname, then dated entries ascend. These two
+passes avoid a cyclic dependency between sorting and whether a surname really changed. End dates
+alone never act as start dates. Missing partner display names are a UI fallback, not stored text.
+
+Episode and independent-record deletion are remove-wins, even when a tombstone arrives before its
+creation or an edit has a later stamp. Pair suppression is a separate **(clock, author, id)** LWW
+register independent of endpoint/root visibility. Removal writes true; a valid **fresh**, non-tombstoned
+add writes false. A delayed/later duplicate add of a tombstoned episode cannot clear suppression.
+Wrong-endpoint edits/removals cannot retarget an existing episode. Local commands reject used IDs,
+including deleted IDs; concurrent materializations of an implied episode keep its one deterministic ID
+and independent endpoint choices. All original events and tombstones stay in history.
 
 ## Derived patronymics and name modes
 
@@ -403,3 +553,9 @@ removal, scalar ordering, per-person surname edits/clears, preserved legacy regi
 inheritance, derived patronymics/name modes without name migration, room dictionary validation and atomic
 LWW overrides/resets (including empty-tree replay), local/concurrent cycles, legacy first claims,
 exact-claim releases/rebinding, and image validation.
+[family_history_test.dart](../../test/family_history_test.dart) additionally covers atomic new partners,
+shared episode dates and independent surname choices, implied/materialized marriages, chronological
+current surnames without inheritance changes, actual/no-op rows, strict new schemas and bounded Unicode,
+remove-wins identities, pair suppression/reset/re-add, survivor history, immutable snapshots, and
+shuffled/duplicate/late/concurrent replay. [family_history_search_test.dart](../../test/family_history_search_test.dart)
+covers the current-name/search projection with preserved patronymics and birth-surname block titles.

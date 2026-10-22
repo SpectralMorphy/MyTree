@@ -2,11 +2,11 @@ import 'dart:collection';
 import 'dart:convert';
 
 import '../room_identity.dart';
+import 'family_history.dart';
 import 'patronymic.dart';
 
+export 'family_history.dart';
 export 'patronymic.dart';
-
-enum TreeSex { unknown, male, female }
 
 enum TreeNameMode { givenSurname, surnameGivenPatronymic }
 
@@ -16,6 +16,7 @@ const rootTreePersonId = 'root';
 const maxTreeTextLength = 100000;
 const maxTreeSurnameLength = 200;
 const maxTreePatronymicLength = 200;
+const maxTreeSurnameReasonLength = 1000;
 const maxTreePhotoBytes = 700 * 1024;
 const treeFactColors = <String>[
   '#E6DCCB',
@@ -46,26 +47,6 @@ class TreePhoto {
   final String id;
   final String dataUrl;
   final String caption;
-}
-
-/// Canonical base spelling. Rendered forms never become inherited values.
-class TreeSurname {
-  const TreeSurname({required this.text, this.decline = false});
-
-  final String text;
-  final bool decline;
-
-  String formForSex(TreeSex sex) =>
-      decline && sex == TreeSex.female ? '$textа' : text;
-
-  String get plural => decline ? '$textы' : text;
-
-  @override
-  bool operator ==(Object other) =>
-      other is TreeSurname && other.text == text && other.decline == decline;
-
-  @override
-  int get hashCode => Object.hash(text, decline);
 }
 
 /// One active undirected sibling claim. Its ID is the immutable creation event.
@@ -99,10 +80,16 @@ class TreePerson {
     this.individualSurname,
     this.maidenSurname,
     TreeSurname? effectiveSurname,
+    TreeSurname? currentSurname,
     this.surnameInheritedFrom,
     TreePatronymicForms? fatherPatronymicForms,
   }) : effectiveSurname =
            effectiveSurname ?? individualSurname ?? familySurname,
+       currentSurname =
+           currentSurname ??
+           effectiveSurname ??
+           individualSurname ??
+           familySurname,
        _fatherPatronymicForms = fatherPatronymicForms,
        facts = List.unmodifiable(facts),
        photos = List.unmodifiable(photos);
@@ -129,7 +116,12 @@ class TreePerson {
   /// This person's explicit configuration; null means father inheritance.
   final TreeSurname? individualSurname;
   final TreeSurname? maidenSurname;
+
+  /// Canonical surname at birth, and the only paternal inheritance source.
   final TreeSurname? effectiveSurname;
+
+  /// Latest chronological surname; marriage transfers never feed inheritance.
+  final TreeSurname? currentSurname;
 
   /// Immediate father, only when the effective value is inherited from him.
   final String? surnameInheritedFrom;
@@ -139,7 +131,7 @@ class TreePerson {
   final TreePatronymicForms? _fatherPatronymicForms;
 
   String get displayName => name.trim().isEmpty ? 'Без имени' : name;
-  String get surname => effectiveSurname?.formForSex(sex) ?? '';
+  String get surname => currentSurname?.formForSex(sex) ?? '';
   String get patronymic => fatherId == null
       ? ''
       : switch (sex) {
@@ -219,7 +211,10 @@ String surnameForBlock(Iterable<TreePerson> people) {
       members.every((person) => person.effectiveSurname == null)) {
     return '';
   }
-  if (members.length == 1) return members.single.surname;
+  if (members.length == 1) {
+    return members.single.effectiveSurname?.formForSex(members.single.sex) ??
+        '';
+  }
   final surname = members.first.effectiveSurname;
   if (surname == null ||
       members.any((person) => person.effectiveSurname != surname)) {
@@ -247,6 +242,12 @@ class TreeOperation {
     'createPerson' || 'createSibling' || 'deletePerson' => 'person',
     'unlinkSibling' => 'sibling:${_json['linkId']}',
     'setPatronymicOverride' => 'patronymic:${_json['name']}',
+    'addMarriage' || 'removeMarriage' => 'marriage:$itemId',
+    'setMarriageDates' => 'marriage:$itemId:dates',
+    'setMarriageSurname' => 'marriage:$itemId:surname:$personId',
+    'addSurnameChange' ||
+    'setSurnameChange' ||
+    'removeSurnameChange' => 'surnameChange:$itemId',
     'setValue' => _json['field']! as String,
     'setSurname' =>
       _json['scope'] == 'family'
@@ -269,6 +270,13 @@ class TreeOperation {
     'createSibling' => 'Добавлен брат или сестра',
     'unlinkSibling' => 'Удалена прямая связь братьев или сестёр',
     'deletePerson' => 'Удалён человек',
+    'addMarriage' => 'Добавлен брак',
+    'setMarriageDates' => 'Изменены даты брака',
+    'setMarriageSurname' => 'Изменена фамилия в браке',
+    'removeMarriage' => 'Удалён брак',
+    'addSurnameChange' => 'Добавлена смена фамилии',
+    'setSurnameChange' => 'Изменена смена фамилии',
+    'removeSurnameChange' => 'Удалена смена фамилии',
     'setPatronymicOverride' =>
       _json['male'] == null
           ? 'Сброшены отчества для имени «${_json['name']}»'
@@ -339,6 +347,86 @@ class TreeOperation {
           _patronymicText(male);
           _patronymicText(female);
         }
+      case 'addMarriage':
+        _keys(json, const [
+          'type',
+          'personId',
+          'partnerId',
+          'itemId',
+          'startDate',
+          'endDate',
+          'endMode',
+          'surnameChoices',
+          'newPartner',
+        ]);
+        _validateMarriagePair(json);
+        _validateMarriageDates(json);
+        final choices = _object(json['surnameChoices']);
+        _keys(choices, [
+          json['personId']! as String,
+          json['partnerId']! as String,
+        ]);
+        for (final choice in choices.values) {
+          final value = _object(choice);
+          _keys(value, const ['changeSurname', 'surname']);
+          _validateMarriageSurnameChoice(value);
+        }
+        if (json['newPartner'] != null) {
+          final partner = _object(json['newPartner']);
+          _keys(partner, const ['name', 'sex', 'birthDate', 'birthSurname']);
+          _historyText(partner['name'], maxLength: maxTreeSurnameLength);
+          _sex(partner['sex']);
+          _validateValue('birthDate', partner['birthDate']);
+          _historySurname(partner['birthSurname'], nullable: true);
+        }
+      case 'setMarriageDates':
+        _keys(json, const [
+          'type',
+          'personId',
+          'partnerId',
+          'itemId',
+          'startDate',
+          'endDate',
+          'endMode',
+        ]);
+        _validateMarriagePair(json);
+        _validateMarriageDates(json);
+      case 'setMarriageSurname':
+        _keys(json, const [
+          'type',
+          'personId',
+          'partnerId',
+          'itemId',
+          'changeSurname',
+          'surname',
+        ]);
+        _validateMarriagePair(json);
+        _validateMarriageSurnameChoice(json);
+      case 'removeMarriage':
+        _keys(json, const ['type', 'personId', 'partnerId', 'itemId']);
+        _validateMarriagePair(json);
+      case 'addSurnameChange' || 'setSurnameChange':
+        _keys(json, const [
+          'type',
+          'personId',
+          'itemId',
+          'surname',
+          'date',
+          'reason',
+        ]);
+        _historyId(json['personId']);
+        _historyId(json['itemId']);
+        _historySurname(json['surname']);
+        _validateValue('birthDate', json['date']);
+        _historyText(
+          json['reason'],
+          maxLength: maxTreeSurnameReasonLength,
+          allowLineBreaks: true,
+        );
+      case 'removeSurnameChange':
+        _keys(json, const ['type', 'personId', 'itemId']);
+        _historyId(json['personId']);
+        _historyId(json['itemId']);
       case 'createPerson':
         _keys(json, const ['type', 'personId', 'name', 'sex']);
         _text(json['name']);
@@ -633,6 +721,46 @@ class TreeDocument {
   Map<String, StampedTreeOperation> _bindingEvents = const {};
   Map<String, String> _siblingGroupIds = const {};
   List<TreeSiblingLink> _directSiblingLinks = const [];
+  _FamilyHistoryProjection _family = _FamilyHistoryProjection.empty();
+
+  /// Graph links: both endpoints are visible. Historical ended episodes remain.
+  List<TreeMarriage> get marriages => _family.marriages;
+
+  /// Explicit history remains editable for a survivor of a deleted partner.
+  List<TreeMarriage> marriagesOf(String personId) =>
+      _people.containsKey(personId) ? _family.marriagesOf(personId) : const [];
+
+  List<TreeSurnameChange> surnameChangesOf(String personId) =>
+      _people.containsKey(personId)
+      ? _family.changes[personId] ?? const []
+      : const [];
+
+  List<TreeFamilyHistoryEntry> historyOf(String personId) =>
+      _people.containsKey(personId)
+      ? _family.history[personId] ?? const []
+      : const [];
+
+  /// Co-parents remain partners for navigation/layout even after noMarriage.
+  List<TreePerson> partnersOf(String personId) {
+    if (!_people.containsKey(personId)) return const [];
+    final ids = <String>{};
+    for (final child in _people.values) {
+      if (child.fatherId == personId && child.motherId != null) {
+        ids.add(child.motherId!);
+      }
+      if (child.motherId == personId && child.fatherId != null) {
+        ids.add(child.fatherId!);
+      }
+    }
+    for (final marriage in marriages) {
+      final partner = marriage.otherPersonId(personId);
+      if (partner != null) ids.add(partner);
+    }
+    ids.remove(personId);
+    return List.unmodifiable(
+      _sortedPeople().where((person) => ids.contains(person.id)),
+    );
+  }
 
   Map<String, String> get siblingGroupIds => _siblingGroupIds;
   List<TreeSiblingLink> get directSiblingLinks => _directSiblingLinks;
@@ -819,6 +947,210 @@ class TreeDocument {
       'decline': normalized != null && decline,
     });
   }
+
+  /// One atomic episode, optionally with a new partner identity. Omitted choices
+  /// default to adoption for women and keeping for others. Only the initiating
+  /// person's explicit choice is edited; the other partner retains their intent.
+  TreeOperation addMarriage(
+    String personId,
+    String partnerId, {
+    String? id,
+    DateTime? startDate,
+    DateTime? endDate,
+    TreeMarriageEndMode endMode = TreeMarriageEndMode.unknown,
+    bool? changeSurname,
+    TreeSurname? adoptedSurname,
+    TreeNewMarriagePartner? newPartner,
+  }) {
+    _requirePerson(personId);
+    if (newPartner == null) {
+      _requirePerson(partnerId);
+    } else {
+      createPerson(partnerId, name: newPartner.name, sex: newPartner.sex);
+    }
+    id ??= createRoomId();
+    if (_family.usedMarriageIds.contains(id)) {
+      throw ArgumentError('Marriage IDs cannot be reused');
+    }
+    final person = _people[personId]!;
+    final partner = newPartner == null ? _people[partnerId] : null;
+    final ownDefault = person.sex == TreeSex.female;
+    final otherDefault = (partner?.sex ?? newPartner!.sex) == TreeSex.female;
+    final ownChange = changeSurname ?? ownDefault;
+    final otherSurname = partner == null
+        ? newPartner!.birthSurname
+        : _family.concreteSurnames[partnerId] ?? partner.effectiveSurname;
+    final ownSurname =
+        _family.concreteSurnames[personId] ?? person.effectiveSurname;
+    return TreeOperation.fromJson({
+      'type': 'addMarriage',
+      'personId': personId,
+      'partnerId': partnerId,
+      'itemId': id,
+      'startDate': startDate == null ? null : _dateText(startDate),
+      'endDate': endDate == null ? null : _dateText(endDate),
+      'endMode': endMode.name,
+      'surnameChoices': {
+        personId: {
+          'changeSurname': ownChange,
+          'surname': _surnameJson(
+            ownChange ? adoptedSurname ?? otherSurname : null,
+          ),
+        },
+        partnerId: {
+          'changeSurname': otherDefault,
+          'surname': _surnameJson(otherDefault ? ownSurname : null),
+        },
+      },
+      'newPartner': newPartner == null
+          ? null
+          : {
+              'name': newPartner.name.trim(),
+              'sex': newPartner.sex.name,
+              'birthDate': newPartner.birthDate == null
+                  ? null
+                  : _dateText(newPartner.birthDate!),
+              'birthSurname': _surnameJson(newPartner.birthSurname),
+            },
+    });
+  }
+
+  TreeOperation updateMarriage(
+    String personId,
+    String marriageId, {
+    required DateTime? startDate,
+    required DateTime? endDate,
+    TreeMarriageEndMode endMode = TreeMarriageEndMode.unknown,
+  }) {
+    final marriage = _requireMarriage(personId, marriageId);
+    return TreeOperation.fromJson({
+      'type': 'setMarriageDates',
+      'personId': personId,
+      'partnerId': marriage.otherPersonId(personId),
+      'itemId': marriageId,
+      'startDate': startDate == null ? null : _dateText(startDate),
+      'endDate': endDate == null ? null : _dateText(endDate),
+      'endMode': endMode.name,
+    });
+  }
+
+  TreeOperation setMarriageSurname(
+    String personId,
+    String marriageId, {
+    required bool changeSurname,
+    TreeSurname? adoptedSurname,
+  }) {
+    final marriage = _requireMarriage(personId, marriageId);
+    final partnerId = marriage.otherPersonId(personId)!;
+    return TreeOperation.fromJson({
+      'type': 'setMarriageSurname',
+      'personId': personId,
+      'partnerId': partnerId,
+      'itemId': marriageId,
+      'changeSurname': changeSurname,
+      'surname': _surnameJson(
+        changeSurname
+            ? adoptedSurname ??
+                  marriage.surnameChoices[personId]?.adoptedSurname ??
+                  _family.concreteSurnames[partnerId] ??
+                  _people[partnerId]?.effectiveSurname
+            : null,
+      ),
+    });
+  }
+
+  /// Removes exactly this episode forever and suppresses co-parent fallback for
+  /// its pair. A fresh add can restore the pair, but not the deleted episode.
+  TreeOperation removeMarriage(String personId, String marriageId) {
+    final marriage = _requireMarriage(personId, marriageId);
+    return TreeOperation.fromJson({
+      'type': 'removeMarriage',
+      'personId': personId,
+      'partnerId': marriage.otherPersonId(personId),
+      'itemId': marriageId,
+    });
+  }
+
+  TreeMarriage _requireMarriage(String personId, String marriageId) {
+    _requirePerson(personId);
+    final marriage = marriagesOf(
+      personId,
+    ).where((item) => item.id == marriageId).firstOrNull;
+    if (marriage == null) throw ArgumentError('Unknown visible marriage');
+    return marriage;
+  }
+
+  TreeOperation addSurnameChange(
+    String personId, {
+    String? id,
+    required TreeSurname surname,
+    DateTime? date,
+    String reason = '',
+  }) {
+    _requirePerson(personId);
+    id ??= createRoomId();
+    if (_family.usedSurnameIds[personId]?.contains(id) ?? false) {
+      throw ArgumentError('Surname change IDs cannot be reused');
+    }
+    return _surnameChangeOperation(
+      'addSurnameChange',
+      personId,
+      id,
+      surname,
+      date,
+      reason,
+    );
+  }
+
+  TreeOperation updateSurnameChange(
+    String personId,
+    String id, {
+    required TreeSurname surname,
+    DateTime? date,
+    String reason = '',
+  }) {
+    _requireSurnameChange(personId, id);
+    return _surnameChangeOperation(
+      'setSurnameChange',
+      personId,
+      id,
+      surname,
+      date,
+      reason,
+    );
+  }
+
+  TreeOperation removeSurnameChange(String personId, String id) {
+    _requireSurnameChange(personId, id);
+    return TreeOperation.fromJson({
+      'type': 'removeSurnameChange',
+      'personId': personId,
+      'itemId': id,
+    });
+  }
+
+  void _requireSurnameChange(String personId, String id) {
+    _requirePerson(personId);
+    if (!(_family.genericChanges[personId]?.containsKey(id) ?? false)) {
+      throw ArgumentError('Unknown visible independent surname change');
+    }
+  }
+
+  TreeOperation _surnameChangeOperation(
+    String type,
+    String personId,
+    String id,
+    TreeSurname surname,
+    DateTime? date,
+    String reason,
+  ) => TreeOperation.fromJson({
+    'type': type,
+    'personId': personId,
+    'itemId': id,
+    'surname': _surnameJson(surname),
+    'date': date == null ? null : _dateText(date),
+    'reason': reason.trim(),
+  });
 
   TreeTextSnapshot textSnapshot(
     String personId,
@@ -1138,18 +1470,33 @@ class TreeDocument {
     final creations = <String, StampedTreeOperation>{};
     for (final event in events) {
       final op = event.operation;
-      if ((op.type != 'createPerson' && op.type != 'createSibling') ||
-          states.containsKey(op.personId)) {
+      final newPartner = op.type == 'addMarriage'
+          ? op._json['newPartner'] as Map?
+          : null;
+      if (op.type != 'createPerson' &&
+          op.type != 'createSibling' &&
+          newPartner == null) {
         continue;
       }
-      final state = _PersonState(op.personId);
-      state.name.seed(op._json['name']! as String, event, 'name');
-      state.values['sex'] = _Register(op._json['sex'], event);
-      if (op.type == 'createSibling') {
-        state.values['birthDate'] = _Register(op._json['birthDate'], event);
+      final id = newPartner == null
+          ? op.personId
+          : op._json['partnerId']! as String;
+      if (states.containsKey(id)) continue;
+      final json = newPartner ?? op._json;
+      final state = _PersonState(id);
+      state.name.seed(json['name']! as String, event, 'name');
+      state.values['sex'] = _Register(json['sex'], event);
+      if (op.type == 'createSibling' || newPartner != null) {
+        state.values['birthDate'] = _Register(json['birthDate'], event);
       }
-      states[op.personId] = state;
-      creations[op.personId] = event;
+      if (newPartner?['birthSurname'] != null) {
+        state.values['individualSurname'] = _Register(
+          _historySurnameValue(newPartner!['birthSurname']),
+          event,
+        );
+      }
+      states[id] = state;
+      creations[id] = event;
     }
     for (final event in events) {
       final op = event.operation;
@@ -1218,10 +1565,11 @@ class TreeDocument {
             state.values[field] = _Register(json['value'], event);
           }
         case 'setSurname':
-          state.values['${json['scope']}Surname'] = _Register(
-            _surnameValue(json),
-            event,
-          );
+          final field = '${json['scope']}Surname';
+          final previous = state.values[field];
+          if (previous == null || _compareStamp(previous.stamp, event) < 0) {
+            state.values[field] = _Register(_surnameValue(json), event);
+          }
         case 'editText':
           final text = switch (json['field']) {
             'name' => state.name,
@@ -1312,6 +1660,20 @@ class TreeDocument {
       for (final id in ids)
         id: states[id]!.name.snapshot(id, TreeTextField.name, null).text,
     };
+    final family = _FamilyHistoryProjection(events, {
+      for (final id in ids)
+        id: TreePerson(
+          id: id,
+          name: names[id]!,
+          sex: TreeSex.values.byName(
+            states[id]!.values['sex']?.value as String? ?? 'unknown',
+          ),
+          birthDate: _dateValue(states[id]!.values['birthDate']?.value),
+          fatherId: accepted[id]?['fatherId'],
+          motherId: accepted[id]?['motherId'],
+          effectiveSurname: effectiveSurnames[id],
+        ),
+    });
     for (final id in ids) {
       if (deletedPersonIds.contains(id)) continue;
       final state = states[id]!;
@@ -1364,6 +1726,7 @@ class TreeDocument {
             state.values['individualSurname']?.value as TreeSurname?,
         maidenSurname: state.values['maidenSurname']?.value as TreeSurname?,
         effectiveSurname: effectiveSurnames[id],
+        currentSurname: family.currentSurnames[id],
         surnameInheritedFrom: inheritedFrom[id],
         facts: facts,
         photos: photos,
@@ -1373,6 +1736,7 @@ class TreeDocument {
       );
     }
     _states = states;
+    _family = family;
     _deletedPersonIds = deletedPersonIds;
     _people = Map.unmodifiable(people);
     _patronymicOverrides = Map.unmodifiable(patronymicOverrides);
@@ -1389,6 +1753,390 @@ class TreeDocument {
     _bindings = Map.unmodifiable({
       for (final entry in bindingEvents.entries)
         entry.key: entry.value.operation.personId,
+    });
+  }
+}
+
+/// Family event replay is independent of root/person lookup. This is deliberately
+/// separate from ancestry: marriage endpoints never participate in its DAG.
+class _MarriageHistoryState {
+  _MarriageHistoryState(this.id, this.personId, this.partnerId);
+  final String id;
+  final String personId;
+  final String partnerId;
+  Map<String, Object?>? period;
+  final choices = <String, TreeMarriageSurnameChoice>{};
+
+  bool matches(String a, String b) =>
+      treeMarriagePairKey(a, b) == treeMarriagePairKey(personId, partnerId);
+}
+
+class _FamilyHistoryProjection {
+  _FamilyHistoryProjection.empty();
+
+  List<TreeMarriage> marriages = const [];
+  Map<String, TreeMarriage> episodes = const {};
+  Map<String, List<TreeSurnameChange>> changes = const {};
+  Map<String, Map<String, TreeSurnameChange>> genericChanges = const {};
+  Map<String, List<TreeFamilyHistoryEntry>> history = const {};
+  Map<String, TreeSurname?> currentSurnames = const {};
+  Map<String, TreeSurname?> concreteSurnames = const {};
+  Set<String> usedMarriageIds = const {};
+  Map<String, Set<String>> usedSurnameIds = const {};
+
+  List<TreeMarriage> marriagesOf(String id) => List.unmodifiable(
+    episodes.values.where((episode) => episode.otherPersonId(id) != null),
+  );
+
+  _FamilyHistoryProjection(
+    List<StampedTreeOperation> events,
+    Map<String, TreePerson> people,
+  ) {
+    final states = <String, _MarriageHistoryState>{};
+    final used = <String>{};
+    final surnameUsed = <String, Set<String>>{};
+    final genericRegisters = <(String, String), _Register>{};
+    final genericRemoved = <(String, String)>{};
+    bool marriageOperation(String type) => const {
+      'addMarriage',
+      'setMarriageDates',
+      'setMarriageSurname',
+      'removeMarriage',
+    }.contains(type);
+    bool surnameOperation(String type) => const {
+      'addSurnameChange',
+      'setSurnameChange',
+      'removeSurnameChange',
+    }.contains(type);
+    // Identity gathering permits late adds, edits and tombstones in any order.
+    for (final event in events) {
+      final op = event.operation;
+      final json = op._json;
+      if (marriageOperation(op.type)) {
+        used.add(op.itemId!);
+        if (op.type == 'addMarriage' ||
+            (op.type != 'removeMarriage' &&
+                op.itemId!.startsWith('implied:'))) {
+          states.putIfAbsent(
+            op.itemId!,
+            () => _MarriageHistoryState(
+              op.itemId!,
+              op.personId,
+              json['partnerId']! as String,
+            ),
+          );
+        }
+      }
+      if (surnameOperation(op.type)) {
+        (surnameUsed[op.personId] ??= {}).add(op.itemId!);
+        final key = (op.personId, op.itemId!);
+        if (op.type == 'addSurnameChange') {
+          genericRegisters.putIfAbsent(key, () => _Register(json, event));
+        }
+        if (op.type == 'removeSurnameChange') genericRemoved.add(key);
+      }
+    }
+    final removed = <String>{};
+    for (final event in events) {
+      final op = event.operation;
+      if (op.type != 'removeMarriage') continue;
+      final state = states[op.itemId];
+      if (state == null ||
+          state.matches(op.personId, op._json['partnerId']! as String)) {
+        removed.add(op.itemId!);
+      }
+    }
+    final suppressed = <String, bool>{};
+    for (final event in events) {
+      final op = event.operation;
+      final json = op._json;
+      if (surnameOperation(op.type)) {
+        final key = (op.personId, op.itemId!);
+        final previous = genericRegisters[key];
+        if (op.type == 'setSurnameChange' &&
+            previous != null &&
+            _compareStamp(previous.stamp, event) < 0) {
+          genericRegisters[key] = _Register(json, event);
+        }
+      }
+      if (!marriageOperation(op.type)) continue;
+      final partner = json['partnerId']! as String;
+      final state = states[op.itemId];
+      if (state != null && !state.matches(op.personId, partner)) continue;
+      final pair = treeMarriagePairKey(op.personId, partner);
+      if (op.type == 'removeMarriage') {
+        suppressed[pair] = true;
+        continue;
+      }
+      if (state == null || removed.contains(state.id)) continue;
+      if (op.type == 'addMarriage') {
+        // A tombstoned or wrong-target old add cannot clear noMarriage.
+        suppressed[pair] = false;
+        final choices = json['surnameChoices']! as Map;
+        for (final id in [state.personId, state.partnerId]) {
+          final choice = choices[id]! as Map;
+          if (id != op.personId && state.choices.containsKey(id)) continue;
+          state.choices[id] = TreeMarriageSurnameChoice(
+            changeSurname: choice['changeSurname']! as bool,
+            adoptedSurname: _historySurnameValue(choice['surname']),
+            isExplicit: id == op.personId,
+          );
+        }
+      }
+      if (op.type == 'addMarriage' || op.type == 'setMarriageDates') {
+        state.period = json;
+      }
+      if (op.type == 'setMarriageSurname') {
+        state.choices[op.personId] = TreeMarriageSurnameChoice(
+          changeSurname: json['changeSurname']! as bool,
+          adoptedSurname: _historySurnameValue(json['surname']),
+          isExplicit: true,
+        );
+      }
+    }
+    final generic = <String, Map<String, TreeSurnameChange>>{};
+    for (final entry in genericRegisters.entries) {
+      if (genericRemoved.contains(entry.key)) continue;
+      final (personId, id) = entry.key;
+      final json = entry.value.value! as Map;
+      (generic[personId] ??= {})[id] = TreeSurnameChange(
+        id: id,
+        personId: personId,
+        surname: _historySurnameValue(json['surname'])!,
+        date: _dateValue(json['date']),
+        reason: json['reason']! as String,
+      );
+    }
+    final commonDates = <String, DateTime?>{};
+    final commonPairs = <String, (String, String)>{};
+    for (final child in people.values) {
+      final a = child.fatherId;
+      final b = child.motherId;
+      if (a == null ||
+          b == null ||
+          a == b ||
+          !people.containsKey(a) ||
+          !people.containsKey(b)) {
+        continue;
+      }
+      final pair = treeMarriagePairKey(a, b);
+      commonPairs[pair] = (a, b);
+      final previous = commonDates[pair];
+      if (child.birthDate != null &&
+          (previous == null || child.birthDate!.isBefore(previous))) {
+        commonDates[pair] = child.birthDate;
+      }
+    }
+    // Resolve concrete values once, excluding every derived/default transfer.
+    // Default implied surnames can then use previous explicit married surnames
+    // without ever recursively resolving the other spouse's current surname.
+    final concrete = <String, TreeSurname?>{
+      for (final person in people.values) person.id: person.effectiveSurname,
+    };
+    final concreteChanges = <String, List<TreeSurnameChange>>{
+      for (final entry in generic.entries)
+        entry.key: entry.value.values.toList(),
+    };
+    for (final state in states.values) {
+      if (removed.contains(state.id)) continue;
+      for (final entry in state.choices.entries) {
+        final choice = entry.value;
+        // Persisted add snapshots are concrete even when they were defaults.
+        if (!choice.changeSurname || choice.adoptedSurname == null) continue;
+        (concreteChanges[entry.key] ??= []).add(
+          TreeSurnameChange(
+            id: state.id,
+            personId: entry.key,
+            surname: choice.adoptedSurname!,
+            date: _dateValue(state.period?['startDate']),
+            orderingDate:
+                commonDates[treeMarriagePairKey(
+                  state.personId,
+                  state.partnerId,
+                )],
+            marriageId: state.id,
+          ),
+        );
+      }
+    }
+    for (final entry in concreteChanges.entries) {
+      entry.value.sort(compareTreeSurnameChanges);
+      if (entry.value.isNotEmpty) {
+        concrete[entry.key] = entry.value.last.surname;
+      }
+    }
+    TreeMarriageSurnameChoice defaultChoice(String id, String partner) =>
+        TreeMarriageSurnameChoice(
+          changeSurname: people[id]?.sex == TreeSex.female,
+          adoptedSurname: people[id]?.sex == TreeSex.female
+              ? concrete[partner]
+              : null,
+        );
+    final all = <String, TreeMarriage>{};
+    final explicitPairs = <String>{};
+    for (final state in states.values) {
+      if (removed.contains(state.id)) continue;
+      final pair = treeMarriagePairKey(state.personId, state.partnerId);
+      explicitPairs.add(pair);
+      all[state.id] = TreeMarriage(
+        id: state.id,
+        personId: state.personId,
+        partnerId: state.partnerId,
+        startDate: _dateValue(state.period?['startDate']),
+        endDate: _dateValue(state.period?['endDate']),
+        endMode: TreeMarriageEndMode.values.byName(
+          state.period?['endMode'] as String? ?? 'unknown',
+        ),
+        orderingDate: commonDates[pair],
+        surnameChoices: {
+          state.personId:
+              state.choices[state.personId] ??
+              defaultChoice(state.personId, state.partnerId),
+          state.partnerId:
+              state.choices[state.partnerId] ??
+              defaultChoice(state.partnerId, state.personId),
+        },
+      );
+    }
+    for (final entry in commonPairs.entries) {
+      if (explicitPairs.contains(entry.key) || suppressed[entry.key] == true) {
+        continue;
+      }
+      final (a, b) = entry.value;
+      final id = _impliedMarriageId(a, b);
+      if (removed.contains(id)) continue;
+      all[id] = TreeMarriage(
+        id: id,
+        personId: a,
+        partnerId: b,
+        isImplied: true,
+        orderingDate: commonDates[entry.key],
+        surnameChoices: {a: defaultChoice(a, b), b: defaultChoice(b, a)},
+      );
+    }
+    final surnameChanges = <String, List<TreeSurnameChange>>{};
+    final histories = <String, List<TreeFamilyHistoryEntry>>{};
+    final current = <String, TreeSurname?>{};
+    for (final person in people.values) {
+      final candidates = <TreeSurnameChange>[...?generic[person.id]?.values];
+      final personMarriages = all.values.where(
+        (m) => m.otherPersonId(person.id) != null,
+      );
+      for (final marriage in personMarriages) {
+        final choice = marriage.surnameChoices[person.id]!;
+        if (!choice.changeSurname || choice.adoptedSurname == null) continue;
+        candidates.add(
+          TreeSurnameChange(
+            id: marriage.id,
+            personId: person.id,
+            surname: choice.adoptedSurname!,
+            date: marriage.startDate,
+            orderingDate: marriage.orderingDate,
+            marriageId: marriage.id,
+            partnerId: marriage.otherPersonId(person.id),
+            isImplied: marriage.isImplied,
+          ),
+        );
+      }
+      candidates.sort(compareTreeSurnameChanges);
+      var surname = person.effectiveSurname;
+      final projected = <TreeSurnameChange>[];
+      for (final candidate in candidates) {
+        final changed =
+            (surname?.formForSex(person.sex) ?? '') !=
+            candidate.surname.formForSex(person.sex);
+        // Generic reason records remain addressable, even for no-op surnames.
+        if (changed || candidate.marriageId == null) {
+          projected.add(
+            TreeSurnameChange(
+              id: candidate.id,
+              personId: candidate.personId,
+              surname: candidate.surname,
+              date: candidate.date,
+              reason: candidate.reason,
+              marriageId: candidate.marriageId,
+              partnerId: candidate.partnerId,
+              isImplied: candidate.isImplied,
+              orderingDate: candidate.orderingDate,
+              changesSurname: changed,
+            ),
+          );
+        }
+        surname = candidate.surname;
+      }
+      current[person.id] = surname;
+      final marriageChanges = {
+        for (final change in projected)
+          if (change.marriageId != null) change.marriageId!: change,
+      };
+      final rows = <TreeFamilyHistoryEntry>[
+        for (final marriage in personMarriages)
+          TreeFamilyHistoryEntry(
+            id: marriage.id,
+            marriage: marriage,
+            surnameChange: marriageChanges[marriage.id],
+          ),
+        for (final change in projected)
+          if (change.marriageId == null)
+            TreeFamilyHistoryEntry(id: change.id, surnameChange: change),
+      ];
+      rows.sort((a, b) {
+        final aUndatedNoChange =
+            a.marriage != null &&
+            !a.marriage!.hasExplicitDates &&
+            a.surnameChange == null &&
+            a.orderingDate == null;
+        final bUndatedNoChange =
+            b.marriage != null &&
+            !b.marriage!.hasExplicitDates &&
+            b.surnameChange == null &&
+            b.orderingDate == null;
+        if (aUndatedNoChange != bUndatedNoChange) {
+          return aUndatedNoChange ? -1 : 1;
+        }
+        if (aUndatedNoChange) {
+          final aPartner = people[a.marriage!.otherPersonId(person.id)];
+          final bPartner = people[b.marriage!.otherPersonId(person.id)];
+          if (aPartner != null && bPartner != null) {
+            final order = compareTreePeopleByBirth(aPartner, bPartner);
+            if (order != 0) return order;
+          }
+        }
+        final aDate = a.orderingDate;
+        final bDate = b.orderingDate;
+        if (aDate == null && bDate != null) return -1;
+        if (aDate != null && bDate == null) return 1;
+        if (aDate != null && bDate != null) {
+          final order = aDate.compareTo(bDate);
+          if (order != 0) return order;
+        }
+        final surnames = (a.surnameChange?.surname.text ?? '').compareTo(
+          b.surnameChange?.surname.text ?? '',
+        );
+        return surnames != 0 ? surnames : a.id.compareTo(b.id);
+      });
+      surnameChanges[person.id] = List.unmodifiable(projected);
+      histories[person.id] = List.unmodifiable(rows);
+    }
+    episodes = Map.unmodifiable(all);
+    marriages = List.unmodifiable(
+      all.values.where(
+        (m) =>
+            people.containsKey(m.personId) && people.containsKey(m.partnerId),
+      ),
+    );
+    changes = Map.unmodifiable(surnameChanges);
+    history = Map.unmodifiable(histories);
+    currentSurnames = Map.unmodifiable(current);
+    concreteSurnames = Map.unmodifiable(concrete);
+    genericChanges = Map<String, Map<String, TreeSurnameChange>>.unmodifiable({
+      for (final entry in generic.entries)
+        entry.key: Map<String, TreeSurnameChange>.unmodifiable(entry.value),
+    });
+    usedMarriageIds = Set.unmodifiable(used);
+    usedSurnameIds = Map.unmodifiable({
+      for (final entry in surnameUsed.entries)
+        entry.key: Set.unmodifiable(entry.value),
     });
   }
 }
@@ -2041,6 +2789,102 @@ String _id(Object? value, {int maxLength = 256}) {
 
 void _nullableId(Object? value) {
   if (value != null) _id(value);
+}
+
+String _impliedMarriageId(String a, String b) =>
+    'implied:${treeMarriagePairKey(a, b)}';
+
+void _historyId(Object? value, {int maxLength = 256}) {
+  final id = _id(value, maxLength: maxLength);
+  if (RegExp(r'[\x7f-\x9f]').hasMatch(id)) {
+    throw const FormatException('Invalid history ID');
+  }
+}
+
+void _historyText(
+  Object? value, {
+  required int maxLength,
+  bool allowLineBreaks = false,
+}) {
+  final controls = allowLineBreaks
+      ? RegExp(r'[\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+      : RegExp(r'[\x00-\x1f\x7f-\x9f]');
+  if (value is! String ||
+      value != value.trim() ||
+      value.runes.length > maxLength ||
+      controls.hasMatch(value) ||
+      !_wellFormedUnicode(value)) {
+    throw const FormatException('Invalid or oversized history text');
+  }
+}
+
+void _historySurname(Object? value, {bool nullable = false}) {
+  if (value == null && nullable) return;
+  final surname = _object(value);
+  _keys(surname, const ['text', 'decline']);
+  _historyText(surname['text'], maxLength: maxTreeSurnameLength);
+  if (surname['text'] == '' || surname['decline'] is! bool) {
+    throw const FormatException('Expected a canonical surname');
+  }
+}
+
+Map<String, Object?>? _surnameJson(TreeSurname? surname) =>
+    surname == null ? null : {'text': surname.text, 'decline': surname.decline};
+
+TreeSurname? _historySurnameValue(Object? value) {
+  if (value == null) return null;
+  final json = value as Map;
+  return TreeSurname(
+    text: json['text'] as String,
+    decline: json['decline'] as bool,
+  );
+}
+
+void _validateMarriagePair(Map json) {
+  _historyId(json['personId']);
+  _historyId(json['partnerId']);
+  if (json['personId'] == json['partnerId']) {
+    throw const FormatException('A person cannot marry themselves');
+  }
+  _historyId(json['itemId'], maxLength: 550);
+  final id = json['itemId']! as String;
+  if (id.startsWith('implied:')) {
+    if (id !=
+        _impliedMarriageId(
+          json['personId'] as String,
+          json['partnerId'] as String,
+        )) {
+      throw const FormatException('Wrong implied marriage identity');
+    }
+  } else if (id.length > 256) {
+    throw const FormatException('Oversized marriage identity');
+  }
+}
+
+void _validateMarriageDates(Map json) {
+  _validateValue('birthDate', json['startDate']);
+  _validateValue('birthDate', json['endDate']);
+  if (!TreeMarriageEndMode.values.any((mode) => mode.name == json['endMode'])) {
+    throw const FormatException('Invalid marriage end mode');
+  }
+  if ((json['endMode'] == 'date') != (json['endDate'] != null)) {
+    throw const FormatException('Only dated marriage ends have an end date');
+  }
+  final start = _dateValue(json['startDate']);
+  final end = _dateValue(json['endDate']);
+  if (start != null && end != null && start.isAfter(end)) {
+    throw const FormatException('Marriage start is after its end');
+  }
+}
+
+void _validateMarriageSurnameChoice(Map json) {
+  if (json['changeSurname'] is! bool) {
+    throw const FormatException('Expected a surname choice');
+  }
+  _historySurname(json['surname'], nullable: true);
+  if (json['changeSurname'] == false && json['surname'] != null) {
+    throw const FormatException('Keeping a surname cannot adopt another one');
+  }
 }
 
 TreeSurname? _surnameValue(Map<String, Object?> json) => json['text'] == null

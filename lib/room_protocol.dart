@@ -156,6 +156,7 @@ class RoomMessage {
     this.explicitSiblings = false,
     this.patronymics = false,
     this.lifeStatus = false,
+    this.marriageHistory = false,
     this.authorHistory = false,
     this.participantIdentity = false,
     this.diskSync = false,
@@ -213,6 +214,9 @@ class RoomMessage {
   /// Explicit living/unknown death mark. Older readers reject the `alive` field.
   final bool lifeStatus;
 
+  /// Marriage episodes, surname-history events and their inferred semantics.
+  final bool marriageHistory;
+
   /// Complete, contiguous same-author history proofs. Legacy readers discard
   /// these fields and must never receive proof-bearing records.
   final bool authorHistory;
@@ -254,6 +258,7 @@ class RoomMessage {
     if (explicitSiblings) 'explicitSiblings': true,
     if (patronymics) 'patronymics': true,
     if (lifeStatus) 'lifeStatus': true,
+    if (marriageHistory) 'marriageHistory': true,
     if (authorHistory) 'authorHistory': true,
     if (participantIdentity) 'participantIdentity': true,
     if (diskSync) 'diskSync': true,
@@ -381,6 +386,13 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
       (lifeStatus && !handshake)) {
     throw const FormatException('Неверная поддержка отметки о жизни');
   }
+  final marriageHistory = value['marriageHistory'] ?? false;
+  if (marriageHistory is! bool ||
+      (value.containsKey('marriageHistory') &&
+          value['marriageHistory'] is! bool) ||
+      (marriageHistory && !handshake)) {
+    throw const FormatException('Неверная поддержка истории браков и фамилий');
+  }
   final authorHistory = value['authorHistory'] ?? false;
   if (authorHistory is! bool ||
       (value.containsKey('authorHistory') && value['authorHistory'] is! bool) ||
@@ -493,6 +505,7 @@ RoomMessage decodeRoomMessage(Object? value, {required String roomId}) {
     explicitSiblings: explicitSiblings,
     patronymics: patronymics,
     lifeStatus: lifeStatus,
+    marriageHistory: marriageHistory,
     authorHistory: authorHistory,
     participantIdentity: participantIdentity,
     diskSync: diskSync,

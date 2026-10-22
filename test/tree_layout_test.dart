@@ -32,6 +32,330 @@ void main() {
       );
     });
 
+    test(
+      'childless marriages align detached partners without adding ancestry or links',
+      () {
+        for (final sex in TreeSex.values) {
+          _Family make(bool reverse) {
+            final family = _Family();
+            final ids = ['grandparent', 'parent', 'selected', 'spouse'];
+            for (final id in reverse ? ids.reversed : ids) {
+              family.add(id);
+            }
+            return family
+              ..sex('selected', sex)
+              ..sex('spouse', sex)
+              ..parents('parent', father: 'grandparent')
+              ..parents('selected', mother: 'parent');
+          }
+
+          final family = make(false);
+          final before = family.layout('selected');
+          expect(before.positions['selected']!.level, 2);
+          expect(before.positions['spouse']!.level, 0);
+          family._apply(
+            family.document.addMarriage('selected', 'spouse', id: 'marriage'),
+          );
+          final reverse = make(true);
+          reverse._apply(
+            reverse.document.addMarriage('spouse', 'selected', id: 'marriage'),
+          );
+          final baseline = family.layout('selected');
+          final people = family.document.people;
+          final events = family.events.toList();
+          for (final mode in TreeTrunkMode.values) {
+            for (final selected in [
+              'selected',
+              'spouse',
+              'parent',
+              'selected',
+            ]) {
+              final layout = family.layout(selected, mode, before);
+              expect(layout.positions.keys, contains('spouse'));
+              expect(layout.positions['spouse']!.level, 2);
+              _expectConsecutive(layout, ['selected', 'spouse']);
+              expect(
+                layout.links.map((link) => (link.parentId, link.childId)),
+                before.links.map((link) => (link.parentId, link.childId)),
+              );
+              expect(layout.trunkIds, family.layout(selected, mode).trunkIds);
+              if (selected == 'selected') {
+                expect(layout.trunkIds, {
+                  'selected',
+                  if (mode != TreeTrunkMode.father) ...[
+                    'parent',
+                    'grandparent',
+                  ],
+                });
+                expect(layout.positions['spouse']!.branch, TreeBranch.neutral);
+                expect(
+                  layout.positions['spouse']!.emphasis,
+                  TreeEmphasis.distant,
+                );
+              }
+              expect(
+                _snapshot(layout),
+                _snapshot(reverse.layout(selected, mode)),
+              );
+              expect(
+                _snapshot(layout),
+                _snapshot(
+                  TreeLayout.build(
+                    family.reload(),
+                    selectedId: selected,
+                    mode: mode,
+                  ),
+                ),
+              );
+              _expectSameRanks(baseline, layout);
+              _expectDescendingLinks(layout);
+              _expectNoOverlap(layout);
+            }
+          }
+          expect(identical(family.document.people, people), isTrue);
+          expect(family.events, events);
+          // Separate history episodes and endpoint direction cannot weight a pair.
+          family._apply(
+            family.document.addMarriage('spouse', 'selected', id: 'second'),
+          );
+          expect(_snapshot(family.layout('selected')), _snapshot(baseline));
+        }
+      },
+    );
+
+    test(
+      'childless marriage proximity has no maternal or sex-based direction',
+      () {
+        final family = _Family()
+          ..add('a-spouse', name: 'Z last')
+          ..add('z-selected', name: 'A first')
+          ..sex('a-spouse', TreeSex.female)
+          ..sex('z-selected', TreeSex.female);
+        final before = family.layout('z-selected');
+        family._apply(
+          family.document.addMarriage('a-spouse', 'z-selected', id: 'marriage'),
+        );
+        for (final mode in TreeTrunkMode.values) {
+          final layout = family.layout('z-selected', mode);
+          _expectBefore(layout, 'z-selected', 'a-spouse');
+          expect(layout.links, isEmpty);
+          expect(layout.trunkIds, {'z-selected'});
+          expect(
+            layout.positions['z-selected']!.crossCenter -
+                layout.positions['a-spouse']!.crossCenter,
+            before.positions['z-selected']!.crossCenter -
+                before.positions['a-spouse']!.crossCenter,
+          );
+          _expectNoOverlap(layout);
+        }
+      },
+    );
+
+    test('explicit spouse chains never collapse the ancestry quotient', () {
+      _Family make(bool reverse) {
+        final family = _Family();
+        final ids = ['a', 'b', 'c', 'd'];
+        for (final id in reverse ? ids.reversed : ids) {
+          family.add(id);
+        }
+        family
+          ..parents('b', father: 'a')
+          ..parents('d', mother: 'c');
+        final pairs = [('a', 'd'), ('b', 'c'), ('a', 'b')];
+        for (final (a, b) in reverse ? pairs.reversed : pairs) {
+          family._apply(
+            family.document.addMarriage(a, b, id: 'marriage-$a-$b'),
+          );
+        }
+        return family;
+      }
+
+      final family = make(false);
+      final initial = family.layout('a');
+      expect(initial.positions['c']!.level, 0);
+      expect(initial.positions['a']!.level, 1);
+      expect(initial.positions['d']!.level, 1);
+      expect(initial.positions['b']!.level, 2);
+      for (final mode in TreeTrunkMode.values) {
+        for (final selected in ['a', 'b', 'c', 'd']) {
+          final layout = family.layout(selected, mode, initial);
+          expect(
+            _snapshot(layout),
+            _snapshot(make(true).layout(selected, mode)),
+          );
+          _expectSameRanks(initial, layout);
+          expect(layout.links.map((link) => (link.parentId, link.childId)), [
+            ('a', 'b'),
+            ('c', 'd'),
+          ]);
+          _expectDescendingLinks(layout);
+          _expectNoOverlap(layout);
+        }
+      }
+    });
+
+    test(
+      'own childless spouses outrank sibling spouses without moving sibling members',
+      () {
+        for (final reverse in [false, true]) {
+          final family = _Family();
+          final ids = ['f', 'm', 'a', 'b', 'pf', 'pm', 'p', 'q', 'r'];
+          for (final id in reverse ? ids.reversed : ids) {
+            family.add(id);
+          }
+          family
+            ..parents('a', father: 'f', mother: 'm')
+            ..parents('b', father: 'f', mother: 'm')
+            ..parents('p', father: 'pf', mother: 'pm')
+            ..parents('q', father: 'pf', mother: 'pm')
+            .._apply(family.document.addMarriage('a', 'p', id: 'own'))
+            .._apply(family.document.addMarriage('b', 'r', id: 'sibling'));
+          final baseline = family.layout('a');
+          final people = family.document.people;
+          final events = family.events.toList();
+          for (final mode in TreeTrunkMode.values) {
+            for (final selected in ['a', 'b', 'p', 'r', 'a']) {
+              final layout = family.layout(selected, mode, baseline);
+              final row = layout.levels.singleWhere(
+                (level) => level.index == layout.positions[selected]!.level,
+              );
+              final blockIds = row.blocks.map((block) => block.id).toList();
+              final (first, second) = selected == 'b' || selected == 'r'
+                  ? ('b', 'r')
+                  : ('a', 'p');
+              expect(
+                (blockIds.indexOf(layout.positions[first]!.blockId) -
+                        blockIds.indexOf(layout.positions[second]!.blockId))
+                    .abs(),
+                1,
+              );
+              expect(_blockFor(layout, 'a').people.map((person) => person.id), [
+                'a',
+                'b',
+              ]);
+              expect(_blockFor(layout, 'p').people.map((person) => person.id), [
+                'p',
+                'q',
+              ]);
+              if (selected != 'r') {
+                expect(layout.positions['r']!.emphasis, TreeEmphasis.distant);
+              }
+              expect(
+                _snapshot(layout),
+                _snapshot(family.layout(selected, mode)),
+              );
+              _expectSameRanks(baseline, layout);
+              _expectDescendingLinks(layout);
+              _expectNoOverlap(layout);
+            }
+          }
+          expect(identical(family.document.people, people), isTrue);
+          expect(family.events, events);
+        }
+      },
+    );
+
+    test(
+      'childless marriages never expose sibling-member seams or replace ancestral parent seams',
+      () {
+        final family = _ancestorCorridorFamily(false);
+        final baseline = family.layout('nikita');
+        family
+          .._apply(
+            family.document.addMarriage('gennady', 'valentina', id: 'grand'),
+          )
+          .._apply(
+            family.document.addMarriage('veronika', 'natalia', id: 'sisters'),
+          )
+          .._apply(
+            family.document.addMarriage('lydia', 'oleg-mother', id: 'context'),
+          );
+        for (final mode in TreeTrunkMode.values) {
+          for (final selected in ['nikita', 'veronika', 'natalia', 'nikita']) {
+            final layout = family.layout(selected, mode, baseline);
+            final withoutMarriages = _ancestorCorridorFamily(
+              false,
+            ).layout(selected, mode);
+            expect(
+              _blockFor(layout, 'veronika').people.map((person) => person.id),
+              _blockFor(
+                withoutMarriages,
+                'veronika',
+              ).people.map((person) => person.id),
+            );
+            if (mode == TreeTrunkMode.both && selected == 'nikita') {
+              _expectParentCardsAdjacent(layout, 'lydia', 'gennady');
+              _expectParentCardsAdjacent(layout, 'veronika', 'roman');
+              _expectAncestorCorridors(layout);
+            }
+            _expectSameRanks(baseline, layout);
+            expect(
+              layout.links.map((link) => (link.parentId, link.childId)),
+              baseline.links.map((link) => (link.parentId, link.childId)),
+            );
+            _expectDescendingLinks(layout);
+            _expectNoOverlap(layout);
+          }
+        }
+      },
+    );
+
+    test(
+      'removing marriages detaches only partners without shared children',
+      () {
+        final family = _Family()
+          ..add('parent')
+          ..add('selected')
+          ..add('spouse')
+          ..parents('selected', father: 'parent');
+        final detached = family.layout('selected');
+        family._apply(
+          family.document.addMarriage('selected', 'spouse', id: 'marriage'),
+        );
+        expect(family.layout('selected').positions['spouse']!.level, 1);
+        family._apply(family.document.removeMarriage('selected', 'marriage'));
+        for (final mode in TreeTrunkMode.values) {
+          expect(
+            _snapshot(family.layout('selected', mode)),
+            _snapshot(
+              TreeLayout.build(
+                TreeDocument()
+                  ..merge(family.events.take(family.events.length - 2)),
+                selectedId: 'selected',
+                mode: mode,
+              ),
+            ),
+          );
+        }
+        expect(_snapshot(family.layout('selected')), _snapshot(detached));
+        family
+          ..add('child')
+          ..parents('child', mother: 'selected', father: 'spouse')
+          .._apply(
+            family.document.addMarriage('selected', 'spouse', id: 'renewed'),
+          );
+        final coParents = family.layout('selected');
+        family._apply(family.document.removeMarriage('selected', 'renewed'));
+        expect(family.document.marriages, isEmpty);
+        for (final mode in TreeTrunkMode.values) {
+          final layout = family.layout('selected', mode);
+          expect(
+            layout.positions['spouse']!.level,
+            layout.positions['selected']!.level,
+          );
+          _expectConsecutive(layout, ['selected', 'spouse']);
+          _expectSameRanks(coParents, layout);
+          expect(layout.links.map((link) => (link.parentId, link.childId)), [
+            ('spouse', 'child'),
+            ('selected', 'child'),
+            ('parent', 'selected'),
+          ]);
+          _expectDescendingLinks(layout);
+          _expectNoOverlap(layout);
+        }
+      },
+    );
+
     test('groups only identical complete parents and sorts births stably', () {
       final family = _Family()
         ..add('father')
@@ -3174,43 +3498,65 @@ void main() {
       }
     });
 
-    test(
-      'parents’ partners use cousin emphasis without extending ancestry',
-      () {
-        final family = _cousinFamily(anastasiaFather: true)
-          ..add('stepmother')
-          ..add('paternal-half')
-          ..add('stepparent-parent')
-          ..add('stepparent-sibling')
-          ..parents('paternal-half', father: 'oleg', mother: 'stepmother')
-          ..parents('nekto', father: 'stepparent-parent')
-          ..parents('stepparent-sibling', father: 'stepparent-parent');
-        final people = family.document.people;
-        final events = family.events.toList();
-        for (final mode in TreeTrunkMode.values) {
-          final layout = family.layout(rootTreePersonId, mode);
-          for (final id in ['nekto', 'stepmother']) {
-            expect(layout.positions[id]!.emphasis, TreeEmphasis.cousin);
-            expect(_blockFor(layout, id).emphasis, TreeEmphasis.cousin);
-            expect(layout.trunkIds, isNot(contains(id)));
-          }
-          for (final id in ['natalia', 'oleg', 'anastasia', 'paternal-half']) {
-            expect(layout.positions[id]!.emphasis, TreeEmphasis.normal);
-          }
-          for (final id in [
-            'stepparent-parent',
-            'stepparent-sibling',
-            'roman',
-          ]) {
-            expect(layout.positions[id]!.emphasis, TreeEmphasis.distant);
-          }
-          _expectDescendingLinks(layout);
-          _expectNoOverlap(layout);
+    test('parents’ partners use cousin emphasis without extending ancestry', () {
+      final family = _cousinFamily(anastasiaFather: true)
+        ..add('stepmother')
+        ..add('paternal-half')
+        ..add('childless-stepparent')
+        ..add('stepparent-parent')
+        ..add('stepparent-sibling')
+        ..parents('paternal-half', father: 'oleg', mother: 'stepmother')
+        ..parents('nekto', father: 'stepparent-parent')
+        ..parents('stepparent-sibling', father: 'stepparent-parent');
+      family._apply(
+        family.document.addMarriage(
+          'natalia',
+          'childless-stepparent',
+          id: 'childless-marriage',
+        ),
+      );
+      final people = family.document.people;
+      final events = family.events.toList();
+      for (final mode in TreeTrunkMode.values) {
+        final layout = family.layout(rootTreePersonId, mode);
+        for (final id in ['nekto', 'stepmother', 'childless-stepparent']) {
+          expect(layout.positions[id]!.emphasis, TreeEmphasis.cousin);
+          expect(_blockFor(layout, id).emphasis, TreeEmphasis.cousin);
+          expect(layout.trunkIds, isNot(contains(id)));
         }
-        expect(identical(family.document.people, people), isTrue);
-        expect(family.events, events);
-      },
-    );
+        for (final id in ['natalia', 'oleg', 'anastasia', 'paternal-half']) {
+          expect(layout.positions[id]!.emphasis, TreeEmphasis.normal);
+        }
+        for (final id in ['stepparent-parent', 'stepparent-sibling', 'roman']) {
+          expect(layout.positions[id]!.emphasis, TreeEmphasis.distant);
+        }
+        _expectDescendingLinks(layout);
+        _expectNoOverlap(layout);
+      }
+      expect(identical(family.document.people, people), isTrue);
+      expect(family.events, events);
+      family._apply(
+        family.document.removeMarriage('natalia', 'childless-marriage'),
+      );
+      expect(
+        family
+            .layout(rootTreePersonId)
+            .positions['childless-stepparent']!
+            .emphasis,
+        TreeEmphasis.distant,
+      );
+      // Co-parent relationships remain even when the implied marriage is hidden.
+      final implied = family.document
+          .marriagesOf('natalia')
+          .singleWhere(
+            (marriage) => marriage.otherPersonId('natalia') == 'nekto',
+          );
+      family._apply(family.document.removeMarriage('natalia', implied.id));
+      expect(
+        family.layout(rootTreePersonId).positions['nekto']!.emphasis,
+        TreeEmphasis.cousin,
+      );
+    });
 
     test('parents and stepparents keep unrelated sibling blocks outside', () {
       _Family make(bool reverse) {

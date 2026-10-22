@@ -179,6 +179,7 @@ void main() {
       expect(encoded.containsKey('personalSurnames'), isFalse);
       expect(encoded.containsKey('explicitSiblings'), isFalse);
       expect(encoded.containsKey('patronymics'), isFalse);
+      expect(encoded.containsKey('marriageHistory'), isFalse);
       expect(encoded.containsKey('authorHistory'), isFalse);
       expect(encoded.containsKey('participantIdentity'), isFalse);
       expect(encoded.containsKey('diskSync'), isFalse);
@@ -590,6 +591,166 @@ void main() {
       }
     }
   });
+
+  test('marriageHistory is an independent optional handshake capability', () {
+    for (final type in RoomMessageType.values) {
+      final raw = _message(type: type).toJson();
+      expect(raw.containsKey('marriageHistory'), isFalse);
+      expect(decodeRoomMessage(raw, roomId: _roomId).marriageHistory, isFalse);
+      expect(
+        decodeRoomMessage({
+          ...raw,
+          'marriageHistory': false,
+        }, roomId: _roomId).toJson(),
+        raw,
+      );
+      if (type == RoomMessageType.hello || type == RoomMessageType.welcome) {
+        final message = RoomMessage(
+          roomId: _roomId,
+          type: type,
+          actor: 'remote',
+          history: const [],
+          marriageHistory: true,
+          online: type == RoomMessageType.welcome ? 1 : null,
+          hosting: type == RoomMessageType.welcome ? true : null,
+        );
+        final decoded = decodeRoomMessage(
+          encodeRoomMessage(message).single,
+          roomId: _roomId,
+        );
+        expect(decoded.marriageHistory, isTrue);
+        expect(decoded.familyTree, isFalse);
+        expect(decoded.familySurnames, isFalse);
+        expect(decoded.toJson(), message.toJson());
+      } else {
+        expect(
+          () => decodeRoomMessage({
+            ...raw,
+            'marriageHistory': true,
+          }, roomId: _roomId),
+          throwsFormatException,
+        );
+      }
+      for (final invalid in <Object?>[
+        null,
+        0,
+        1,
+        1.0,
+        'true',
+        'false',
+        [],
+        {},
+      ]) {
+        expect(
+          () => decodeRoomMessage({
+            ...raw,
+            'marriageHistory': invalid,
+          }, roomId: _roomId),
+          throwsFormatException,
+          reason: '$type: $invalid',
+        );
+      }
+    }
+  });
+
+  test(
+    'marriage and surname-history operations preserve canonical wire cores',
+    () {
+      final document = TreeDocument();
+      var clock = 0;
+      void merge(TreeOperation operation) => document.merge([
+        StampedTreeOperation(
+          id: 'event-${++clock}',
+          author: 'remote',
+          clock: clock,
+          createdAt: DateTime.utc(2020),
+          operation: operation,
+        ),
+      ]);
+      merge(document.createPerson('partner', name: 'Павел', sex: TreeSex.male));
+      final marriage = document.addMarriage(
+        rootTreePersonId,
+        'partner',
+        id: 'marriage',
+        startDate: DateTime.utc(2000),
+        endMode: TreeMarriageEndMode.lifelong,
+        changeSurname: true,
+        adoptedSurname: const TreeSurname(text: 'Петров', decline: true),
+      );
+      merge(marriage);
+      final surnameChange = document.addSurnameChange(
+        rootTreePersonId,
+        id: 'change',
+        surname: const TreeSurname(text: 'Ли'),
+        reason: 'Личное решение',
+        date: DateTime.utc(2010),
+      );
+      merge(surnameChange);
+      final operations = [
+        marriage,
+        document.updateMarriage(
+          rootTreePersonId,
+          'marriage',
+          startDate: null,
+          endDate: null,
+        ),
+        document.setMarriageSurname(
+          rootTreePersonId,
+          'marriage',
+          changeSurname: false,
+        ),
+        document.removeMarriage(rootTreePersonId, 'marriage'),
+        surnameChange,
+        document.updateSurnameChange(
+          rootTreePersonId,
+          'change',
+          surname: const TreeSurname(text: 'Сидоров', decline: true),
+        ),
+        document.removeSurnameChange(rootTreePersonId, 'change'),
+        document.addMarriage(
+          rootTreePersonId,
+          'new-partner',
+          id: 'new-episode',
+          newPartner: TreeNewMarriagePartner(
+            name: 'Новый',
+            sex: TreeSex.male,
+            birthDate: DateTime.utc(1980),
+            birthSurname: const TreeSurname(text: 'Иванов', decline: true),
+          ),
+        ),
+      ];
+      for (final operation in operations) {
+        expect(operation.isRoomScoped, isFalse);
+        expect(operation.personId, rootTreePersonId);
+        final edit = RoomEdit(
+          id: 'wire-${operations.indexOf(operation)}',
+          author: 'remote',
+          clock: 1,
+          createdAt: 2,
+          kind: RoomEditKind.tree,
+          text: jsonEncode(operation.toJson()),
+        );
+        final message = RoomMessage(
+          roomId: _roomId,
+          type: RoomMessageType.hello,
+          actor: 'remote',
+          history: [edit],
+          marriageHistory: true,
+        );
+        final raw = encodeRoomMessage(message).single;
+        expect(raw['v'], 1);
+        final decoded = decodeRoomMessage(raw, roomId: _roomId);
+        expect(decoded.history.single.toJson(), edit.toJson());
+        expect(roomEditDigest(decoded.history.single), roomEditDigest(edit));
+        expect(
+          TreeOperation.fromJson(
+            jsonDecode(decoded.history.single.text),
+          ).toJson(),
+          operation.toJson(),
+        );
+      }
+    },
+  );
 
   test('patronymics is an independent optional handshake capability', () {
     for (final type in RoomMessageType.values) {

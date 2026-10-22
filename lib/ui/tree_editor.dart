@@ -2414,18 +2414,9 @@ List<double> _saturationMatrix(double saturation) {
   ];
 }
 
-Set<String> _partnersOf(TreeDocument document, String id) {
-  final result = <String>{};
-  for (final child in document.people.values) {
-    if (child.fatherId == id && child.motherId != null) {
-      result.add(child.motherId!);
-    }
-    if (child.motherId == id && child.fatherId != null) {
-      result.add(child.fatherId!);
-    }
-  }
-  return result..remove(id);
-}
+Set<String> _partnersOf(TreeDocument document, String id) => {
+  for (final partner in document.partnersOf(id)) partner.id,
+};
 
 Set<String> _descendantsOf(TreeDocument document, String id) {
   final children = <String, Set<String>>{};

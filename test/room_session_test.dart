@@ -3072,7 +3072,8 @@ void main() {
           'familyTree': true,
           'familySurnames': true,
           'personalSurnames': true,
-        'patronymics': true,
+          'marriageHistory': true,
+          'patronymics': true,
           'explicitSiblings': true,
           'authorHistory': true,
           'durableSync': true,
@@ -3131,6 +3132,7 @@ void main() {
           'familyTree': true,
           'familySurnames': true,
           'personalSurnames': true,
+          'marriageHistory': true,
           'explicitSiblings': true,
           'authorHistory': true,
           'participantIdentity': true,
@@ -3151,6 +3153,74 @@ void main() {
           await settle(tester);
           expect(room.initialSyncComplete, isFalse);
           expect(room.initialSyncError, contains('отчества'));
+        }
+      },
+    );
+  }
+
+  for (final incoming in [false, true]) {
+    testRoomWidgets(
+      'production marriageHistory gate rejects old ${incoming ? 'hello' : 'welcome'} with empty local history before admission',
+      (tester) async {
+        final store = _Store();
+        final room = session(
+          member: incoming,
+          store: store,
+          requireFamilyTree: true,
+        );
+        final _FakeConnection channel;
+        if (incoming) {
+          await room.start();
+          final peer = network.peers.single;
+          peer.register();
+          await settle(tester);
+          channel = _FakeConnection('old-marriages');
+          network.connections.add(channel);
+          peer.attached.add(channel);
+          peer.emit<DataConnection>('connection', channel);
+        } else {
+          channel = await standaloneFollower(tester, room);
+        }
+        channel.openChannel();
+        await settle(tester);
+        expect(room.changes, isEmpty);
+        if (!incoming) {
+          final hello = _sentMessages(channel).single;
+          expect(hello.marriageHistory, isTrue);
+          expect(hello.history, isEmpty);
+        }
+        final packetsBefore = channel.sent.length;
+        channel.receive({
+          ..._message(incoming ? 'hello' : 'welcome', [
+            _edit('must-not-save', 'Private old history'),
+          ]),
+          'roomMetadata': true,
+          'roomRoles': true,
+          'familyTree': true,
+          'familySurnames': true,
+          'personalSurnames': true,
+          'explicitSiblings': true,
+          'patronymics': true,
+          'lifeStatus': true,
+          'authorHistory': true,
+          'participantIdentity': true,
+          'durableSync': true,
+        });
+        await settle(tester);
+        expect(channel.disposed, isTrue);
+        expect(channel.sent, hasLength(packetsBefore));
+        expect(room.joined, incoming);
+        expect(room.changes, isEmpty);
+        expect(room.initialSyncError, contains('историю браков и фамилий'));
+        expect(room.initialSyncError, contains('Обновите страницу на обоих'));
+        expect(store.appendCalls, 0);
+        expect(store.membershipCalls, 0);
+        expect(await store.loadHistory(_roomId), isEmpty);
+        if (incoming) {
+          await tester.pump(const Duration(seconds: 31));
+          await settle(tester);
+          expect(room.initialSyncComplete, isFalse);
+          expect(room.initialSyncError, contains('историю браков и фамилий'));
         }
       },
     );
@@ -3178,6 +3248,7 @@ void main() {
         'familyTree': true,
         'familySurnames': true,
         'personalSurnames': true,
+        'marriageHistory': true,
         'patronymics': true,
         'explicitSiblings': true,
         'participantIdentity': true,
@@ -3214,6 +3285,7 @@ void main() {
         'familyTree': true,
         'familySurnames': true,
         'personalSurnames': true,
+        'marriageHistory': true,
         'patronymics': true,
         'explicitSiblings': true,
         'participantIdentity': true,

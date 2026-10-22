@@ -79,19 +79,20 @@ Current clients advertise these extensions in `hello`/`welcome`; absence means u
 | `explicitSiblings` | Atomic new sibling creation, exact-claim unlink, component-wide parent set/clear, and deterministic retirement when both accepted parents become known. |
 | `patronymics` | Computed patronymics and room-wide `setPatronymicOverride` dictionary entries, including explicit resets. |
 | `lifeStatus` | Explicit living/unknown death mark, the `setValue` field `alive`. Older readers reject that field. |
+| `marriageHistory` | Explicit and implied marriage episodes, per-partner surname choices, independent surname-history events, and pair suppression. |
 | `authorHistory` | Per-actor sequence/predecessor/base proofs across all edit kinds, complete-prefix import, and proof-aware fingerprints. |
 | `participantIdentity` | Explicit empty participant aliases and exact-claim `unbindActor` releases, allowing an editor to release and choose a person again. |
 | `diskSync` | Public `diskConnection` journal operations and separate editor-only `diskCredentials` messages; no token in history or handshake payloads. |
 
-`familySurnames`, `personalSurnames`, `explicitSiblings`, `patronymics`, `lifeStatus`, `authorHistory`, `participantIdentity`, and `diskSync` are optional Boolean extensions, default false/omitted.
-True is valid only on `hello`/`welcome`; current sessions advertise all eight on both handshakes. Non-Boolean values,
+`familySurnames`, `personalSurnames`, `explicitSiblings`, `patronymics`, `lifeStatus`, `marriageHistory`, `authorHistory`, `participantIdentity`, and `diskSync` are optional Boolean extensions, default false/omitted.
+True is valid only on `hello`/`welcome`; current sessions advertise all nine on both handshakes. Non-Boolean values,
 including explicit null, are invalid. They do not change wire version 1 or the inventory/checkpoint formats. The surname
 and participant-identity capabilities alone change no edit fingerprint; author proofs extend only proof-bearing
 fingerprints, leaving legacy bytes unchanged.
 
 Before importing handshake history, the session rejects peers missing capabilities required by its profile, invitation,
 or existing journal. The production `requireFamilyTree` profile requires **`familyTree`, `familySurnames`,
-`personalSurnames`, `explicitSiblings`, `patronymics`, `authorHistory`, and `participantIdentity`**, even for an empty room. A direct/legacy-compatible session also requires
+`personalSurnames`, `explicitSiblings`, `patronymics`, `marriageHistory`, `authorHistory`, and `participantIdentity`**, even for an empty room. A direct/legacy-compatible session also requires
 both surname capabilities as soon as **any known** `setSurname` exists, author-history support for **any known proof-bearing edit**,
 and participant-identity support for **any known empty `participantName` or `unbindActor`**. These checks include losing,
 pending, and failed records, not just currently visible or durable winners. Pending entry-profile creation also requires
@@ -102,13 +103,33 @@ Incoming and outgoing operations are independently gated: `setSurname` requires 
 and `personalSurnames`; support for the original wire schema alone is insufficient. Proof-bearing history requires
 `authorHistory` even when its payload is ordinary text or metadata, and blank aliases or `unbindActor` require
 `participantIdentity`. An established legacy channel cannot silently continue after the room acquires a personal-surname,
-explicit-sibling, patronymic, author-proof, or participant-identity requirement. Any known `createSibling` or
+explicit-sibling, patronymic, marriage/surname-history, author-proof, or participant-identity requirement. Any known `createSibling` or
 `unlinkSibling`, including pending/failed operations or claims later retired, requires `explicitSiblings`.
 Both new payloads and subsequent ordinary parent/history traffic are barred without that negotiated
 capability; the same gate precedes handshake history import, profile writes, and membership. This changes
 no room envelope version, fingerprint, storage schema, or checkpoint format. Unsupported records are rejected, not stripped of proof,
 downgraded to text, interpreted as permanent old bindings, or dropped. An initial hello sends **no history payload**
 before negotiation.
+
+`marriageHistory` is required by the production tree profile even without explicit history: implied co-parent marriages
+and current-name projections already have new semantics. A legacy-compatible direct session requires it as soon as
+**any known** `addMarriage`, `setMarriageDates`, `setMarriageSurname`, `removeMarriage`, `addSurnameChange`,
+`setSurnameChange`, or `removeSurnameChange` exists. Losing records, null date/choice resets, failed/pending drafts, and
+removed episodes/events remain requirements. Both handshake directions reject missing support before any history/profile
+or membership write; established inbound/outbound traffic is independently checked before import/send, including ordinary
+history/control traffic after a new local requirement appears. Legacy test sessions without these operations retain their
+previous text/tree compatibility.
+
+These are person-scoped ordinary optimistic/durable tree commands. `RoomSession.addMarriage`, `updateMarriage`,
+`setMarriageSurname`, `removeMarriage`, `addSurnameChange`, `updateSurnameChange`, and `removeSurnameChange` mirror the
+[domain builders](tree-model.md) and require an editor through both typed and raw submission. An atomic `addMarriage`
+can contain a `TreeNewMarriagePartner` snapshot; no separate orphan identity write is created. The session validates a live
+initiator, unused new identities/items, and exact episode ownership/endpoints without recomputing frozen surname choices
+or replacing the submitted immutable payload. Existing explicit episodes remain editable/removable by a live survivor
+after the spouse is deleted; new marriages require an existing live identity or an unused atomic new partner. Date tuples
+are one operation, and parallel date/choice submissions immediately observe earlier optimistic drafts. Save failure keeps
+those exact records for `flush()` retry and never broadcasts unconfirmed drafts. All records reuse the existing complete
+journal, Disk encoding, digests, inventory and checkpoint formats; wire version and storage envelope remain unchanged.
 
 `lifeStatus` is advertised on every current hello/welcome but is **not** required for an empty room. Any known `setValue` whose field is `alive`, including a null clear and pending/failed writes, requires negotiated `lifeStatus` before handshake history import and on established channels. Later ordinary history cannot bypass that gate. A new hello remains payload-free. Older clients stay compatible until the journal contains that field.
 
@@ -263,9 +284,9 @@ Connectivity/presence indicators are separate from local saving, checkpoint read
 
 ## Source and regression map
 
-- [Protocol tests](../../test/room_protocol_test.dart): proof-aware digests with unchanged legacy fingerprints, handshake-only surname/patronymic/author/participant-identity capabilities, recursive author closure, immutable IDs, bounds, Unicode, malformed chunks.
-- [Session tests](../../test/room_session_test.dart): empty capability offers/current fast welcomes, author/patronymic gates on empty production rooms and legacy channels, closure before persistence/ACK, frozen-core checkpoint resolution, same-actor tab relay, admission, finite cohorts, solo/partial outages, ACK timers, and wake recovery.
-- [Tree session tests](../../test/tree_room_session_test.dart) and [role tests](../../test/room_roles_test.dart): payload compatibility and durable admission, participant-identity gates before import and on established legacy channels, room dictionary permissions without visible people, durable dictionary exchange/concurrent reset/shuffled replay/reload and bidirectional patronymic gates, independent per-person surname convergence/reload, legacy history preservation without opening migration, person-target retry, and bidirectional wire/semantic surname capability gates.
+- [Protocol tests](../../test/room_protocol_test.dart): proof-aware digests with unchanged legacy fingerprints, handshake-only surname/patronymic/marriage-history/author/participant-identity capabilities, recursive author closure, immutable IDs, bounds, Unicode, malformed chunks.
+- [Session tests](../../test/room_session_test.dart): empty capability offers/current fast welcomes, author/patronymic/marriage-history gates on empty production rooms and legacy channels, closure before persistence/ACK, frozen-core checkpoint resolution, same-actor tab relay, admission, finite cohorts, solo/partial outages, ACK timers, and wake recovery.
+- [Tree session tests](../../test/tree_room_session_test.dart) and [role tests](../../test/room_roles_test.dart): payload compatibility and durable admission, participant-identity gates before import and on established legacy channels, marriage/surname-history guest permissions, atomic new partners, implied materialization/suppression/re-entry and durable replay/reload, frozen-core retry and bidirectional capability gates; room dictionary permissions without visible people, durable dictionary exchange/concurrent reset/shuffled replay/reload and bidirectional patronymic gates, independent per-person surname convergence/reload, legacy history preservation without opening migration, person-target retry, and bidirectional wire/semantic surname capability gates.
 - [History tests](../../test/room_history_test.dart), [page tests](../../test/room_page_test.dart), and the historical [headless recovery driver](../../tool/check_room_resume.cjs). The latter targets the old text-demo UI; see [testing](testing.md#historical-drivers-and-browser-harness-caveat) before reusing it.
 
 [Yandex Disk](yandex-disk.md) documents the implemented optional cloud replica. [Future storage and synchronization](../future-storage-and-sync.md) remains the broader agreement for snapshots, separate attachments, and future formats. Current WebRTC checkpoints are wire durability proofs, not cloud acknowledgments or stored snapshots.

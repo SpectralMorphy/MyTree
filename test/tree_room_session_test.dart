@@ -368,6 +368,120 @@ Map<String, Object?> _projection(TreeDocument tree) => {
   ],
 };
 
+const _familyHistoryTypes = [
+  'addMarriage',
+  'setMarriageDates',
+  'setMarriageSurname',
+  'removeMarriage',
+  'addSurnameChange',
+  'setSurnameChange',
+  'removeSurnameChange',
+];
+
+TreeOperation _familyHistoryWireOperation(String type) =>
+    TreeOperation.fromJson({
+      'type': type,
+      'personId': rootTreePersonId,
+      'itemId': type.contains('Marriage') ? 'episode' : 'change',
+      if (type.contains('Marriage')) 'partnerId': 'partner',
+      if (type == 'addMarriage' || type == 'setMarriageDates') ...{
+        'startDate': null,
+        'endDate': null,
+        'endMode': 'unknown',
+      },
+      if (type == 'addMarriage') ...{
+        'surnameChoices': {
+          rootTreePersonId: {'changeSurname': false, 'surname': null},
+          'partner': {'changeSurname': false, 'surname': null},
+        },
+        'newPartner': null,
+      },
+      if (type == 'setMarriageSurname') ...{
+        'changeSurname': false,
+        'surname': null,
+      },
+      if (type == 'addSurnameChange' || type == 'setSurnameChange') ...{
+        'surname': {'text': 'Ли', 'decline': false},
+        'date': null,
+        'reason': '',
+      },
+    });
+
+RoomMessage _oldMarriagePeerMessage({
+  RoomMessageType type = RoomMessageType.hello,
+  List<RoomEdit> history = const [],
+}) => RoomMessage(
+  roomId: _roomId,
+  type: type,
+  actor: 'old-marriages',
+  history: history,
+  online: type == RoomMessageType.welcome ? 2 : null,
+  hosting: type == RoomMessageType.welcome ? true : null,
+  roomMetadata:
+      type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  roomRoles: type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  familyTree: type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  familySurnames:
+      type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  personalSurnames:
+      type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  explicitSiblings:
+      type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  patronymics: type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  lifeStatus: type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  authorHistory:
+      type == RoomMessageType.hello || type == RoomMessageType.welcome,
+  participantIdentity:
+      type == RoomMessageType.hello || type == RoomMessageType.welcome,
+);
+
+Map<String, Object?> _familyHistoryProjection(TreeDocument tree) => {
+  'tree': _projection(tree),
+  'people': {
+    for (final person in tree.people.values)
+      person.id: {
+        'currentSurname': person.surname,
+        'history': [
+          for (final entry in tree.historyOf(person.id))
+            {
+              'id': entry.id,
+              'marriage': entry.marriage == null
+                  ? null
+                  : {
+                      'id': entry.marriage!.id,
+                      'personId': entry.marriage!.personId,
+                      'partnerId': entry.marriage!.partnerId,
+                      'implied': entry.marriage!.isImplied,
+                      'start': entry.marriage!.startDate?.toIso8601String(),
+                      'end': entry.marriage!.endDate?.toIso8601String(),
+                      'mode': entry.marriage!.endMode.name,
+                      'choices': {
+                        for (final choice
+                            in entry.marriage!.surnameChoices.entries)
+                          choice.key: [
+                            choice.value.changeSurname,
+                            choice.value.adoptedSurname?.text,
+                            choice.value.adoptedSurname?.decline,
+                            choice.value.isExplicit,
+                          ],
+                      },
+                    },
+              'surname': entry.surnameChange == null
+                  ? null
+                  : [
+                      entry.surnameChange!.id,
+                      entry.surnameChange!.surname.text,
+                      entry.surnameChange!.surname.decline,
+                      entry.surnameChange!.date?.toIso8601String(),
+                      entry.surnameChange!.reason,
+                      entry.surnameChange!.marriageId,
+                    ],
+            },
+        ],
+      },
+  },
+};
+
 Future<void> _settle(WidgetTester tester) async {
   for (var i = 0; i < 16; i++) {
     await tester.pump();
@@ -434,6 +548,40 @@ void main() {
         await _settle(tester);
       }
     });
+  }
+
+  Future<void> seedMarriagePeople(
+    RoomSession room, {
+    bool coParents = false,
+  }) async {
+    await room.applyTreeOperation(
+      room.tree.setValue(rootTreePersonId, 'sex', TreeSex.female),
+    );
+    await room.applyTreeOperation(
+      room.tree.setIndividualSurname(
+        rootTreePersonId,
+        text: 'Иванов',
+        decline: true,
+      ),
+    );
+    await room.applyTreeOperation(
+      room.tree.createPerson('partner', name: 'Павел', sex: TreeSex.male),
+    );
+    await room.applyTreeOperation(
+      room.tree.setIndividualSurname('partner', text: 'Петров', decline: true),
+    );
+    if (coParents) {
+      await room.applyTreeOperation(room.tree.createPerson('child'));
+      await room.applyTreeOperation(
+        room.tree.setValue('child', 'fatherId', 'partner'),
+      );
+      await room.applyTreeOperation(
+        room.tree.setValue('child', 'motherId', rootTreePersonId),
+      );
+      await room.applyTreeOperation(
+        room.tree.setValue('child', 'birthDate', DateTime.utc(2005)),
+      );
+    }
   }
 
   tearDown(() async {
@@ -619,6 +767,7 @@ void main() {
       expect(handshakes.every((message) => message.personalSurnames), isTrue);
       expect(handshakes.every((message) => message.explicitSiblings), isTrue);
       expect(handshakes.every((message) => message.patronymics), isTrue);
+      expect(handshakes.every((message) => message.marriageHistory), isTrue);
       expect(handshakes.every((message) => message.authorHistory), isTrue);
       expect(
         handshakes
@@ -892,6 +1041,603 @@ void main() {
         );
       }
       expect(roomHistoryInventory(room.changes), before);
+    },
+  );
+
+  treeTest(
+    'marriage history materializes implied dates and surname intent then durably suppresses and readds episodes',
+    (tester) async {
+      final aliceStore = store();
+      final bobStore = store();
+      final alice = session(actor: 'alice', storage: aliceStore, creator: true);
+      await alice.start();
+      await _settle(tester);
+      await seedMarriagePeople(alice, coParents: true);
+      final implied = alice.tree.marriagesOf(rootTreePersonId).single;
+      expect(implied.isImplied, isTrue);
+      expect(implied.startDate, isNull);
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Петрова');
+      final bob = session(
+        actor: 'bob',
+        storage: bobStore,
+        member: false,
+        follower: true,
+      );
+      await bob.start();
+      await _settleRoom(tester);
+      expect(
+        _familyHistoryProjection(bob.tree),
+        _familyHistoryProjection(alice.tree),
+      );
+      final beforeMaterialize = _treeEdits(alice).length;
+      await Future.wait([
+        alice.updateMarriage(
+          rootTreePersonId,
+          implied.id,
+          startDate: DateTime.utc(2000),
+          endDate: DateTime.utc(2010),
+          endMode: TreeMarriageEndMode.date,
+        ),
+        alice.setMarriageSurname(
+          rootTreePersonId,
+          implied.id,
+          changeSurname: false,
+        ),
+      ]);
+      final materialized = alice.tree.marriagesOf(rootTreePersonId).single;
+      expect(materialized.id, implied.id);
+      expect(materialized.isImplied, isFalse);
+      expect(materialized.startDate, DateTime.utc(2000));
+      expect(materialized.endDate, DateTime.utc(2010));
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Иванова');
+      expect(_treeEdits(alice), hasLength(beforeMaterialize + 2));
+      await _settleRoom(tester);
+      // Suppression is a durable pair register; unchanged co-parent edges do not
+      // re-create the removed implied episode on another device or after reload.
+      await bob.removeMarriage(rootTreePersonId, implied.id);
+      await _settleRoom(tester);
+      expect(alice.tree.marriagesOf(rootTreePersonId), isEmpty);
+      expect(alice.tree.person('child')!.fatherId, 'partner');
+      expect(alice.tree.person('child')!.motherId, rootTreePersonId);
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Иванова');
+      await alice.addMarriage(
+        rootTreePersonId,
+        'partner',
+        id: 'second-episode',
+        startDate: DateTime.utc(2015),
+        changeSurname: true,
+      );
+      await alice.addMarriage(
+        rootTreePersonId,
+        'partner',
+        id: 'third-episode',
+        startDate: DateTime.utc(2020),
+        changeSurname: false,
+      );
+      expect(alice.tree.marriagesOf(rootTreePersonId), hasLength(2));
+      await alice.addSurnameChange(
+        rootTreePersonId,
+        id: 'personal',
+        surname: const TreeSurname(text: 'Ли'),
+        date: DateTime.utc(2021),
+        reason: 'Личное решение',
+      );
+      await alice.updateSurnameChange(
+        rootTreePersonId,
+        'personal',
+        surname: const TreeSurname(text: 'Сидоров', decline: true),
+        date: DateTime.utc(2022),
+        reason: 'Исправлено',
+      );
+      await _settleRoom(tester);
+      expect(bob.tree.person(rootTreePersonId)!.surname, 'Сидорова');
+      await bob.removeSurnameChange(rootTreePersonId, 'personal');
+      await _settleRoom(tester);
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Петрова');
+      // An independent dated event is kept separately from marriage-derived rows.
+      await alice.addSurnameChange(
+        rootTreePersonId,
+        id: 'retained',
+        surname: const TreeSurname(text: 'Ким'),
+        date: DateTime.utc(2023),
+      );
+      await _settleRoom(tester);
+      final expected = _familyHistoryProjection(alice.tree);
+      final inventory = roomHistoryInventory(alice.changes);
+      expect(_familyHistoryProjection(bob.durableTree), expected);
+      expect(roomHistoryInventory(bob.changes), inventory);
+      final replay = TreeDocument();
+      for (final edit in _treeEdits(alice).reversed) {
+        replay.merge([
+          StampedTreeOperation(
+            id: edit.id,
+            author: edit.author,
+            clock: edit.clock,
+            createdAt: DateTime.fromMillisecondsSinceEpoch(
+              edit.createdAt,
+              isUtc: true,
+            ),
+            operation: TreeOperation.fromJson(jsonDecode(edit.text)),
+          ),
+        ]);
+      }
+      expect(_familyHistoryProjection(replay), expected);
+      alice.dispose();
+      bob.dispose();
+      await _settle(tester);
+      network.autoRegister = false;
+      for (final entry in [('alice', aliceStore), ('bob', bobStore)]) {
+        final reopened = session(actor: entry.$1, storage: entry.$2);
+        await reopened.start();
+        expect(_familyHistoryProjection(reopened.tree), expected);
+        expect(_familyHistoryProjection(reopened.durableTree), expected);
+        expect(roomHistoryInventory(reopened.changes), inventory);
+      }
+    },
+  );
+
+  treeTest(
+    'marriage history parallel date and choice drafts survive a failed save as one retry backlog',
+    (tester) async {
+      final storage = store();
+      final alice = session(actor: 'alice', storage: storage, creator: true);
+      await alice.start();
+      await _settle(tester);
+      await seedMarriagePeople(alice, coParents: true);
+      final implied = alice.tree.marriagesOf(rootTreePersonId).single;
+      final bob = session(actor: 'bob', member: false, follower: true);
+      await bob.start();
+      await _settleRoom(tester);
+      final before = roomHistoryInventory(alice.changes);
+      storage.failAppend = true;
+      await expectLater(
+        Future.wait([
+          alice.updateMarriage(
+            rootTreePersonId,
+            implied.id,
+            startDate: DateTime.utc(2000),
+            endDate: DateTime.utc(2010),
+            endMode: TreeMarriageEndMode.date,
+          ),
+          alice.setMarriageSurname(
+            rootTreePersonId,
+            implied.id,
+            changeSurname: false,
+          ),
+        ]),
+        throwsStateError,
+      );
+      final drafts = alice.changes
+          .where((edit) => !before.containsKey(edit.id))
+          .toList();
+      expect(drafts, hasLength(2));
+      expect(drafts.map((edit) => jsonDecode(edit.text)['type']).toSet(), {
+        'setMarriageDates',
+        'setMarriageSurname',
+      });
+      final optimistic = alice.tree.marriagesOf(rootTreePersonId).single;
+      expect(optimistic.id, implied.id);
+      expect(optimistic.startDate, DateTime.utc(2000));
+      expect(optimistic.endDate, DateTime.utc(2010));
+      expect(optimistic.isImplied, isFalse);
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Иванова');
+      expect(bob.tree.person(rootTreePersonId)!.surname, 'Петрова');
+      expect(
+        alice.durableTree.marriagesOf(rootTreePersonId).single.isImplied,
+        isTrue,
+      );
+      expect(
+        _messages(network)
+            .expand((message) => message.history)
+            .where((edit) => drafts.any((draft) => draft.id == edit.id)),
+        isEmpty,
+      );
+      await expectLater(alice.flush(), throwsStateError);
+      storage.failAppend = false;
+      await alice.flush();
+      await _settleRoom(tester);
+      expect(
+        _familyHistoryProjection(bob.durableTree),
+        _familyHistoryProjection(alice.durableTree),
+      );
+      expect(
+        alice.changes.where((edit) => !before.containsKey(edit.id)),
+        hasLength(2),
+      );
+      for (final draft in drafts) {
+        final saved = _treeEdits(
+          alice,
+        ).singleWhere((edit) => edit.id == draft.id);
+        expect(saved.sameCoreAs(draft), isTrue);
+        expect(
+          storage.batches
+              .expand((batch) => batch)
+              .where((row) => row['id'] == draft.id),
+          everyElement(_immutableEdit(draft)),
+        );
+      }
+    },
+  );
+
+  treeTest(
+    'marriage history raw snapshots survive later partner surname changes and deleted-spouse edits',
+    (tester) async {
+      final alice = session(actor: 'alice', creator: true);
+      await alice.start();
+      await _settle(tester);
+      await seedMarriagePeople(alice);
+      final frozen = alice.tree.addMarriage(
+        rootTreePersonId,
+        'partner',
+        id: 'frozen',
+        changeSurname: true,
+      );
+      final frozenJson = jsonEncode(frozen.toJson());
+      await alice.applyTreeOperation(
+        alice.tree.setIndividualSurname(
+          'partner',
+          text: 'Новый',
+          decline: true,
+        ),
+      );
+      await alice.applyTreeOperation(frozen);
+      expect(_treeEdits(alice).last.text, frozenJson);
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Петрова');
+      expect(
+        alice.tree.person(rootTreePersonId)!.effectiveSurname!.text,
+        'Иванов',
+      );
+      await alice.applyTreeOperation(alice.tree.deletePerson('partner'));
+      expect(alice.tree.partnersOf(rootTreePersonId), isEmpty);
+      expect(alice.tree.marriagesOf(rootTreePersonId).single.id, 'frozen');
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Петрова');
+      await alice.updateMarriage(
+        rootTreePersonId,
+        'frozen',
+        startDate: DateTime.utc(2000),
+        endDate: null,
+        endMode: TreeMarriageEndMode.lifelong,
+      );
+      await alice.setMarriageSurname(
+        rootTreePersonId,
+        'frozen',
+        changeSurname: false,
+      );
+      expect(alice.tree.person(rootTreePersonId)!.surname, 'Иванова');
+      await alice.removeMarriage(rootTreePersonId, 'frozen');
+      expect(alice.tree.marriagesOf(rootTreePersonId), isEmpty);
+      expect(alice.tree.person('partner'), isNull);
+    },
+  );
+
+  treeTest(
+    'marriage history guest typed and raw commands cannot write any operation',
+    (tester) async {
+      final alice = session(actor: 'alice', creator: true);
+      await alice.start();
+      await _settle(tester);
+      await seedMarriagePeople(alice);
+      await alice.addMarriage(rootTreePersonId, 'partner', id: 'existing');
+      await alice.addSurnameChange(
+        rootTreePersonId,
+        id: 'change',
+        surname: const TreeSurname(text: 'Ли'),
+      );
+      final bobStore = store();
+      final bob = session(
+        actor: 'bob',
+        storage: bobStore,
+        member: false,
+        follower: true,
+        role: RoomRole.guest,
+      );
+      await bob.start();
+      await _settleRoom(tester);
+      expect(bob.canEdit, isFalse);
+      final before = roomHistoryInventory(bob.changes);
+      final batches = bobStore.batches.length;
+      final authored = bobStore.authoredBatches.length;
+      final packets = _messages(network).length;
+      for (final command in <Future<void> Function()>[
+        () => bob.addMarriage(
+          rootTreePersonId,
+          'new-partner',
+          newPartner: TreeNewMarriagePartner(name: 'Нельзя'),
+        ),
+        () => bob.updateMarriage(
+          rootTreePersonId,
+          'existing',
+          startDate: null,
+          endDate: null,
+        ),
+        () => bob.setMarriageSurname(
+          rootTreePersonId,
+          'existing',
+          changeSurname: false,
+        ),
+        () => bob.removeMarriage(rootTreePersonId, 'existing'),
+        () => bob.addSurnameChange(
+          rootTreePersonId,
+          surname: const TreeSurname(text: 'Нельзя'),
+        ),
+        () => bob.updateSurnameChange(
+          rootTreePersonId,
+          'change',
+          surname: const TreeSurname(text: 'Нельзя'),
+        ),
+        () => bob.removeSurnameChange(rootTreePersonId, 'change'),
+      ]) {
+        await expectLater(command(), throwsStateError);
+      }
+      for (final operation in [
+        alice.tree.addMarriage(
+          rootTreePersonId,
+          'new-partner',
+          newPartner: TreeNewMarriagePartner(name: 'Нельзя'),
+        ),
+        alice.tree.updateMarriage(
+          rootTreePersonId,
+          'existing',
+          startDate: null,
+          endDate: null,
+        ),
+        alice.tree.setMarriageSurname(
+          rootTreePersonId,
+          'existing',
+          changeSurname: false,
+        ),
+        alice.tree.removeMarriage(rootTreePersonId, 'existing'),
+        alice.tree.addSurnameChange(
+          rootTreePersonId,
+          surname: const TreeSurname(text: 'Нельзя'),
+        ),
+        alice.tree.updateSurnameChange(
+          rootTreePersonId,
+          'change',
+          surname: const TreeSurname(text: 'Нельзя'),
+        ),
+        alice.tree.removeSurnameChange(rootTreePersonId, 'change'),
+      ]) {
+        await expectLater(bob.applyTreeOperation(operation), throwsStateError);
+      }
+      await _settle(tester);
+      expect(roomHistoryInventory(bob.changes), before);
+      expect(bobStore.batches, hasLength(batches));
+      expect(bobStore.authoredBatches, hasLength(authored));
+      expect(_messages(network), hasLength(packets));
+      expect(bob.tree.person('new-partner'), isNull);
+    },
+  );
+
+  for (final kind in [
+    'addMarriage',
+    'setMarriageDates',
+    'setMarriageSurname',
+    'removeMarriage',
+    'addSurnameChange',
+    'setSurnameChange',
+    'removeSurnameChange',
+  ]) {
+    treeTest(
+      'failed marriage history $kind keeps its core and broadcasts only after flush',
+      (tester) async {
+        final storage = store();
+        final alice = session(actor: 'alice', storage: storage, creator: true);
+        await alice.start();
+        await _settle(tester);
+        await seedMarriagePeople(alice);
+        await alice.addMarriage(rootTreePersonId, 'partner', id: 'existing');
+        await alice.addSurnameChange(
+          rootTreePersonId,
+          id: 'change',
+          surname: const TreeSurname(text: 'Ли'),
+        );
+        final bob = session(actor: 'bob', member: false, follower: true);
+        await bob.start();
+        await _settleRoom(tester);
+        final before = roomHistoryInventory(alice.changes);
+        final operation = switch (kind) {
+          'addMarriage' => alice.tree.addMarriage(
+            rootTreePersonId,
+            'new-partner',
+            id: 'atomic',
+            newPartner: TreeNewMarriagePartner(
+              name: 'Новый',
+              sex: TreeSex.male,
+              birthDate: DateTime.utc(1980),
+              birthSurname: const TreeSurname(text: 'Ким'),
+            ),
+          ),
+          'setMarriageDates' => alice.tree.updateMarriage(
+            rootTreePersonId,
+            'existing',
+            startDate: DateTime.utc(2000),
+            endDate: DateTime.utc(2010),
+            endMode: TreeMarriageEndMode.date,
+          ),
+          'setMarriageSurname' => alice.tree.setMarriageSurname(
+            rootTreePersonId,
+            'existing',
+            changeSurname: false,
+          ),
+          'removeMarriage' => alice.tree.removeMarriage(
+            rootTreePersonId,
+            'existing',
+          ),
+          'addSurnameChange' => alice.tree.addSurnameChange(
+            rootTreePersonId,
+            id: 'new-change',
+            surname: const TreeSurname(text: 'Сидоров', decline: true),
+          ),
+          'setSurnameChange' => alice.tree.updateSurnameChange(
+            rootTreePersonId,
+            'change',
+            surname: const TreeSurname(text: 'Сидоров', decline: true),
+          ),
+          _ => alice.tree.removeSurnameChange(rootTreePersonId, 'change'),
+        };
+        storage.failAppend = true;
+        await expectLater(
+          alice.applyTreeOperation(operation),
+          throwsStateError,
+        );
+        final failed = alice.changes.singleWhere(
+          (edit) => !before.containsKey(edit.id),
+        );
+        expect(failed.text, jsonEncode(operation.toJson()));
+        expect(alice.storageError, isNotNull);
+        expect(
+          _messages(network)
+              .expand((message) => message.history)
+              .where((edit) => edit.id == failed.id),
+          isEmpty,
+        );
+        expect(bob.changes.where((edit) => edit.id == failed.id), isEmpty);
+        if (kind == 'addMarriage') {
+          expect(alice.tree.person('new-partner')!.name, 'Новый');
+          expect(
+            alice.tree
+                .marriagesOf(rootTreePersonId)
+                .where((marriage) => marriage.id == 'atomic'),
+            hasLength(1),
+          );
+          expect(alice.durableTree.person('new-partner'), isNull);
+          expect(bob.tree.person('new-partner'), isNull);
+          expect(
+            alice.changes.where((edit) => !before.containsKey(edit.id)),
+            hasLength(1),
+            reason: 'identity and marriage are one draft, not an orphan create',
+          );
+        }
+        await expectLater(alice.flush(), throwsStateError);
+        storage.failAppend = false;
+        await alice.flush();
+        await _settleRoom(tester);
+        expect(alice.storageError, isNull);
+        expect(
+          _familyHistoryProjection(bob.durableTree),
+          _familyHistoryProjection(alice.durableTree),
+        );
+        expect(
+          roomHistoryInventory(bob.changes),
+          roomHistoryInventory(alice.changes),
+        );
+        expect(
+          _treeEdits(alice).singleWhere((edit) => edit.id == failed.id).text,
+          failed.text,
+        );
+        final attempts = storage.batches
+            .expand((batch) => batch)
+            .where((row) => row['id'] == failed.id);
+        expect(attempts.length, greaterThanOrEqualTo(3));
+        expect(attempts, everyElement(_immutableEdit(failed)));
+        expect(
+          decodeRoomHistory(
+            await storage.loadHistory(_roomId),
+          ).where((edit) => edit.id == failed.id),
+          hasLength(1),
+        );
+      },
+    );
+  }
+
+  treeTest(
+    'marriage history raw guards retain endpoint ownership and retired identities',
+    (tester) async {
+      final alice = session(actor: 'alice', creator: true);
+      await alice.start();
+      await _settle(tester);
+      await seedMarriagePeople(alice);
+      await alice.applyTreeOperation(alice.tree.createPerson('other'));
+      await alice.addMarriage(rootTreePersonId, 'partner', id: 'existing');
+      await alice.addSurnameChange(
+        rootTreePersonId,
+        id: 'change',
+        surname: const TreeSurname(text: 'Ли'),
+      );
+      final dates = alice.tree
+          .updateMarriage(
+            rootTreePersonId,
+            'existing',
+            startDate: null,
+            endDate: null,
+          )
+          .toJson();
+      final choice = alice.tree
+          .setMarriageSurname(
+            rootTreePersonId,
+            'existing',
+            changeSurname: false,
+          )
+          .toJson();
+      final removal = alice.tree
+          .removeMarriage(rootTreePersonId, 'existing')
+          .toJson();
+      final updateSurname = alice.tree
+          .updateSurnameChange(
+            rootTreePersonId,
+            'change',
+            surname: const TreeSurname(text: 'Ким'),
+          )
+          .toJson();
+      final removeSurname = alice.tree
+          .removeSurnameChange(rootTreePersonId, 'change')
+          .toJson();
+      final oldAdd = alice.tree.addMarriage(
+        rootTreePersonId,
+        'partner',
+        id: 'retired',
+      );
+      await alice.applyTreeOperation(oldAdd);
+      await alice.removeMarriage(rootTreePersonId, 'retired');
+      final oldSurname = alice.tree.addSurnameChange(
+        rootTreePersonId,
+        id: 'retired-change',
+        surname: const TreeSurname(text: 'Ким'),
+      );
+      await alice.applyTreeOperation(oldSurname);
+      await alice.removeSurnameChange(rootTreePersonId, 'retired-change');
+      final orphan = alice.tree.addMarriage(
+        rootTreePersonId,
+        'retired-person',
+        newPartner: TreeNewMarriagePartner(name: 'Не воскреснет'),
+      );
+      await alice.applyTreeOperation(alice.tree.createPerson('retired-person'));
+      await alice.applyTreeOperation(alice.tree.deletePerson('retired-person'));
+      final missingPartner = alice.tree
+          .addMarriage(rootTreePersonId, 'partner', id: 'unused')
+          .toJson();
+      final before = roomHistoryInventory(alice.changes);
+      for (final operation in [
+        TreeOperation.fromJson({...dates, 'personId': 'other'}),
+        TreeOperation.fromJson({...dates, 'partnerId': 'other'}),
+        TreeOperation.fromJson({...choice, 'personId': 'other'}),
+        TreeOperation.fromJson({...removal, 'partnerId': 'other'}),
+        TreeOperation.fromJson({...updateSurname, 'personId': 'other'}),
+        TreeOperation.fromJson({...removeSurname, 'personId': 'other'}),
+        TreeOperation.fromJson({...removeSurname, 'itemId': 'existing'}),
+        oldAdd,
+        oldSurname,
+        orphan,
+        TreeOperation.fromJson({
+          ...missingPartner,
+          'partnerId': 'missing',
+          'surnameChoices': {
+            rootTreePersonId: {'changeSurname': false, 'surname': null},
+            'missing': {'changeSurname': false, 'surname': null},
+          },
+        }),
+      ]) {
+        await expectLater(
+          alice.applyTreeOperation(operation),
+          throwsArgumentError,
+        );
+      }
+      await expectLater(
+        alice.addMarriage(rootTreePersonId, rootTreePersonId),
+        throwsFormatException,
+      );
+      expect(roomHistoryInventory(alice.changes), before);
     },
   );
 
@@ -2912,6 +3658,7 @@ void main() {
             familyTree: true,
             familySurnames: true,
             personalSurnames: true,
+            marriageHistory: true,
             explicitSiblings: true,
             patronymics: true,
             authorHistory: true,
@@ -2974,6 +3721,7 @@ void main() {
         familyTree: true,
         familySurnames: true,
         personalSurnames: true,
+        marriageHistory: true,
         explicitSiblings: true,
         patronymics: true,
         authorHistory: true,
@@ -3050,6 +3798,7 @@ void main() {
               familyTree: true,
               familySurnames: true,
               personalSurnames: true,
+              marriageHistory: true,
               explicitSiblings: true,
               authorHistory: true,
               participantIdentity: true,
@@ -3066,6 +3815,252 @@ void main() {
           expect(storage.membershipCalls, membershipBefore);
           expect(room.durableTree.patronymicOverrides, isEmpty);
           expect(room.log.any((line) => line.contains('отчества')), isTrue);
+        },
+      );
+    }
+  }
+
+  for (final type in _familyHistoryTypes) {
+    treeTest(
+      'known marriage history $type requires capability even when not visible',
+      (tester) async {
+        final storage = store();
+        final historical = RoomEdit(
+          id: 'historical-$type',
+          author: 'historical',
+          clock: 1,
+          createdAt: 1,
+          kind: RoomEditKind.tree,
+          text: jsonEncode(_familyHistoryWireOperation(type).toJson()),
+        );
+        await storage.appendHistory(_roomId, [historical.toJson()]);
+        final host = session(
+          actor: 'alice',
+          storage: storage,
+          creator: true,
+          requireFamilyTree: false,
+        );
+        await host.start();
+        await _settle(tester);
+        final before = roomHistoryInventory(host.changes);
+        final batches = storage.batches.length;
+        final inbound = _Channel(network, 'old-marriages');
+        network.registered[host.hostAlias]!.accept(inbound);
+        inbound.openChannel();
+        inbound.receive(
+          _oldMarriagePeerMessage(
+            history: const [
+              RoomEdit(
+                id: 'must-not-import',
+                author: 'old-marriages',
+                clock: 100,
+                createdAt: 100,
+                text: 'Private old history',
+              ),
+            ],
+          ).toJson(),
+        );
+        await _settle(tester);
+        expect(inbound.disposed, isTrue);
+        expect(inbound.sent, isEmpty);
+        expect(roomHistoryInventory(host.changes), before);
+        expect(storage.batches, hasLength(batches));
+        expect(
+          host.log.any((line) => line.contains('историю браков и фамилий')),
+          isTrue,
+        );
+      },
+    );
+
+    for (final incoming in [false, true]) {
+      treeTest(
+        'marriage history $type in old ${incoming ? 'hello' : 'welcome'} rejects before import',
+        (tester) async {
+          final storage = store();
+          final room = session(
+            actor: 'alice',
+            storage: storage,
+            member: incoming,
+            creator: incoming,
+            follower: !incoming,
+            requireFamilyTree: false,
+          );
+          await room.start();
+          await _settle(tester);
+          final _Channel channel;
+          if (incoming) {
+            channel = _Channel(network, 'old-marriages');
+            network.registered[room.hostAlias]!.accept(channel);
+          } else {
+            channel = network.channels.single;
+          }
+          channel.openChannel();
+          await _settle(tester);
+          final before = roomHistoryInventory(room.changes);
+          final batches = storage.batches.length;
+          final authored = storage.authoredBatches.length;
+          final memberships = storage.membershipCalls;
+          final sent = channel.sent.length;
+          channel.receive(
+            _oldMarriagePeerMessage(
+              type: incoming ? RoomMessageType.hello : RoomMessageType.welcome,
+              history: [
+                RoomEdit(
+                  id: 'unsupported-$type',
+                  author: 'old-marriages',
+                  clock: 100,
+                  createdAt: 100,
+                  kind: RoomEditKind.tree,
+                  text: jsonEncode(_familyHistoryWireOperation(type).toJson()),
+                ),
+              ],
+            ).toJson(),
+          );
+          await _settle(tester);
+          expect(channel.disposed, isTrue);
+          expect(channel.sent, hasLength(sent));
+          expect(room.joined, incoming);
+          expect(roomHistoryInventory(room.changes), before);
+          expect(storage.batches, hasLength(batches));
+          expect(storage.authoredBatches, hasLength(authored));
+          expect(storage.membershipCalls, memberships);
+          expect(
+            room.log.any((line) => line.contains('история браков и фамилий')),
+            isTrue,
+          );
+        },
+      );
+
+      treeTest(
+        'established old marriage peer blocks ${incoming ? 'incoming' : 'outgoing'} $type',
+        (tester) async {
+          final storage = store();
+          final host = session(
+            actor: 'alice',
+            storage: storage,
+            creator: true,
+            requireFamilyTree: false,
+          );
+          await host.start();
+          await _settle(tester);
+          final inbound = _Channel(network, 'old-marriages');
+          network.registered[host.hostAlias]!.accept(inbound);
+          inbound.openChannel();
+          inbound.receive(_oldMarriagePeerMessage().toJson());
+          await _settle(tester);
+          expect(inbound.disposed, isFalse);
+          expect(
+            _channelMessages(inbound)
+                .singleWhere(
+                  (message) => message.type == RoomMessageType.welcome,
+                )
+                .marriageHistory,
+            isTrue,
+          );
+          final before = roomHistoryInventory(host.changes);
+          final batches = storage.batches.length;
+          final sent = inbound.sent.length;
+          final edit = RoomEdit(
+            id: 'unsupported-$type',
+            author: 'external',
+            clock: 100,
+            createdAt: 100,
+            kind: RoomEditKind.tree,
+            text: jsonEncode(_familyHistoryWireOperation(type).toJson()),
+          );
+          if (incoming) {
+            inbound.receive(
+              _oldMarriagePeerMessage(
+                type: RoomMessageType.edits,
+                history: [edit],
+              ).toJson(),
+            );
+          } else {
+            // A same-origin external durable write must use the same outbound
+            // capability gate as an ordinary locally saved command.
+            await storage.appendHistory(_roomId, [edit.toJson()]);
+            await tester.pump(const Duration(milliseconds: 40));
+          }
+          await _settle(tester);
+          expect(inbound.disposed, isTrue);
+          expect(inbound.sent, hasLength(sent));
+          if (incoming) {
+            expect(roomHistoryInventory(host.changes), before);
+            expect(storage.batches, hasLength(batches));
+          }
+          expect(
+            host.log.any((line) => line.contains('история браков и фамилий')),
+            isTrue,
+          );
+        },
+      );
+    }
+  }
+
+  for (final admission in [false, true]) {
+    for (final incoming in [false, true]) {
+      treeTest(
+        'pending marriage draft blocks ${admission
+            ? 'admission'
+            : incoming
+            ? 'incoming ordinary history'
+            : 'outgoing presence'} from old peer incoming=$incoming',
+        (tester) async {
+          final storage = store();
+          final host = session(
+            actor: 'alice',
+            storage: storage,
+            creator: true,
+            requireFamilyTree: false,
+          );
+          await host.start();
+          await _settle(tester);
+          await seedMarriagePeople(host);
+          final inbound = _Channel(network, 'old-marriages');
+          network.registered[host.hostAlias]!.accept(inbound);
+          inbound.openChannel();
+          if (!admission) {
+            inbound.receive(_oldMarriagePeerMessage().toJson());
+            await _settle(tester);
+            expect(inbound.disposed, isFalse);
+          }
+          storage.failAppend = true;
+          await expectLater(
+            host.addMarriage(rootTreePersonId, 'partner', id: 'pending'),
+            throwsStateError,
+          );
+          final before = roomHistoryInventory(host.changes);
+          final batches = storage.batches.length;
+          final sent = inbound.sent.length;
+          if (admission) {
+            inbound.receive(_oldMarriagePeerMessage().toJson());
+          } else if (incoming) {
+            inbound.receive(
+              _oldMarriagePeerMessage(
+                type: RoomMessageType.edits,
+                history: const [
+                  RoomEdit(
+                    id: 'ordinary',
+                    author: 'old-marriages',
+                    clock: 100,
+                    createdAt: 100,
+                    text: 'Old ordinary traffic',
+                  ),
+                ],
+              ).toJson(),
+            );
+          } else {
+            await tester.pump(const Duration(seconds: 5));
+          }
+          await _settle(tester);
+          expect(inbound.disposed, isTrue);
+          expect(inbound.sent, hasLength(sent));
+          expect(roomHistoryInventory(host.changes), before);
+          expect(storage.batches, hasLength(batches));
+          expect(
+            host.log.any((line) => line.contains('браков и фамилий')),
+            isTrue,
+          );
         },
       );
     }
@@ -3126,6 +4121,7 @@ void main() {
             familyTree: true,
             familySurnames: true,
             personalSurnames: true,
+            marriageHistory: true,
             explicitSiblings: true,
             authorHistory: true,
             participantIdentity: true,
@@ -3176,6 +4172,7 @@ void main() {
               familyTree: true,
               familySurnames: true,
               personalSurnames: true,
+              marriageHistory: true,
               explicitSiblings: true,
               authorHistory: true,
               participantIdentity: true,
@@ -3299,6 +4296,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          marriageHistory: true,
           patronymics: true,
           explicitSiblings: true,
           authorHistory: true,
@@ -3346,6 +4344,7 @@ void main() {
             familyTree: true,
             familySurnames: true,
             personalSurnames: true,
+            marriageHistory: true,
             patronymics: true,
             explicitSiblings: true,
             authorHistory: true,
@@ -3391,6 +4390,7 @@ void main() {
               familyTree: true,
               familySurnames: true,
               personalSurnames: true,
+              marriageHistory: true,
               patronymics: true,
               explicitSiblings: true,
               authorHistory: true,
@@ -3493,6 +4493,7 @@ void main() {
           participantIdentity: true,
           familySurnames: true,
           personalSurnames: true,
+          marriageHistory: true,
           patronymics: true,
           explicitSiblings: true,
           durableSync: true,
@@ -3548,6 +4549,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          marriageHistory: true,
           patronymics: true,
           authorHistory: true,
           participantIdentity: true,
@@ -3620,6 +4622,7 @@ void main() {
           familyTree: true,
           familySurnames: true,
           personalSurnames: true,
+          marriageHistory: true,
           patronymics: true,
           authorHistory: true,
           participantIdentity: true,
@@ -3664,6 +4667,7 @@ void main() {
             familyTree: true,
             familySurnames: true,
             personalSurnames: true,
+            marriageHistory: true,
             patronymics: true,
             authorHistory: true,
             participantIdentity: true,

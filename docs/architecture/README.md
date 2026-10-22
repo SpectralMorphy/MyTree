@@ -8,7 +8,7 @@ This directory documents the **implemented** application for contributors. It de
 | --- | --- |
 | [Application and UI](ui.md) | Composition, room navigation, editor lifecycle, surname/biography forms, search, existing-person picking, photos, and presentation state. |
 | [Rooms and identity](rooms-and-identity.md) | Room admission, invitations, actors versus people, optional aliases, roles, presence, and releasable person bindings. |
-| [Tree model](tree-model.md) | People and relationships, personal birth surnames with paternal inheritance and legacy compatibility, anchored text, ordered lists, atomic fields, and deterministic projection. |
+| [Tree model](tree-model.md) | People, parent/sibling/marriage relationships, birth/current surnames and chronological family history, computed patronymics and room overrides, anchored text, ordered lists, atomic fields, and deterministic projection. |
 | [Tree layout](tree-layout.md) | Generation ranking, sibling blocks, trunk modes, placement, and the boundary with viewport geometry. |
 | [History and storage](history-and-storage.md) | Immutable cores and author-prefix proofs, optimistic versus canonical durable state, atomic authored storage, retries, and refresh. |
 | [Synchronization](synchronization.md) | WebRTC capability gates, predecessor-complete batches, proof-aware inventories, durable checkpoints, entry barriers, chunking, and recovery. |

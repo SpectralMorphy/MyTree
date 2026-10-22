@@ -673,6 +673,7 @@ void main() {
           personalSurnames: true,
           explicitSiblings: true,
           patronymics: true,
+          marriageHistory: true,
         ).toJson(),
       );
       for (var i = 0; i < 12; i++) {
@@ -725,6 +726,7 @@ void main() {
           familySurnames: true,
           personalSurnames: true,
           patronymics: true,
+          marriageHistory: true,
           authorHistory: true,
           participantIdentity: true,
         ).toJson(),
@@ -948,6 +950,7 @@ void main() {
           personalSurnames: true,
           explicitSiblings: true,
           patronymics: true,
+          marriageHistory: true,
         ).toJson(),
       );
       for (var i = 0; i < 12; i++) {
@@ -1170,6 +1173,7 @@ void main() {
               personalSurnames: true,
               explicitSiblings: true,
               patronymics: true,
+              marriageHistory: true,
             ).toJson(),
           );
           for (var i = 0; i < 12; i++) {
@@ -1552,6 +1556,7 @@ void main() {
         'personalSurnames': true,
         'explicitSiblings': true,
         'patronymics': true,
+        'marriageHistory': true,
       });
       for (var i = 0; i < 8; i++) {
         await tester.pump();
@@ -1956,6 +1961,7 @@ void main() {
         'personalSurnames': true,
         'explicitSiblings': true,
         'patronymics': true,
+        'marriageHistory': true,
       });
       for (var i = 0; i < 8; i++) {
         await tester.pump();
@@ -2644,6 +2650,7 @@ void main() {
           personalSurnames: true,
           explicitSiblings: true,
           patronymics: true,
+          marriageHistory: true,
           history: const [
             RoomEdit(
               id: 'remote-profile',
@@ -3299,6 +3306,7 @@ void main() {
           personalSurnames: true,
           explicitSiblings: true,
           patronymics: true,
+          marriageHistory: true,
         ).toJson(),
       );
       for (var i = 0; i < 16; i++) {

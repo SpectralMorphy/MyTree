@@ -106,12 +106,18 @@ async function load(page) {
   await settled(page);
 }
 async function type(page, field, text) {
-  await field.click(); await field.focus();
-  await until(() => page.evaluate(() => document.activeElement instanceof HTMLInputElement ||
-    document.activeElement instanceof HTMLTextAreaElement), 'No actual native text input.');
+  await field.click(); await field.focus(); await sleep(150);
+  await until(() => page.evaluate(() => {
+    const input = document.activeElement;
+    return input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement;
+  }), 'The field did not acquire actual native focus.', 5000);
   await page.keyboard.press('Control+A');
+  await until(() => page.evaluate(() => {
+    const input = document.activeElement;
+    return input?.selectionStart === 0 && input?.selectionEnd === input?.value?.length;
+  }), 'The actual native input did not select its previous value.', 5000);
   if (text) await page.keyboard.type(text, { delay: 20 }); else await page.keyboard.press('Backspace');
-  await until(() => page.evaluate((text) => document.activeElement?.value === text, text), 'Native input differs from typed text.');
+  await until(() => page.evaluate((text) => document.activeElement?.value === text, text), 'Native input differs from typed text.', 5000);
 }
 async function search(page, query, expected) {
   // The hint ceases to be the accessible name once Flutter has a query.
@@ -129,6 +135,11 @@ async function nameMode(page, label) {
 }
 async function dictionary(page) {
   await page.getByRole('button', { name: /^Меню комнаты(?: |$)/ }).click();
+  await page.getByRole('menuitem', { name: 'Словарь отчеств', exact: true }).waitFor();
+  await until(async () => {
+    const snapshot = await body(page);
+    return snapshot.includes('Настройки комнаты') && snapshot.includes('Словарь отчеств');
+  }, 'Room menu did not finish opening.');
   const menu = await body(page);
   assert.ok(menu.indexOf('Настройки комнаты') < menu.indexOf('Словарь отчеств'));
   await page.getByRole('menuitem', { name: 'Словарь отчеств', exact: true }).click();
@@ -136,9 +147,10 @@ async function dictionary(page) {
 async function addOverride(page) {
   await dictionary(page);
   await page.getByRole('button', { name: 'Добавить', exact: true }).click();
-  await type(page, page.getByRole('textbox', { name: 'Имя отца', exact: true }), 'Илья');
-  await type(page, page.getByRole('textbox', { name: 'Мужское отчество', exact: true }), 'Илиевич');
-  await type(page, page.getByRole('textbox', { name: 'Женское отчество', exact: true }), 'Илиевна');
+  await type(page, page.getByRole('textbox', { name: /^Имя отца(?: |$)/ }), 'Илья');
+  await type(page, page.getByRole('textbox', { name: /^Мужское отчество(?: |$)/ }), 'Илиевич');
+  await type(page, page.getByRole('textbox', { name: /^Женское отчество(?: |$)/ }), 'Илиевна');
+  await capture(page, 'dictionary-edit-forms');
   await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
   await page.getByRole('button', { name: 'Закрыть', exact: true }).waitFor();
   await page.getByRole('button', { name: 'Закрыть', exact: true }).click();
@@ -163,7 +175,9 @@ async function converge(pages) {
   }, 'Independent real RTC journals did not converge.');
 }
 async function capture(page, name) {
-  await settled(page);
+  // Moving a synthetic mouse on a touch profile can blur its native editor.
+  // Keep the real search focus intact while retaining the painted result.
+  await sleep(200);
   await fs.writeFile(path.join(output, `${name}.txt`), await body(page));
   await page.screenshot({ path: path.join(output, `${name}.png`) });
   assert.doesNotMatch(await body(page), /Не сохранено:|Не удалось прочитать локальные данные|Не удалось загрузить историю/);

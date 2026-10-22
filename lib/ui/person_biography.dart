@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import '../room_session.dart';
 import '../tree/tree_document.dart';
+import 'person_family_history.dart';
 
 const _leaf = Color(0xFF53765B);
 const _bark = Color(0xFF896C52);
@@ -448,6 +449,16 @@ class _PersonBiographyState extends State<PersonBiography> {
                           ),
                         const SizedBox(height: 24),
                         _relatives(person, editing: editing),
+                        const SizedBox(height: 24),
+                        PersonFamilyHistory(
+                          key: ValueKey('family-history-${person.id}'),
+                          session: session,
+                          personId: person.id,
+                          nameMode: _nameMode,
+                          onSelect: widget.onSelect,
+                          onPickFromTree: widget.onPickFromTree,
+                          editing: editing,
+                        ),
                         const SizedBox(height: 24),
                         Row(
                           children: [
@@ -1136,7 +1147,7 @@ class _SurnameEditorState extends State<_SurnameEditor> {
           controller: _surname,
           textCapitalization: TextCapitalization.words,
           decoration: InputDecoration(
-            labelText: 'Фамилия',
+            labelText: 'Фамилия при рождении',
             hintText: father?.effectiveSurname?.text,
             helperText: _explicitSnapshot != null
                 ? 'Указана для этого человека'
@@ -1827,39 +1838,13 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
                         },
                 ),
                 const SizedBox(height: 12),
-                Wrap(
-                  spacing: 8,
-                  children: [
-                    ChoiceChip(
-                      label: const Text('Новый человек'),
-                      selected: _newPerson,
-                      onSelected:
-                          _busy || _createdId != null || _submittedLink != null
-                          ? null
-                          : (_) {
-                              if (_createdId == null) {
-                                setState(() => _newPerson = true);
-                              }
-                            },
-                    ),
-                    ChoiceChip(
-                      label: const Text('Из дерева'),
-                      selected: !_newPerson,
-                      // Siblings stay new people. The choice remains visible,
-                      // but muted, so an existing person cannot be selected.
-                      onSelected:
-                          _busy ||
-                              _createdId != null ||
-                              _submittedLink != null ||
-                              _isSibling
-                          ? null
-                          : (_) {
-                              if (!_isSibling && _createdId == null) {
-                                setState(() => _newPerson = false);
-                              }
-                            },
-                    ),
-                  ],
+                PersonSourceChoice(
+                  newPerson: _newPerson,
+                  allowExisting: !_isSibling,
+                  onChanged:
+                      _busy || _createdId != null || _submittedLink != null
+                      ? null
+                      : (value) => setState(() => _newPerson = value),
                 ),
                 const SizedBox(height: 12),
                 if (!_createsNewPerson) ...[
@@ -1893,61 +1878,17 @@ class _AddRelativeDialogState extends State<_AddRelativeDialog> {
                     ),
                   ],
                 ] else ...[
-                  TextField(
-                    key: const Key('relative-new-name'),
-                    controller: _name,
+                  NewPersonFields(
+                    keyPrefix: 'relative-new',
+                    name: _name,
+                    sex: _fixedSex ?? _sex,
+                    birthDate: _birthDate,
                     enabled: !_busy && _createdId == null,
-                    textCapitalization: TextCapitalization.words,
-                    decoration: const InputDecoration(
-                      labelText: 'Имя нового человека',
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  DropdownButtonFormField<TreeSex>(
-                    key: ValueKey(
-                      'relative-new-sex-${(_fixedSex ?? _sex).name}',
-                    ),
-                    initialValue: _fixedSex ?? _sex,
-                    // Without expansion the hidden longest option sets the
-                    // dropdown width and overflows a narrow phone dialog.
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                      labelText: 'Пол',
-                      border: OutlineInputBorder(),
-                    ),
-                    items: [
-                      for (final sex in TreeSex.values)
-                        DropdownMenuItem(
-                          value: sex,
-                          child: Text(
-                            _sexLabel(sex),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                    ],
-                    onChanged: _busy || _createdId != null || _fixedSex != null
+                    onSexChanged: _fixedSex != null
                         ? null
-                        : (sex) =>
-                              setState(() => _sex = sex ?? TreeSex.unknown),
-                  ),
-                  const SizedBox(height: 8),
-                  OutlinedButton.icon(
-                    onPressed: _busy || _createdId != null
-                        ? null
-                        : () async {
-                            final date = await _pickDate(context, _birthDate);
-                            if (date != null && mounted) {
-                              setState(() => _birthDate = date);
-                            }
-                          },
-                    icon: const Icon(Icons.calendar_today_outlined),
-                    label: Text(
-                      _birthDate == null
-                          ? 'Дата рождения (необязательно)'
-                          : _dateLabel(_birthDate!),
-                    ),
+                        : (sex) => setState(() => _sex = sex),
+                    onBirthDateChanged: (date) =>
+                        setState(() => _birthDate = date),
                   ),
                 ],
                 if (error != null) ...[

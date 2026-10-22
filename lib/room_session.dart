@@ -1048,6 +1048,110 @@ class RoomSession extends ChangeNotifier {
     }
   }
 
+  Future<void> addMarriage(
+    String personId,
+    String partnerId, {
+    String? id,
+    DateTime? startDate,
+    DateTime? endDate,
+    TreeMarriageEndMode endMode = TreeMarriageEndMode.unknown,
+    bool? changeSurname,
+    TreeSurname? adoptedSurname,
+    TreeNewMarriagePartner? newPartner,
+  }) => _submitTreeCommand(
+    () => tree.addMarriage(
+      personId,
+      partnerId,
+      id: id,
+      startDate: startDate,
+      endDate: endDate,
+      endMode: endMode,
+      changeSurname: changeSurname,
+      adoptedSurname: adoptedSurname,
+      newPartner: newPartner,
+    ),
+  );
+
+  Future<void> updateMarriage(
+    String personId,
+    String marriageId, {
+    required DateTime? startDate,
+    required DateTime? endDate,
+    TreeMarriageEndMode endMode = TreeMarriageEndMode.unknown,
+  }) => _submitTreeCommand(
+    () => tree.updateMarriage(
+      personId,
+      marriageId,
+      startDate: startDate,
+      endDate: endDate,
+      endMode: endMode,
+    ),
+  );
+
+  Future<void> setMarriageSurname(
+    String personId,
+    String marriageId, {
+    required bool changeSurname,
+    TreeSurname? adoptedSurname,
+  }) => _submitTreeCommand(
+    () => tree.setMarriageSurname(
+      personId,
+      marriageId,
+      changeSurname: changeSurname,
+      adoptedSurname: adoptedSurname,
+    ),
+  );
+
+  Future<void> removeMarriage(String personId, String marriageId) =>
+      _submitTreeCommand(() => tree.removeMarriage(personId, marriageId));
+
+  Future<void> addSurnameChange(
+    String personId, {
+    String? id,
+    required TreeSurname surname,
+    DateTime? date,
+    String reason = '',
+  }) => _submitTreeCommand(
+    () => tree.addSurnameChange(
+      personId,
+      id: id,
+      surname: surname,
+      date: date,
+      reason: reason,
+    ),
+  );
+
+  Future<void> updateSurnameChange(
+    String personId,
+    String id, {
+    required TreeSurname surname,
+    DateTime? date,
+    String reason = '',
+  }) => _submitTreeCommand(
+    () => tree.updateSurnameChange(
+      personId,
+      id,
+      surname: surname,
+      date: date,
+      reason: reason,
+    ),
+  );
+
+  Future<void> removeSurnameChange(String personId, String id) =>
+      _submitTreeCommand(() => tree.removeSurnameChange(personId, id));
+
+  Future<void> _submitTreeCommand(TreeOperation Function() command) {
+    if (!canEdit) {
+      return Future.error(StateError('Только редактор может изменять дерево'));
+    }
+    try {
+      // Do not await here: a second command observes this draft immediately.
+      return applyTreeOperation(command());
+    } catch (error, stack) {
+      return Future.error(error, stack);
+    }
+  }
+
   Future<void> applyTreeOperation(TreeOperation operation) {
     if (!canEdit) {
       return Future.error(StateError('Только редактор может изменять дерево'));
@@ -1092,6 +1196,67 @@ class RoomSession extends ChangeNotifier {
               ? null
               : DateTime.parse(data['birthDate']! as String),
         );
+      case 'addMarriage':
+        // Surname choices are canonical snapshots in the submitted operation.
+        // Validate identity/ownership only; never regenerate the saved payload.
+        final partnerId = data['partnerId']! as String;
+        if (partnerId == id) {
+          throw ArgumentError('Нельзя заключить брак с собой');
+        }
+        if (data['newPartner'] case final Map partner) {
+          document.createPerson(
+            partnerId,
+            name: partner['name']! as String,
+            sex: TreeSex.values.byName(partner['sex']! as String),
+          );
+        } else if (document.person(partnerId) == null) {
+          throw ArgumentError('Партнёр не найден в дереве');
+        }
+        if (_hasTreeHistoryItem(item!, const {
+              'addMarriage',
+              'setMarriageDates',
+              'setMarriageSurname',
+              'removeMarriage',
+            }) ||
+            (item.startsWith('implied:') &&
+                !document
+                    .marriagesOf(id)
+                    .any(
+                      (marriage) =>
+                          marriage.id == item &&
+                          marriage.isImplied &&
+                          marriage.otherPersonId(id) == partnerId,
+                    ))) {
+          throw ArgumentError('Идентификатор брака уже использован');
+        }
+      case 'setMarriageDates':
+      case 'setMarriageSurname':
+      case 'removeMarriage':
+        // Explicit history remains editable after the other endpoint is deleted.
+        if (!document
+            .marriagesOf(id)
+            .any(
+              (marriage) =>
+                  marriage.id == item &&
+                  marriage.otherPersonId(id) == data['partnerId'],
+            )) {
+          throw ArgumentError('Брак уже изменился или не принадлежит человеку');
+        }
+      case 'addSurnameChange':
+        if (_hasTreeHistoryItem(item!, const {
+          'addSurnameChange',
+          'setSurnameChange',
+          'removeSurnameChange',
+        }, personId: id)) {
+          throw ArgumentError('Идентификатор смены фамилии уже использован');
+        }
+      case 'setSurnameChange':
+      case 'removeSurnameChange':
+        if (!document
+            .surnameChangesOf(id)
+            .any((change) => change.id == item && change.marriageId == null)) {
+          throw ArgumentError('Самостоятельная смена фамилии не найдена');
+        }
       case 'unlinkSibling':
         final link = document.directSiblingLinks
             .where(
@@ -1173,6 +1338,18 @@ class RoomSession extends ChangeNotifier {
         }
     }
   }
+
+  bool _hasTreeHistoryItem(
+    String itemId,
+    Set<String> types, {
+    String? personId,
+  }) => _history.knownEdits.any((edit) {
+    if (edit.kind != RoomEditKind.tree) return false;
+    final operation = jsonDecode(edit.text) as Map<String, dynamic>;
+    return types.contains(operation['type']) &&
+        operation['itemId'] == itemId &&
+        (personId == null || operation['personId'] == personId);
+  });
 
   Future<void> _appendTreeOperation(TreeOperation operation) {
     final payload = jsonEncode(operation.toJson());
@@ -2774,6 +2951,23 @@ class RoomSession extends ChangeNotifier {
   bool get _requiresPatronymics =>
       requireFamilyTree || _containsPatronymics(_history.knownEdits);
 
+  bool _containsMarriageHistory(Iterable<RoomEdit> history) => history.any(
+    (edit) =>
+        edit.kind == RoomEditKind.tree &&
+        const [
+          'addMarriage',
+          'setMarriageDates',
+          'setMarriageSurname',
+          'removeMarriage',
+          'addSurnameChange',
+          'setSurnameChange',
+          'removeSurnameChange',
+        ].contains((jsonDecode(edit.text) as Map<String, dynamic>)['type']),
+  );
+
+  bool get _requiresMarriageHistory =>
+      requireFamilyTree || _containsMarriageHistory(_history.knownEdits);
+
   bool _containsLifeStatus(Iterable<RoomEdit> history) => history.any((edit) {
     if (edit.kind != RoomEditKind.tree) return false;
     final operation = jsonDecode(edit.text);
@@ -2850,6 +3044,8 @@ class RoomSession extends ChangeNotifier {
     patronymics:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
     lifeStatus:
+        type == RoomMessageType.hello || type == RoomMessageType.welcome,
+    marriageHistory:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
     participantIdentity:
         type == RoomMessageType.hello || type == RoomMessageType.welcome,
@@ -3313,6 +3509,14 @@ class RoomSession extends ChangeNotifier {
         _failInitialSync(reason);
         throw const FormatException(reason);
       }
+      if (!message.marriageHistory && _requiresMarriageHistory) {
+        const reason =
+            'Обновите страницу на обоих устройствах: '
+            'другой клиент ещё не поддерживает историю браков и фамилий.';
+        _failInitialSync(reason);
+        throw const FormatException(reason);
+      }
+      state.marriageHistory = message.marriageHistory;
       state.patronymics = message.patronymics;
       state.lifeStatus = message.lifeStatus;
       state.diskSync = message.diskSync;
@@ -3330,6 +3534,13 @@ class RoomSession extends ChangeNotifier {
           (edit) => edit.kind == RoomEditKind.diskConnection,
         )) {
       throw const FormatException('Подключение Диска не согласовано');
+    }
+    if (!state.marriageHistory &&
+        (_requiresMarriageHistory ||
+            _containsMarriageHistory(message.history))) {
+      throw const FormatException(
+        'Обновите страницу на обоих устройствах: история браков и фамилий не согласована.',
+      );
     }
     if (message.type == RoomMessageType.diskCredentials) {
       await _receiveDiskCredentials(state, message);
@@ -3764,6 +3975,14 @@ class RoomSession extends ChangeNotifier {
           'Обновите страницу на обоих устройствах: отметка о жизни не согласована.',
         );
       }
+      if (!state.marriageHistory &&
+          (_containsMarriageHistory(message.history) ||
+              (message.type != RoomMessageType.hello &&
+                  _requiresMarriageHistory))) {
+        throw const FormatException(
+          'Обновите страницу на обоих устройствах: история браков и фамилий не согласована.',
+        );
+      }
       if (!state.familyTree &&
           message.history.any((edit) => edit.kind == RoomEditKind.tree)) {
         throw const FormatException(
@@ -4074,6 +4293,7 @@ class _RoomConnection {
   bool explicitSiblings = false;
   bool patronymics = false;
   bool lifeStatus = false;
+  bool marriageHistory = false;
   bool participantIdentity = false;
   bool authorHistory = false;
   bool diskSync = false;
