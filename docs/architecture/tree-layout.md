@@ -114,8 +114,10 @@ members' masks, so a block's branch can differ from an individual member's branc
   qualifying relationship, and unrelated people. Missing parents alone never establish sibling relationships;
   an explicit sibling component can establish them without inventing an unknown parent.
 
-A block takes its most prominent member's emphasis. These labels do not remove nodes or links from
-layout output; the [UI](ui.md) decides how strongly to draw context and which connections to paint.
+A block takes its most prominent member's blood-relative emphasis. Stepparent-only cousin styling
+applies to the individual card, not the block: an otherwise unrelated block stays `distant`/grey.
+Normal membership or a genuine cousin-style relative in the same block still promotes that block.
+These labels do not remove nodes or links from layout output; the [UI](ui.md) decides how strongly to draw context and which connections to paint.
 The UI also gives the selected person's partners normal color on their individual cards only, using
 `TreeDocument.partnersOf`: both co-parents and explicit marriage partners, of any sex. This keeps the existing
 full-color photo, name, and avatar treatment; it does not change model emphasis, sibling-block wash, palette,

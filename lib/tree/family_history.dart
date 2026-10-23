@@ -47,8 +47,9 @@ String treeMarriagePairKey(String a, String b) {
   return '${first.length}:$first:${second.length}:$second';
 }
 
-/// An explicit choice belongs to one partner, never to the whole pair. An
-/// explicit adopted surname is a snapshot, not a reference to a current surname.
+/// An explicit choice belongs to one partner, never to the whole pair. A
+/// non-null adopted surname is a snapshot, not a reference to a current surname.
+/// A missing snapshot can resolve from the partner's concrete surname later.
 class TreeMarriageSurnameChoice {
   const TreeMarriageSurnameChoice({
     required this.changeSurname,

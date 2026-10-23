@@ -140,29 +140,31 @@ class TreePerson {
           TreeSex.unknown => '',
         };
 
-  String get fullName {
-    final givenName = name.trim();
-    return [
-      givenName.isEmpty ? displayName : givenName,
-      if (surname.isNotEmpty) surname,
-    ].join(' ');
-  }
+  String get fullName => nameForMode(TreeNameMode.givenSurname);
 
-  String nameForMode(TreeNameMode mode) {
-    if (mode == TreeNameMode.givenSurname) return fullName;
+  String nameForMode(TreeNameMode mode) =>
+      nameWithSurname(mode, currentSurname);
+
+  String nameWithSurname(TreeNameMode mode, TreeSurname? value) {
     final givenName = name.trim();
+    final renderedSurname = value?.formForSex(sex) ?? '';
     return [
-      if (surname.isNotEmpty) surname,
+      if (mode == TreeNameMode.surnameGivenPatronymic &&
+          renderedSurname.isNotEmpty)
+        renderedSurname,
       givenName.isEmpty ? displayName : givenName,
-      if (patronymic.isNotEmpty) patronymic,
+      if (mode == TreeNameMode.givenSurname && renderedSurname.isNotEmpty)
+        renderedSurname,
+      if (mode == TreeNameMode.surnameGivenPatronymic && patronymic.isNotEmpty)
+        patronymic,
     ].join(' ');
   }
 
   String get fullNameWithPatronymic =>
       nameForMode(TreeNameMode.surnameGivenPatronymic);
 
-  /// Year span. A death date wins. Otherwise explicit [alive] chooses `н.в.`
-  /// or `?`. With no explicit choice, a missing death is `н.в.` only when a
+  /// Year span. A death date wins. Otherwise explicit [alive] chooses `н.в`
+  /// or `?`. With no explicit choice, a missing death is `н.в` only when a
   /// birth date exists; both missing stays `?–?`.
   String get lifeYears {
     if (deathDate != null) {
@@ -170,7 +172,7 @@ class TreePerson {
     }
     final living = alive ?? birthDate != null;
     if (!living && birthDate == null) return '?–?';
-    return '${birthDate?.year ?? '?'}–${living ? 'н.в.' : '?'}';
+    return '${birthDate?.year ?? '?'}–${living ? 'н.в' : '?'}';
   }
 }
 
@@ -734,6 +736,12 @@ class TreeDocument {
       _people.containsKey(personId)
       ? _family.changes[personId] ?? const []
       : const [];
+
+  /// Canonical surname immediately before this episode in surname chronology.
+  TreeSurname? surnameBeforeMarriage(String personId, String marriageId) =>
+      _people.containsKey(personId)
+      ? (_family.surnamesBeforeMarriages[personId]?[marriageId])
+      : null;
 
   List<TreeFamilyHistoryEntry> historyOf(String personId) =>
       _people.containsKey(personId)
@@ -1781,6 +1789,7 @@ class _FamilyHistoryProjection {
   Map<String, List<TreeFamilyHistoryEntry>> history = const {};
   Map<String, TreeSurname?> currentSurnames = const {};
   Map<String, TreeSurname?> concreteSurnames = const {};
+  Map<String, Map<String, TreeSurname?>> surnamesBeforeMarriages = const {};
   Set<String> usedMarriageIds = const {};
   Map<String, Set<String>> usedSurnameIds = const {};
 
@@ -1965,13 +1974,26 @@ class _FamilyHistoryProjection {
         concrete[entry.key] = entry.value.last.surname;
       }
     }
-    TreeMarriageSurnameChoice defaultChoice(String id, String partner) =>
-        TreeMarriageSurnameChoice(
-          changeSurname: people[id]?.sex == TreeSex.female,
-          adoptedSurname: people[id]?.sex == TreeSex.female
-              ? concrete[partner]
-              : null,
-        );
+    TreeMarriageSurnameChoice resolveChoice(
+      String id,
+      String partner, [
+      TreeMarriageSurnameChoice? choice,
+    ]) {
+      if (choice != null &&
+          (!choice.changeSurname || choice.adoptedSurname != null)) {
+        return choice;
+      }
+      // An absent snapshot can resolve once the partner has a concrete surname.
+      // Never feed this derived transfer back into the concrete source map.
+      final changeSurname =
+          choice?.changeSurname ?? people[id]?.sex == TreeSex.female;
+      return TreeMarriageSurnameChoice(
+        changeSurname: changeSurname,
+        adoptedSurname: changeSurname ? concrete[partner] : null,
+        isExplicit: choice?.isExplicit ?? false,
+      );
+    }
+
     final all = <String, TreeMarriage>{};
     final explicitPairs = <String>{};
     for (final state in states.values) {
@@ -1989,12 +2011,16 @@ class _FamilyHistoryProjection {
         ),
         orderingDate: commonDates[pair],
         surnameChoices: {
-          state.personId:
-              state.choices[state.personId] ??
-              defaultChoice(state.personId, state.partnerId),
-          state.partnerId:
-              state.choices[state.partnerId] ??
-              defaultChoice(state.partnerId, state.personId),
+          state.personId: resolveChoice(
+            state.personId,
+            state.partnerId,
+            state.choices[state.personId],
+          ),
+          state.partnerId: resolveChoice(
+            state.partnerId,
+            state.personId,
+            state.choices[state.partnerId],
+          ),
         },
       );
     }
@@ -2011,17 +2037,18 @@ class _FamilyHistoryProjection {
         partnerId: b,
         isImplied: true,
         orderingDate: commonDates[entry.key],
-        surnameChoices: {a: defaultChoice(a, b), b: defaultChoice(b, a)},
+        surnameChoices: {a: resolveChoice(a, b), b: resolveChoice(b, a)},
       );
     }
     final surnameChanges = <String, List<TreeSurnameChange>>{};
     final histories = <String, List<TreeFamilyHistoryEntry>>{};
     final current = <String, TreeSurname?>{};
+    final beforeMarriages = <String, Map<String, TreeSurname?>>{};
     for (final person in people.values) {
       final candidates = <TreeSurnameChange>[...?generic[person.id]?.values];
-      final personMarriages = all.values.where(
-        (m) => m.otherPersonId(person.id) != null,
-      );
+      final personMarriages = all.values
+          .where((m) => m.otherPersonId(person.id) != null)
+          .toList(growable: false);
       for (final marriage in personMarriages) {
         final choice = marriage.surnameChoices[person.id]!;
         if (!choice.changeSurname || choice.adoptedSurname == null) continue;
@@ -2039,6 +2066,32 @@ class _FamilyHistoryProjection {
         );
       }
       candidates.sort(compareTreeSurnameChanges);
+      final boundaries = [
+        for (final marriage in personMarriages)
+          TreeSurnameChange(
+            id: marriage.id,
+            personId: person.id,
+            // A non-adopting episode precedes same-date surname changes.
+            // The empty surname is only a sort key, never a projected value.
+            surname:
+                marriage.surnameChoices[person.id]!.adoptedSurname ??
+                const TreeSurname(text: ''),
+            date: marriage.startDate,
+            orderingDate: marriage.orderingDate,
+            marriageId: marriage.id,
+          ),
+      ]..sort(compareTreeSurnameChanges);
+      final before = <String, TreeSurname?>{};
+      var previousSurname = person.effectiveSurname;
+      var nextChange = 0;
+      for (final boundary in boundaries) {
+        while (nextChange < candidates.length &&
+            compareTreeSurnameChanges(candidates[nextChange], boundary) < 0) {
+          previousSurname = candidates[nextChange++].surname;
+        }
+        before[boundary.id] = previousSurname;
+      }
+      beforeMarriages[person.id] = Map.unmodifiable(before);
       var surname = person.effectiveSurname;
       final projected = <TreeSurnameChange>[];
       for (final candidate in candidates) {
@@ -2129,6 +2182,7 @@ class _FamilyHistoryProjection {
     history = Map.unmodifiable(histories);
     currentSurnames = Map.unmodifiable(current);
     concreteSurnames = Map.unmodifiable(concrete);
+    surnamesBeforeMarriages = Map.unmodifiable(beforeMarriages);
     genericChanges = Map<String, Map<String, TreeSurnameChange>>.unmodifiable({
       for (final entry in generic.entries)
         entry.key: Map<String, TreeSurnameChange>.unmodifiable(entry.value),

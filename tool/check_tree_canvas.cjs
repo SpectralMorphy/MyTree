@@ -2121,8 +2121,8 @@ async function surnameSearch(page, seeded, label) {
     const snapshot = await options.nth(index).ariaSnapshot();
     return JSON.parse(snapshot.match(/^- button (".*")/m)[1]);
   }));
-  assert.deepEqual(labels, ['Вера Иванова, ?–?', 'Павел Иванов, 1950–н.в.',
-    'Борис Иванов, 1979–н.в.', 'Анна Иванова, 1985–н.в.'], 'Search must put unknown birth first, then ascending date/name/ID.');
+  assert.deepEqual(labels, ['Вера Иванова, ?–?', 'Павел Иванов, 1950–н.в',
+    'Борис Иванов, 1979–н.в', 'Анна Иванова, 1985–н.в'], 'Search must put unknown birth first, then ascending date/name/ID.');
   assert.doesNotMatch(await body(page), /до замужества|Сидоров/, 'Search still exposed a legacy maiden caption.');
   await page.screenshot({ path: path.join(output, `${label}-surname-search-unknown-first.png`), animations: 'disabled' });
   await searchOption(page, 'Борис Иванов').click();
@@ -2138,7 +2138,7 @@ async function surnameSearch(page, seeded, label) {
   const canonical = searchOption(page, 'Анна Иванова');
   await canonical.waitFor();
   assert.equal(JSON.parse((await canonical.ariaSnapshot()).match(/^- button (".*")/m)[1]),
-    'Анна Иванова, 1985–н.в.', 'Search must expose only the canonical full name and years.');
+    'Анна Иванова, 1985–н.в', 'Search must expose only the canonical full name and years.');
   await canonical.click();
   await settle(page);
   assert.deepEqual(await history(page, seeded), before, 'Search/browsing appended an edit.');
@@ -3882,6 +3882,7 @@ async function stepParentKinshipFrame(page, seeded, title, portrait, focus) {
     // Reuse kinshipFollowup's real cousin palette/filter and clean wash patches.
     const styles = ids.map((id) => {
       const saturation = id === normalFather ? 1 : id === 'elena' ? 0 : .35;
+      const neutralBlock = id === stepParent || id === 'elena';
       const box = boxes[id], blockSamples = [];
       for (const x of [1, 3, 8, 12, 16]) for (const y of [18, 24, 30, 42, 48, 54]) {
         blockSamples.push(pixel(box.x + x, box.y + y));
@@ -3894,7 +3895,7 @@ async function stepParentKinshipFrame(page, seeded, title, portrait, focus) {
           rgb.map((channel, c) => Math.abs(channel - photos.nikita[index][c])))),
         ring: [[25, 30], [25, 36], [26, 42], [81, 30], [82, 36]].map(([x, y]) => pixel(box.x + x, box.y + y)),
         expectedRing: rgb.map((channel) => grey * (1 - saturation) + channel * saturation),
-        expectedBlock: blend(id === 'elena' ? [104, 108, 101] : [133, 136, 74], saturation === .35 ? .14 : .24) };
+        expectedBlock: blend(neutralBlock ? [104, 108, 101] : [133, 136, 74], neutralBlock || saturation === 1 ? .24 : .14) };
     });
     return { background, normalChroma, styles };
   }, { base64: png.toString('base64'), boxes, normalFather, stepParent });
@@ -4094,6 +4095,7 @@ const alignAll = (page) => page.getByRole('button', { name: /^Выровнять
 async function compactToolbarGeometry(page, label, portrait) {
   const controls = {};
   for (const [name, locator] of [['toggle', toolbarToggle(page, true)], ['mode', trunkPicker(page)], ['align', alignAll(page)],
+    ['name', page.getByRole('button', { name: /Формат имени/ })],
     ['search', treeSearch(page)], ['out', zoomOut(page)], ['reset', zoomReset(page)], ['in', zoomIn(page)]]) {
     assert.equal(await locator.count(), 1, `${label}: expanded ${name} control is missing or duplicated.`);
     controls[name] = await locator.boundingBox();
@@ -4116,9 +4118,9 @@ async function compactToolbarGeometry(page, label, portrait) {
   const zoomWidth = controls.reset.x + controls.reset.width - controls.out.x;
   assert.ok(zoomWidth > 0 && zoomWidth <= 128 + 1,
     `${label}: zoom controls exceed their compact 128px group: ${zoomWidth}px.`);
-  for (const [left, right] of [['out', 'in'], ['in', 'reset'], ['reset', 'search']]) {
+  for (const [left, right] of [['align', 'name'], ['name', 'out'], ['out', 'in'], ['in', 'reset'], ['reset', 'search']]) {
     assert.ok(controls[left].x + controls[left].width <= controls[right].x + 1,
-      `${label}: expected [-][+][percent] followed by the right-hand search field: ${JSON.stringify(controls)}`);
+      `${label}: expected name format, [-][+][percent], then the right-hand search field: ${JSON.stringify(controls)}`);
   }
   assert.ok(controls.search.width >= 48,
     `${label}: compact search has no usable text entry target (${controls.search.width}px).`);

@@ -3233,64 +3233,69 @@ void main() {
     expect(session.tree.person(rootTreePersonId)!.motherId, isNull);
   });
 
-  testWidgets('death date distinguishes living from unknown', (tester) async {
+  testWidgets('death date modal distinguishes living, unknown and a date', (
+    tester,
+  ) async {
+    Future<void> open() async {
+      await tester.tap(find.byKey(const Key('person-death-date')));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('person-death-dialog')), findsOneWidget);
+    }
+
+    Future<void> choose(String mode) async {
+      await open();
+      await tester.tap(find.byKey(Key('person-death-choice-$mode')));
+      await tester.pumpAndSettle();
+    }
+
     session.seed(
       session.tree.setValue(rootTreePersonId, 'birthDate', '1980-05-06'),
     );
     await mount(tester);
-    expect(find.text('06.05.1980 — жив'), findsOneWidget);
-    expect(find.byKey(const Key('person-alive')), findsNothing);
-    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–н.в.');
+    expect(find.text('06.05.1980 — н.в'), findsOneWidget);
+    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–н.в');
     await edit(tester);
-    expect(
-      tester.widget<ChoiceChip>(find.byKey(const Key('person-alive'))).selected,
-      isTrue,
-    );
+    expect(find.byKey(const Key('person-death-choice-ongoing')), findsNothing);
+    expect(find.byTooltip('Убрать дату смерти'), findsNothing);
+    await open();
     expect(
       tester
-          .widget<ChoiceChip>(find.byKey(const Key('person-death-unknown')))
+          .widget<ChoiceChip>(
+            find.byKey(const Key('person-death-choice-ongoing')),
+          )
           .selected,
-      isFalse,
+      isTrue,
     );
-    await tester.tap(find.byKey(const Key('person-death-unknown')));
+    await tester.tap(find.byKey(const Key('person-death-choice-unknown')));
     await tester.pumpAndSettle();
     expect(session.tree.person(rootTreePersonId)!.alive, isFalse);
     expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–?');
     expect(session.operations.single.fieldKey, 'alive');
-    await tester.tap(find.byKey(const Key('person-alive')));
-    await tester.pumpAndSettle();
+    await choose('ongoing');
     expect(session.tree.person(rootTreePersonId)!.alive, isTrue);
-    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–н.в.');
-    await tester.tap(find.byKey(const Key('person-death-date')));
-    await tester.pumpAndSettle();
+    expect(session.tree.person(rootTreePersonId)!.lifeYears, '1980–н.в');
+    await choose('date');
+    expect(find.byType(DatePickerDialog), findsOneWidget);
     await tester.tap(find.text('OK'));
     await tester.pumpAndSettle();
     final dated = session.tree.person(rootTreePersonId)!;
     expect(dated.deathDate, DateTime.utc(1970));
     expect(dated.alive, isNull);
     expect(dated.lifeYears, '1980–1970');
-    expect(
-      tester.widget<ChoiceChip>(find.byKey(const Key('person-alive'))).selected,
-      isFalse,
-    );
+    await open();
+    expect(find.widgetWithText(ChoiceChip, '01.01.1970'), findsOneWidget);
     expect(
       tester
-          .widget<ChoiceChip>(find.byKey(const Key('person-death-unknown')))
+          .widget<ChoiceChip>(find.byKey(const Key('person-death-choice-date')))
           .selected,
-      isFalse,
+      isTrue,
     );
-    await tester.tap(find.byTooltip('Убрать дату смерти'));
+    await tester.tap(find.byKey(const Key('person-death-choice-unknown')));
     await tester.pumpAndSettle();
     final cleared = session.tree.person(rootTreePersonId)!;
     expect(cleared.deathDate, isNull);
     expect(cleared.alive, isFalse);
     expect(cleared.lifeYears, '1980–?');
-    expect(
-      tester
-          .widget<ChoiceChip>(find.byKey(const Key('person-death-unknown')))
-          .selected,
-      isTrue,
-    );
     await tester.tap(find.byKey(const Key('biography-edit-toggle')));
     await tester.pumpAndSettle();
     expect(find.text('06.05.1980 — не известно'), findsOneWidget);
@@ -3302,6 +3307,32 @@ void main() {
       'deathDate',
       'alive',
     ]);
+  });
+
+  testWidgets('cancelling death mode and its calendar writes nothing', (
+    tester,
+  ) async {
+    await mount(tester);
+    await edit(tester);
+    await tester.tap(find.byKey(const Key('person-death-date')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('person-death-choice-date')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('person-death-dialog')), findsOneWidget);
+    expect(
+      tester
+          .widget<ChoiceChip>(
+            find.byKey(const Key('person-death-choice-unknown')),
+          )
+          .selected,
+      isTrue,
+    );
+    await tester.tap(find.text('Отмена'));
+    await tester.pumpAndSettle();
+    expect(session.operations, isEmpty);
+    expect(session.tree.person(rootTreePersonId)!.deathDate, isNull);
   });
 
   testWidgets('descendants cannot be selected as parents', (tester) async {

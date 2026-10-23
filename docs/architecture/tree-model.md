@@ -159,7 +159,7 @@ payloads and do not propagate ordinary parent operations inside components.
 | Room patronymic dictionary | Per-normalized-name LWW nullable `(male, female)` pair; null resets to the built-in dictionary/algorithm. Independent of any person. |
 | Person patronymic | Projection only, from the accepted father's given-name text, room overrides, and child's sex; unknown sex gives an empty string. |
 | Sex | Atomic last-writer-wins (LWW) register; clearing means `unknown`, not `null`. |
-| Birth/death date | Independent nullable LWW registers; strict valid `yyyy-MM-dd` calendar dates, exposed as UTC dates. Nullable bool `alive` is a separate register: `true` is living (`н.в.`), `false` is an unknown death (`?`). Absent `alive` keeps the legacy display: `н.в.` only when a birth date exists and death does not; both missing stays `?–?`. A death date wins over `alive`. |
+| Birth/death date | Independent nullable LWW registers; strict valid `yyyy-MM-dd` calendar dates, exposed as UTC dates. Nullable bool `alive` is a separate register: `true` is living (`н.в`), `false` is an unknown death (`?`). Absent `alive` keeps the legacy display: `н.в` only when a birth date exists and death does not; both missing stays `?–?`. A death date wins over `alive`. |
 | Father/mother | Independent nullable role registers; parent writes materialize across active direct-sibling components, followed by atomic quotient-DAG cycle projection. |
 | Avatar | Nullable LWW photo-ID register; exposed as `null` if that photo is not visible. |
 | Fact color | Independent LWW `#RRGGBB` register; the supplied palette is not a validation restriction. |
@@ -338,7 +338,7 @@ Every wire key below is required, including nullable values; extra/missing keys 
 | `removeSurnameChange` | `personId, itemId` |
 
 `addMarriage.surnameChoices` has exactly the two endpoint IDs as keys and `Choice` values.
-The initial other-endpoint default is a frozen snapshot, not a later whole-pair editable register;
+A nonempty initial other-endpoint surname is a frozen snapshot, not a later whole-pair editable register;
 subsequent updates from either endpoint preserve the other's register. `newPartner` is null or exact
 `{name, sex, birthDate, birthSurname}`. Independent surname IDs are person-scoped; episode IDs are
 room-global. Explicit IDs have the normal 256-UTF-16-unit bound. Reserved implied IDs are
@@ -360,7 +360,7 @@ be empty or multiline, and are at most 1,000 runes (`maxTreeSurnameReasonLength`
 names are trimmed, may be empty, and are bounded
 at 200 runes. Helpers trim reasons/new-partner names; wire decoding requires canonical text. Keeping
 a surname requires a null adopted snapshot. Adoption may have a null snapshot when the partner has
-no surname: that does **not** clear the person's existing surname.
+no surname: that does **not** clear the person's existing surname. Such a null adoption remains unresolved and can use that partner's concrete surname once it becomes available, without rewriting the immutable marriage record.
 
 ### Inference, snapshots, ordering and deletion
 
@@ -372,12 +372,14 @@ start/surname-change date. Other children, deleted children and unknown dates do
 boundary. Either partner may explicitly uncheck adoption; materializing that choice prevents later
 children, renames, or unrelated date edits from restoring the female default.
 
-Explicit adopted surnames are canonical configuration snapshots. Default implied transfers use the
+Nonempty explicit adopted surnames are canonical configuration snapshots. Default implied transfers and unresolved null adoptions use the
 partner's latest **concrete** configuration: birth plus generic changes and persisted explicit-episode
 snapshots, excluding every inferred/default-derived transfer. This two-stage calculation never follows
 spouses' current surnames recursively; female/female unions and marriage loops cannot cycle. A partner
-rename, changed birth surname, death, or deletion does not rewrite an already persisted snapshot.
+rename, changed birth surname, death, or deletion does not rewrite an already persisted nonempty snapshot. Resolved null adoptions never feed back into the concrete-source map, so they cannot create recursive spouse transfers.
 Divorce/death does not roll back a surname; a later explicit change can restore any canonical value.
+
+`TreeDocument.surnameBeforeMarriage(personId, marriageId)` supplies canonical pre-episode captions. It uses the same sorted raw surname candidates, including hidden no-op marriage transfers that still change canonical configuration. An adopting episode uses its exact surname-comparator boundary; a keeping/unresolved episode has an empty sort-only surname key, so same-date surname changes follow it. This marker is never an operation or a projected surname. `TreePerson.nameWithSurname` applies the shared name format without replacing the person's current name or surname.
 
 Surname chronology sorts undated records before dated records; date means actual change/marriage
 start, or the common-child ordering hint for a startless marriage. Ties compare canonical surname text,

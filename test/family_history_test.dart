@@ -117,6 +117,12 @@ Object _view(TreeDocument document) => {
         'alive': p.alive,
         'partners': document.partnersOf(p.id).map((p) => p.id).toList(),
         'marriages': document.marriagesOf(p.id).map(_marriage).toList(),
+        'surnamesBeforeMarriages': {
+          for (final marriage in document.marriagesOf(p.id))
+            marriage.id: _surname(
+              document.surnameBeforeMarriage(p.id, marriage.id),
+            ),
+        },
         'changes': document.surnameChangesOf(p.id).map(_change).toList(),
         'history': [
           for (final row in document.historyOf(p.id))
@@ -240,6 +246,167 @@ void main() {
       );
       _converges(c.events);
     });
+
+    for (final changeSurname in [false, true]) {
+      test(
+        'an initially missing spouse surname resolves without rewriting the marriage; changeSurname=$changeSurname',
+        () {
+          final c = _Client('a');
+          c.person('wife', sex: TreeSex.female, surname: _petrov);
+          final marriage = c.commit(
+            c.doc.addMarriage(
+              'wife',
+              'new-partner',
+              id: 'deferred-surname',
+              newPartner: const TreeNewMarriagePartner(
+                name: 'Иван',
+                sex: TreeSex.male,
+              ),
+              changeSurname: changeSurname,
+            ),
+          );
+          final original = jsonEncode(marriage.toJson());
+          expect(c.doc.person('wife')!.surname, 'Петрова');
+          expect(c.doc.historyOf('wife').single.surnameChange, isNull);
+          c.commit(
+            c.doc.setIndividualSurname(
+              'new-partner',
+              text: 'Иванов',
+              decline: true,
+            ),
+          );
+          final choice = c.doc.marriages.single.surnameChoices['wife']!;
+          expect(choice.changeSurname, changeSurname);
+          expect(choice.adoptedSurname, changeSurname ? _ivanov : null);
+          expect(
+            c.doc.person('wife')!.surname,
+            changeSurname ? 'Иванова' : 'Петрова',
+          );
+          expect(c.doc.person('wife')!.effectiveSurname, _petrov);
+          expect(
+            c.doc.historyOf('wife').single.surnameChange?.surname,
+            changeSurname ? _ivanov : null,
+          );
+          expect(jsonEncode(marriage.toJson()), original);
+          _converges(c.events, expected: c.doc);
+        },
+      );
+    }
+
+    test(
+      'marriage captions use the surname before the episode, not a later name',
+      () {
+        final c = _Client('a');
+        c.person('wife', sex: TreeSex.female, surname: _petrov);
+        c.person('husband', sex: TreeSex.male, surname: _ivanov);
+        c.commit(
+          c.doc.addSurnameChange(
+            'husband',
+            id: 'before',
+            surname: _sidorov,
+            date: DateTime.utc(1980),
+          ),
+        );
+        c.commit(
+          c.doc.addMarriage(
+            'wife',
+            'husband',
+            id: 'marriage',
+            startDate: DateTime.utc(1990),
+            changeSurname: false,
+          ),
+        );
+        c.commit(
+          c.doc.addSurnameChange(
+            'husband',
+            id: 'after',
+            surname: const TreeSurname(text: 'Кузнецов'),
+            date: DateTime.utc(2000),
+          ),
+        );
+        expect(c.doc.surnameBeforeMarriage('husband', 'marriage'), _sidorov);
+        expect(c.doc.surnameBeforeMarriage('wife', 'marriage'), _petrov);
+        expect(c.doc.person('husband')!.surname, 'Кузнецов');
+        expect(c.doc.surnameBeforeMarriage('missing', 'marriage'), isNull);
+        _converges(c.events);
+      },
+    );
+
+    test('surname before marriage retains hidden no-op canonical changes', () {
+      final c = _Client('a');
+      c.person(
+        'husband',
+        sex: TreeSex.male,
+        surname: const TreeSurname(text: 'Иванов'),
+      );
+      c.person('first', sex: TreeSex.female, surname: _ivanov);
+      c.person('second', sex: TreeSex.female, surname: _petrov);
+      c.commit(
+        c.doc.addMarriage(
+          'husband',
+          'first',
+          id: 'first',
+          changeSurname: true,
+          startDate: DateTime.utc(1980),
+        ),
+      );
+      c.commit(
+        c.doc.addMarriage(
+          'husband',
+          'second',
+          id: 'second',
+          changeSurname: false,
+          startDate: DateTime.utc(1990),
+        ),
+      );
+      expect(c.doc.historyOf('husband').first.surnameChange, isNull);
+      expect(c.doc.surnameBeforeMarriage('husband', 'second'), _ivanov);
+      _converges(c.events);
+    });
+
+    test(
+      'premarital surname uses the same dated and undated tie order as changes',
+      () {
+        for (final date in [null, DateTime.utc(1990)]) {
+          for (final adopt in [false, true]) {
+            final c = _Client('a');
+            c.person('husband', sex: TreeSex.male, surname: _ivanov);
+            c.person('wife', sex: TreeSex.female, surname: _sidorov);
+            const earlier = TreeSurname(text: 'А');
+            c.commit(
+              c.doc.addSurnameChange(
+                'husband',
+                id: 'early',
+                surname: earlier,
+                date: date,
+              ),
+            );
+            c.commit(
+              c.doc.addSurnameChange(
+                'husband',
+                id: 'late',
+                surname: const TreeSurname(text: 'Я'),
+                date: date,
+              ),
+            );
+            c.commit(
+              c.doc.addMarriage(
+                'husband',
+                'wife',
+                id: 'same-date',
+                changeSurname: adopt,
+                startDate: date,
+              ),
+            );
+            expect(
+              c.doc.surnameBeforeMarriage('husband', 'same-date'),
+              adopt ? earlier : _ivanov,
+            );
+            _converges(c.events);
+          }
+        }
+      },
+    );
 
     test('common accepted live children imply one stable undated marriage', () {
       final c = _Client('a');

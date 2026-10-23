@@ -3521,7 +3521,7 @@ void main() {
         final layout = family.layout(rootTreePersonId, mode);
         for (final id in ['nekto', 'stepmother', 'childless-stepparent']) {
           expect(layout.positions[id]!.emphasis, TreeEmphasis.cousin);
-          expect(_blockFor(layout, id).emphasis, TreeEmphasis.cousin);
+          expect(_blockFor(layout, id).emphasis, TreeEmphasis.distant);
           expect(layout.trunkIds, isNot(contains(id)));
         }
         for (final id in ['natalia', 'oleg', 'anastasia', 'paternal-half']) {
@@ -3557,6 +3557,40 @@ void main() {
         TreeEmphasis.cousin,
       );
     });
+
+    for (final sharedParents in [false, true]) {
+      test(
+        'stepparent retains blood-relative block emphasis; sharedParents=$sharedParents',
+        () {
+          final family = _Family()
+            ..add('grandfather')
+            ..add('grandmother')
+            ..add('other-grandmother')
+            ..add('father')
+            ..add('mother')
+            ..add('uncle')
+            ..parents('father', father: 'grandfather', mother: 'grandmother')
+            ..parents(
+              'uncle',
+              father: 'grandfather',
+              mother: sharedParents ? 'grandmother' : 'other-grandmother',
+            )
+            ..parents(rootTreePersonId, father: 'father', mother: 'mother');
+          family._apply(
+            family.document.addMarriage('mother', 'uncle', id: 'step-marriage'),
+          );
+          for (final mode in TreeTrunkMode.values) {
+            final layout = family.layout(rootTreePersonId, mode);
+            expect(layout.positions['uncle']!.emphasis, TreeEmphasis.cousin);
+            expect(
+              _blockFor(layout, 'uncle').emphasis,
+              sharedParents ? TreeEmphasis.normal : TreeEmphasis.cousin,
+            );
+            _expectNoOverlap(layout);
+          }
+        },
+      );
+    }
 
     test('parents and stepparents keep unrelated sibling blocks outside', () {
       _Family make(bool reverse) {

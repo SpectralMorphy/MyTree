@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import '../room_session.dart';
 import '../tree/tree_document.dart';
+import 'person_dates.dart';
 import 'person_family_history.dart';
 
 const _leaf = Color(0xFF53765B);
@@ -173,9 +174,13 @@ class _PersonBiographyState extends State<PersonBiography> {
     if (mounted) setState(() => _binding = false);
   }
 
-  Future<void> _date(TreePerson person, {required bool birth}) async {
+  Future<void> _date(
+    TreePerson person, {
+    required bool birth,
+    DateTime? chosenDate,
+  }) async {
     final current = birth ? person.birthDate : person.deathDate;
-    final picked = await _pickDate(context, current);
+    final picked = chosenDate ?? await pickPersonDate(context, current);
     if (picked == null || !mounted) return;
     await _act(() async {
       final session = widget.session;
@@ -214,21 +219,26 @@ class _PersonBiographyState extends State<PersonBiography> {
     });
   }
 
-  Future<void> _clearDeathDate(TreePerson person) async {
-    await _act(() async {
-      final session = widget.session;
-      if (session.tree.person(person.id)?.deathDate != null) {
-        await session.applyTreeOperation(
-          session.tree.setValue(person.id, 'deathDate', null),
-        );
+  Future<void> _chooseDeathDate(TreePerson person) async {
+    final value = await showPersonEndDateDialog(
+      context,
+      value: (
+        mode: person.deathDate != null
+            ? PersonEndDateMode.date
+            : _shownAlive(person) == true
+            ? PersonEndDateMode.ongoing
+            : PersonEndDateMode.unknown,
+        date: person.deathDate,
+      ),
+    );
+    if (value == null || !mounted || !widget.session.canEdit) return;
+    if (value.mode == PersonEndDateMode.date) {
+      if (value.date != null) {
+        await _date(person, birth: false, chosenDate: value.date);
       }
-      // Removing a date must not imply the person is alive.
-      if (session.tree.person(person.id)?.alive != false) {
-        await session.applyTreeOperation(
-          session.tree.setValue(person.id, 'alive', false),
-        );
-      }
-    });
+    } else {
+      await _markAlive(person, alive: value.mode == PersonEndDateMode.ongoing);
+    }
   }
 
   void _album() {
@@ -715,59 +725,28 @@ class _PersonBiographyState extends State<PersonBiography> {
     );
   }
 
-  /// Null when a death date is set, so neither choice looks selected.
-  /// Legacy records with only a birth date still read as living.
+  /// A date takes precedence; legacy birth-only records still read as living.
   bool? _shownAlive(TreePerson person) {
     if (person.deathDate != null) return null;
     return person.alive ?? person.birthDate != null;
   }
 
   Widget _deathDate(TreePerson person) {
-    final shown = _shownAlive(person);
     final date = person.deathDate;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    final label = date != null
+        ? _dateLabel(date)
+        : _shownAlive(person) == true
+        ? 'Жив'
+        : 'Не известно';
+    return Row(
       children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            ChoiceChip(
-              key: const Key('person-alive'),
-              label: const Text('Жив'),
-              selected: shown == true,
-              onSelected: (_) => _markAlive(person, alive: true),
-            ),
-            ChoiceChip(
-              key: const Key('person-death-unknown'),
-              label: const Text('Не известно'),
-              selected: shown == false,
-              onSelected: (_) => _markAlive(person, alive: false),
-            ),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              child: OutlinedButton.icon(
-                key: const Key('person-death-date'),
-                onPressed: () => _date(person, birth: false),
-                icon: const Icon(Icons.calendar_today_outlined, size: 18),
-                label: Text(
-                  date == null
-                      ? 'Дата смерти'
-                      : 'Дата смерти: ${_dateLabel(date)}',
-                ),
-              ),
-            ),
-            if (date != null)
-              IconButton(
-                tooltip: 'Убрать дату смерти',
-                onPressed: () => _clearDeathDate(person),
-                icon: const Icon(Icons.clear, size: 18),
-              ),
-          ],
+        Expanded(
+          child: OutlinedButton.icon(
+            key: const Key('person-death-date'),
+            onPressed: () => _chooseDeathDate(person),
+            icon: const Icon(Icons.calendar_today_outlined, size: 18),
+            label: Text('Дата смерти: $label'),
+          ),
         ),
       ],
     );
@@ -2389,16 +2368,7 @@ String _lifeDates(TreePerson person) {
   final death = person.deathDate != null
       ? _dateLabel(person.deathDate!)
       : living == true
-      ? 'жив'
+      ? 'н.в'
       : 'не известно';
   return '$birth — $death';
 }
-
-Future<DateTime?> _pickDate(BuildContext context, DateTime? current) =>
-    showDatePicker(
-      context: context,
-      initialDate: current ?? DateTime(1970),
-      firstDate: DateTime(1),
-      lastDate: DateTime(9999, 12, 31),
-      helpText: 'Выберите дату',
-    );

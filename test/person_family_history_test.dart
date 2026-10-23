@@ -163,25 +163,94 @@ Future<void> _existing(WidgetTester tester) async {
   await _tap(tester, find.byKey(const Key('marriage-pick-from-tree')));
 }
 
-Future<void> _date(WidgetTester tester, {bool end = false}) async {
-  await _tap(
-    tester,
-    find.byKey(Key(end ? 'history-end-date' : 'history-start-date')),
-  );
+Future<void> _date(WidgetTester tester) async {
+  await _tap(tester, find.byKey(const Key('history-start-date')));
   await tester.tap(find.text('OK'));
   await tester.pumpAndSettle();
 }
 
 Future<void> _endMode(WidgetTester tester, String text) async {
-  await _tap(tester, find.byType(DropdownButtonFormField<TreeMarriageEndMode>));
-  await tester.tap(find.text(text).last);
-  await tester.pumpAndSettle();
+  await _tap(tester, find.widgetWithText(ChoiceChip, text));
+  if (text == 'Дата') {
+    expect(find.byType(DatePickerDialog), findsOneWidget);
+    await tester.tap(find.text('OK'));
+    await tester.pumpAndSettle();
+  }
 }
 
 String _entryIdentity(TreeFamilyHistoryEntry entry) =>
     '${entry.marriage != null ? 'marriage' : 'surnameChange'}-${entry.id}';
 
 void main() {
+  for (final editing in [false, true]) {
+    testWidgets('unchanged birth surname is not repeated; editing=$editing', (
+      tester,
+    ) async {
+      final session = _family();
+      await _mount(tester, session, editing: editing);
+      expect(
+        find.byKey(const Key('family-history-birth-surname')),
+        findsNothing,
+      );
+      expect(find.text('Сидорова'), findsNothing);
+      expect(find.text('при рождении'), findsNothing);
+      expect(session.operations, isEmpty);
+    });
+  }
+
+  testWidgets(
+    'inherited birth surname precedes changes and disappears after the last removal',
+    (tester) async {
+      final session = _family();
+      final tree = session.tree;
+      session.seed(tree.setIndividualSurname(rootTreePersonId, text: null));
+      session.seed(
+        tree.createPerson('father', name: 'Пётр', sex: TreeSex.male),
+      );
+      session.seed(
+        tree.setIndividualSurname('father', text: 'Петров', decline: true),
+      );
+      session.seed(tree.setValue(rootTreePersonId, 'fatherId', 'father'));
+      session.seed(
+        tree.addSurnameChange(
+          rootTreePersonId,
+          id: 'change',
+          surname: const TreeSurname(text: 'Седых'),
+          reason: 'По желанию',
+        ),
+      );
+      await _mount(tester, session, editing: true);
+      final birth = find.byKey(const Key('family-history-birth-surname'));
+      expect(
+        find.descendant(of: birth, matching: find.text('Петрова')),
+        findsOneWidget,
+      );
+      expect(find.text('при рождении'), findsOneWidget);
+      expect(
+        tester.getRect(birth).bottom,
+        lessThanOrEqualTo(tester.getRect(find.text('Седых')).top),
+      );
+      expect(
+        find.descendant(of: birth, matching: find.byType(IconButton)),
+        findsNothing,
+      );
+      expect(session.operations, isEmpty);
+      await _tap(
+        tester,
+        find.byKey(
+          const ValueKey('delete-family-history-surnameChange-change'),
+        ),
+      );
+      await _tap(
+        tester,
+        find.byKey(const Key('confirm-delete-family-history')),
+      );
+      expect(find.text('при рождении'), findsNothing);
+      expect(birth, findsNothing);
+      expect(session.operations.single.type, 'removeSurnameChange');
+    },
+  );
+
   testWidgets(
     'inferred marriage has no displayed child-derived date; names browse in both modes',
     (tester) async {
@@ -192,6 +261,8 @@ void main() {
       await _mount(tester, session, nameMode: mode, onSelect: selected.add);
       expect(find.text('Брак с '), findsOneWidget);
       expect(find.text('Иван Иванов'), findsOneWidget);
+      expect(find.text('Сидорова'), findsOneWidget);
+      expect(find.text('при рождении'), findsOneWidget);
       expect(find.textContaining('03.02.2000'), findsNothing);
       await tester.tap(find.text('Иван Иванов'));
       expect(selected, ['partner']);
@@ -220,8 +291,10 @@ void main() {
         find.byKey(const ValueKey('family-history-surname-marriage-marriage')),
         findsNothing,
       );
-      expect(find.text(' (05.04.1990 — ?)'), findsOneWidget);
+      expect(find.text('(05.04.1990 — ?)'), findsOneWidget);
       expect(find.text('Иванова'), findsNothing);
+      expect(find.text('Сидорова'), findsNothing);
+      expect(find.text('при рождении'), findsNothing);
       expect(session.operations, isEmpty);
     },
   );
@@ -241,15 +314,93 @@ void main() {
         ),
       );
       await _mount(tester, session);
-      expect(find.text(' (01.01.1990 — н.в.)'), findsOneWidget);
+      expect(find.text('(01.01.1990 — н.в)'), findsOneWidget);
       session.seed(session.tree.setValue('partner', 'alive', false));
       session.refresh();
       await tester.pumpAndSettle();
-      expect(find.text(' (01.01.1990 — пожизненно)'), findsOneWidget);
+      expect(find.text('(01.01.1990 — ?)'), findsOneWidget);
       session.seed(session.tree.setValue('partner', 'deathDate', '2020-06-07'));
       session.refresh();
       await tester.pumpAndSettle();
-      expect(find.text(' (01.01.1990 — 07.06.2020)'), findsOneWidget);
+      expect(find.text('(01.01.1990 — 07.06.2020)'), findsOneWidget);
+      session.seed(
+        session.tree.setValue(rootTreePersonId, 'deathDate', '2018-03-04'),
+      );
+      session.refresh();
+      await tester.pumpAndSettle();
+      expect(find.text('(01.01.1990 — 04.03.2018)'), findsOneWidget);
+      expect(session.operations, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'marriage caption keeps premarital surname and puts period below on the right',
+    (tester) async {
+      final session = _family();
+      final tree = session.tree;
+      session.seed(
+        tree.addMarriage(
+          rootTreePersonId,
+          'partner',
+          id: 'period',
+          changeSurname: false,
+          startDate: DateTime.utc(1990),
+        ),
+      );
+      session.seed(
+        tree.addSurnameChange(
+          'partner',
+          id: 'later',
+          surname: const TreeSurname(text: 'Петров', decline: true),
+          date: DateTime.utc(2000),
+        ),
+      );
+      await _mount(tester, session);
+      expect(find.text('Иван Иванов'), findsOneWidget);
+      expect(find.text('Иван Петров'), findsNothing);
+      final range = find.byKey(const ValueKey('marriage-range-period'));
+      expect(tester.widget<Text>(range).textAlign, TextAlign.right);
+      expect(
+        tester.getRect(range).top,
+        greaterThanOrEqualTo(
+          tester
+              .getRect(find.byKey(const ValueKey('marriage-partner-period')))
+              .bottom,
+        ),
+      );
+      expect(tester.widget<Text>(range).data, '(01.01.1990 — ?)');
+      expect(session.operations, isEmpty);
+    },
+  );
+
+  testWidgets(
+    'marriage date pill opens calendar immediately and cancellation keeps the mode',
+    (tester) async {
+      final session = _family();
+      await _mount(tester, session, editing: true);
+      await _tap(tester, find.byKey(const Key('add-marriage')));
+      await _tap(tester, find.byKey(const Key('history-end-date')));
+      expect(find.byType(DatePickerDialog), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<ChoiceChip>(find.byKey(const Key('history-end-unknown')))
+            .selected,
+        isTrue,
+      );
+      expect(
+        find
+            .byType(OutlinedButton)
+            .evaluate()
+            .any(
+              (element) =>
+                  (element.widget.key == const Key('history-end-date')),
+            ),
+        isFalse,
+      );
+      await _tap(tester, find.text('Отмена'));
+      expect(session.operations, isEmpty);
     },
   );
 
@@ -267,7 +418,7 @@ void main() {
         ),
       );
       await _mount(tester, session);
-      expect(find.textContaining('н.в.'), findsNothing);
+      expect(find.textContaining('н.в'), findsNothing);
       expect(find.textContaining('('), findsNothing);
     },
   );
@@ -302,11 +453,13 @@ void main() {
       );
       expect(
         tester
-            .widget<DropdownButtonFormField<TreeMarriageEndMode>>(
-              find.byType(DropdownButtonFormField<TreeMarriageEndMode>),
-            )
-            .initialValue,
-        TreeMarriageEndMode.unknown,
+            .widget<ChoiceChip>(find.byKey(const Key('history-end-unknown')))
+            .selected,
+        isTrue,
+      );
+      expect(
+        find.byType(DropdownButtonFormField<TreeMarriageEndMode>),
+        findsNothing,
       );
       await _existing(tester);
       expect(picks, 1);
@@ -362,6 +515,102 @@ void main() {
       expect(session.operations, isEmpty);
     });
   }
+
+  for (final (sex, expected) in [
+    (TreeSex.female, TreeSex.male),
+    (TreeSex.male, TreeSex.female),
+    (TreeSex.unknown, TreeSex.unknown),
+  ]) {
+    testWidgets('new spouse defaults to opposite sex of $sex', (tester) async {
+      final session = _family(sex: sex);
+      await _mount(tester, session, editing: true);
+      await _tap(tester, find.byKey(const Key('add-marriage')));
+      final field = find.byType(DropdownButtonFormField<TreeSex>);
+      expect(
+        tester.widget<DropdownButtonFormField<TreeSex>>(field).initialValue,
+        expected,
+      );
+      await tester.enterText(
+        find.byKey(const Key('marriage-new-name')),
+        'Супруг',
+      );
+      await _tap(tester, _save);
+      final marriage = session.tree.marriagesOf(rootTreePersonId).single;
+      final partner = session.tree.person(
+        marriage.otherPersonId(rootTreePersonId)!,
+      )!;
+      expect(partner.sex, expected);
+      expect(session.operations.single.type, 'addMarriage');
+    });
+  }
+
+  testWidgets('new spouse sex draft survives source switching', (tester) async {
+    final session = _family();
+    await _mount(tester, session, editing: true);
+    await _tap(tester, find.byKey(const Key('add-marriage')));
+    final field = find.byType(DropdownButtonFormField<TreeSex>);
+    await _tap(tester, field);
+    await tester.tap(find.text('Пол не указан').last);
+    await tester.pumpAndSettle();
+    await _tap(tester, find.widgetWithText(ChoiceChip, 'Из дерева'));
+    await _tap(tester, find.widgetWithText(ChoiceChip, 'Новый человек'));
+    expect(
+      tester.widget<DropdownButtonFormField<TreeSex>>(field).initialValue,
+      TreeSex.unknown,
+    );
+    await _tap(tester, find.text('Отмена'));
+    expect(session.operations, isEmpty);
+  });
+
+  testWidgets(
+    'marriage surname appears when a new spouse gets their initially missing surname',
+    (tester) async {
+      final session = _family();
+      await _mount(tester, session, editing: true);
+      await _tap(tester, find.byKey(const Key('add-marriage')));
+      await tester.enterText(
+        find.byKey(const Key('marriage-new-name')),
+        'Пётр',
+      );
+      await _tap(tester, _save);
+      final marriage = session.tree.marriagesOf(rootTreePersonId).single;
+      final partnerId = marriage.otherPersonId(rootTreePersonId)!;
+      expect(marriage.surnameChoices[rootTreePersonId]!.changeSurname, isTrue);
+      expect(marriage.surnameChoices[rootTreePersonId]!.adoptedSurname, isNull);
+      final original = session.records.single.text;
+      await session.applyTreeOperation(
+        session.tree.setIndividualSurname(
+          partnerId,
+          text: 'Петров',
+          decline: true,
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Петрова'), findsOneWidget);
+      expect(find.text('Сидорова'), findsOneWidget);
+      expect(find.text('при рождении'), findsOneWidget);
+      final entry = session.tree.historyOf(rootTreePersonId).single;
+      expect(entry.surnameChange!.changesSurname, isTrue);
+      expect(session.records.first.text, original);
+      await _tap(
+        tester,
+        find.byKey(ValueKey('edit-family-history-${_entryIdentity(entry)}')),
+      );
+      expect(
+        tester
+            .widget<CheckboxListTile>(
+              find.byKey(const Key('marriage-change-surname')),
+            )
+            .value,
+        isTrue,
+      );
+      await _tap(tester, find.text('Отмена'));
+      expect(session.operations.map((operation) => operation.type), [
+        'addMarriage',
+        'setSurname',
+      ]);
+    },
+  );
 
   testWidgets(
     'new partner name sex DOB and canonical surname snapshot save atomically',
@@ -480,6 +729,8 @@ void main() {
       await _date(tester);
       await _tap(tester, _save);
       expect(find.text('Леснойа'), findsOneWidget);
+      expect(find.text('Сидорова'), findsOneWidget);
+      expect(find.text('при рождении'), findsOneWidget);
       expect(find.text('01.01.1970'), findsOneWidget);
       expect(find.text('По желанию'), findsOneWidget);
       expect(
@@ -708,6 +959,8 @@ void main() {
         findsNothing,
       );
       expect(find.text('Уточнение записи'), findsOneWidget);
+      expect(find.text('при рождении'), findsNothing);
+      expect(find.text('Сидорова'), findsNothing);
       expect(find.textContaining('01.01.2001'), findsNothing);
       await _tap(
         tester,
@@ -749,7 +1002,7 @@ void main() {
         ),
       );
       await _mount(tester, session);
-      expect(find.text(' (? — 01.01.1980)'), findsOneWidget);
+      expect(find.text('(? — 01.01.1980)'), findsOneWidget);
       final entries = session.tree.historyOf(rootTreePersonId);
       expect(
         tester
@@ -971,7 +1224,16 @@ void main() {
           'Очень длинное имя нового человека',
         );
         await _endMode(tester, 'Дата');
-        await _date(tester, end: true);
+        expect(find.widgetWithText(ChoiceChip, '01.01.1970'), findsOneWidget);
+        final chips = [
+          for (final mode in ['date', 'ongoing', 'unknown'])
+            tester.getRect(find.byKey(Key('history-end-$mode'))),
+        ];
+        expect(chips.map((rect) => rect.center.dy).toSet(), hasLength(1));
+        expect(
+          find.byType(DropdownButtonFormField<TreeMarriageEndMode>),
+          findsNothing,
+        );
         await _tap(tester, find.byKey(const Key('marriage-change-surname')));
         expect(tester.takeException(), isNull);
         await _tap(tester, find.text('Отмена'));

@@ -410,7 +410,7 @@ void main() {
       expect(person.name, '  Анна Ивановна  ');
       expect(person.surname, 'Иванова');
       expect(person.fullName, 'Анна Ивановна Иванова');
-      expect(person.lifeYears, '1980–н.в.');
+      expect(person.lifeYears, '1980–н.в');
       expect(TreePerson(id: 'empty').fullName, 'Без имени');
       expect(TreePerson(id: 'empty').lifeYears, '?–?');
       expect(
@@ -433,7 +433,7 @@ void main() {
         ).lifeYears,
         '1980–?',
       );
-      expect(TreePerson(id: 'living', alive: true).lifeYears, '?–н.в.');
+      expect(TreePerson(id: 'living', alive: true).lifeYears, '?–н.в');
       expect(
         TreePerson(
           id: 'dated',
@@ -467,7 +467,7 @@ void main() {
         );
         client.commit(client.doc.setValue(root, 'birthDate', '1980-01-01'));
         expect(client.doc.person(root)!.alive, isNull);
-        expect(client.doc.person(root)!.lifeYears, '1980–н.в.');
+        expect(client.doc.person(root)!.lifeYears, '1980–н.в');
         client.commit(client.doc.setValue(root, 'alive', false));
         expect(client.doc.person(root)!.alive, isFalse);
         expect(client.doc.person(root)!.lifeYears, '1980–?');
@@ -476,7 +476,7 @@ void main() {
         client.commit(client.doc.setValue(root, 'alive', null));
         client.commit(client.doc.setValue(root, 'deathDate', null));
         expect(client.doc.person(root)!.alive, isNull);
-        expect(client.doc.person(root)!.lifeYears, '1980–н.в.');
+        expect(client.doc.person(root)!.lifeYears, '1980–н.в');
         _converges(client.events);
       },
     );

@@ -607,7 +607,7 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('Анна Старая'), findsNothing);
     expect(find.text('Анна Новая'), findsOneWidget);
-    expect(find.text('1900–н.в.'), findsOneWidget);
+    expect(find.text('1900–н.в'), findsOneWidget);
     expect(_option('new'), findsOneWidget);
     expect(
       tester.getTopLeft(_option('new')).dy,

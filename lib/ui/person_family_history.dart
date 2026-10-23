@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../room_identity.dart';
 import '../room_session.dart';
 import '../tree/tree_document.dart';
+import 'person_dates.dart';
 
 /// The biography supplies navigation; history forms do not depend on the canvas.
 class PersonFamilyHistory extends StatefulWidget {
@@ -133,6 +134,10 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
       final person = tree.person(widget.personId);
       if (person == null) return const SizedBox.shrink();
       final entries = tree.historyOf(person.id);
+      final birthSurname = person.effectiveSurname;
+      final hasSurnameChanges = entries.any(
+        (entry) => entry.surnameChange?.changesSurname ?? false,
+      );
       final editing = widget.editing && widget.session.canEdit;
       return Column(
         key: const Key('person-family-history'),
@@ -173,6 +178,21 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
                 style: TextStyle(
                   color: Theme.of(context).colorScheme.onSurfaceVariant,
                 ),
+              ),
+            ),
+          if (birthSurname != null && hasSurnameChanges)
+            Padding(
+              key: const Key('family-history-birth-surname'),
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    birthSurname.formForSex(person.sex),
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const Text('при рождении'),
+                ],
               ),
             ),
           for (final entry in entries)
@@ -250,28 +270,44 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
       marriage.otherPersonId(person.id) ?? '',
     );
     final range = _marriageRange(marriage, person, partner);
-    return Wrap(
-      crossAxisAlignment: WrapCrossAlignment.center,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Text('Брак с '),
-        if (partner == null)
-          const Text('Удалённый человек')
-        else
-          Semantics(
-            button: true,
-            child: InkWell(
-              key: ValueKey('marriage-partner-${marriage.id}'),
-              onTap: () => widget.onSelect(partner.id),
-              child: Text(
-                partner.nameForMode(widget.nameMode.value),
-                style: TextStyle(
-                  color: Theme.of(context).colorScheme.primary,
-                  decoration: TextDecoration.underline,
+        Wrap(
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            const Text('Брак с '),
+            if (partner == null)
+              const Text('Удалённый человек')
+            else
+              Semantics(
+                button: true,
+                child: InkWell(
+                  key: ValueKey('marriage-partner-${marriage.id}'),
+                  onTap: () => widget.onSelect(partner.id),
+                  child: Text(
+                    partner.nameWithSurname(
+                      widget.nameMode.value,
+                      widget.session.tree.surnameBeforeMarriage(
+                        partner.id,
+                        marriage.id,
+                      ),
+                    ),
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.primary,
+                      decoration: TextDecoration.underline,
+                    ),
+                  ),
                 ),
               ),
-            ),
+          ],
+        ),
+        if (range.isNotEmpty)
+          Text(
+            '($range)',
+            key: ValueKey('marriage-range-${marriage.id}'),
+            textAlign: TextAlign.right,
           ),
-        if (range.isNotEmpty) Text(' ($range)'),
       ],
     );
   }
@@ -297,10 +333,8 @@ String _marriageRange(
   final alive = person.alive == true && partner?.alive == true;
   final end = endDate != null
       ? _dateLabel(endDate)
-      : marriage.endMode == TreeMarriageEndMode.lifelong
-      ? alive
-            ? 'н.в.'
-            : 'пожизненно'
+      : marriage.endMode == TreeMarriageEndMode.lifelong && alive
+      ? 'н.в'
       : '?';
   return '$start — $end';
 }
@@ -446,6 +480,11 @@ class _FamilyHistoryDialogState extends State<_FamilyHistoryDialog> {
   void initState() {
     super.initState();
     final person = widget.session.tree.person(widget.personId);
+    _sex = switch (person?.sex) {
+      TreeSex.female => TreeSex.male,
+      TreeSex.male => TreeSex.female,
+      _ => TreeSex.unknown,
+    };
     final marriage = widget.entry?.marriage;
     final change = widget.entry?.surnameChange;
     _id = widget.entry?.id ?? 'history-${createRoomId()}';
@@ -647,33 +686,21 @@ class _FamilyHistoryDialogState extends State<_FamilyHistoryDialog> {
     }
   }
 
-  Future<void> _pickDate({bool end = false}) async {
+  Future<void> _pickDate() async {
     if (!_enabled) return;
-    final date = await pickFamilyHistoryDate(context, end ? _end : _date);
-    if (date != null && mounted) {
-      setState(() {
-        if (end) {
-          _end = date;
-        } else {
-          _date = date;
-        }
-      });
-    }
+    final date = await pickPersonDate(context, _date);
+    if (date != null && mounted) setState(() => _date = date);
   }
 
-  Widget _dateField({bool end = false}) {
-    final date = end ? _end : _date;
-    final label = end
-        ? 'Дата окончания'
-        : widget.marriage
-        ? 'Дата начала'
-        : 'Дата смены фамилии';
+  Widget _dateField() {
+    final date = _date;
+    final label = widget.marriage ? 'Дата начала' : 'Дата смены фамилии';
     return Row(
       children: [
         Expanded(
           child: OutlinedButton.icon(
-            key: Key(end ? 'history-end-date' : 'history-start-date'),
-            onPressed: _enabled ? () => _pickDate(end: end) : null,
+            key: const Key('history-start-date'),
+            onPressed: _enabled ? _pickDate : null,
             icon: const Icon(Icons.calendar_today_outlined),
             label: Text(date == null ? label : '$label: ${_dateLabel(date)}'),
           ),
@@ -681,15 +708,7 @@ class _FamilyHistoryDialogState extends State<_FamilyHistoryDialog> {
         if (date != null)
           IconButton(
             tooltip: 'Убрать дату',
-            onPressed: !_enabled
-                ? null
-                : () => setState(() {
-                    if (end) {
-                      _end = null;
-                    } else {
-                      _date = null;
-                    }
-                  }),
+            onPressed: !_enabled ? null : () => setState(() => _date = null),
             icon: const Icon(Icons.clear),
           ),
       ],
@@ -806,40 +825,33 @@ class _FamilyHistoryDialogState extends State<_FamilyHistoryDialog> {
                 _dateField(),
                 if (widget.marriage) ...[
                   const SizedBox(height: 12),
-                  DropdownButtonFormField<TreeMarriageEndMode>(
-                    key: ValueKey('history-end-mode-${_endMode.name}'),
-                    initialValue: _endMode,
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                      labelText: 'Окончание брака',
-                      border: OutlineInputBorder(),
+                  PersonEndDateChoices(
+                    keyPrefix: 'history-end',
+                    value: (
+                      mode: switch (_endMode) {
+                        TreeMarriageEndMode.date => PersonEndDateMode.date,
+                        TreeMarriageEndMode.lifelong =>
+                          PersonEndDateMode.ongoing,
+                        TreeMarriageEndMode.unknown =>
+                          PersonEndDateMode.unknown,
+                      },
+                      date: _end,
                     ),
-                    items: [
-                      for (final mode in TreeMarriageEndMode.values)
-                        DropdownMenuItem(
-                          value: mode,
-                          child: Text(
-                            switch (mode) {
-                              TreeMarriageEndMode.unknown => 'Не известно',
-                              TreeMarriageEndMode.lifelong => 'Пожизненно',
-                              TreeMarriageEndMode.date => 'Дата',
-                            },
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                    ],
+                    ongoingLabel: 'Пожизненно',
                     onChanged: !_enabled
                         ? null
-                        : (mode) => setState(
-                            () =>
-                                _endMode = mode ?? TreeMarriageEndMode.unknown,
-                          ),
+                        : (value) => setState(() {
+                            _end = value.date;
+                            _endMode = switch (value.mode) {
+                              PersonEndDateMode.date =>
+                                TreeMarriageEndMode.date,
+                              PersonEndDateMode.ongoing =>
+                                TreeMarriageEndMode.lifelong,
+                              PersonEndDateMode.unknown =>
+                                TreeMarriageEndMode.unknown,
+                            };
+                          }),
                   ),
-                  if (_endMode == TreeMarriageEndMode.date) ...[
-                    const SizedBox(height: 8),
-                    _dateField(end: true),
-                  ],
                   CheckboxListTile(
                     key: const Key('marriage-change-surname'),
                     value: _changeSurname,
@@ -1031,7 +1043,7 @@ class NewPersonFields extends StatelessWidget {
         onPressed: !enabled || onBirthDateChanged == null
             ? null
             : () async {
-                final date = await pickFamilyHistoryDate(context, birthDate);
+                final date = await pickPersonDate(context, birthDate);
                 if (date != null && context.mounted) onBirthDateChanged!(date);
               },
         icon: const Icon(Icons.calendar_today_outlined),
@@ -1044,17 +1056,6 @@ class NewPersonFields extends StatelessWidget {
     ],
   );
 }
-
-Future<DateTime?> pickFamilyHistoryDate(
-  BuildContext context,
-  DateTime? current,
-) => showDatePicker(
-  context: context,
-  initialDate: current ?? DateTime(1970),
-  firstDate: DateTime(1),
-  lastDate: DateTime(9999, 12, 31),
-  helpText: 'Выберите дату',
-);
 
 String _dateLabel(DateTime date) =>
     '${date.day.toString().padLeft(2, '0')}.${date.month.toString().padLeft(2, '0')}.${date.year.toString().padLeft(4, '0')}';

@@ -866,8 +866,9 @@ void _expectToolbarFits(WidgetTester tester) {
   expect(zoomGroup.width, lessThanOrEqualTo(108));
   expect(zoom[0].right, lessThanOrEqualTo(zoom[2].left + .1));
   expect(zoom[2].right, lessThanOrEqualTo(zoom[1].left + .1));
-  expect(nameMode.left, greaterThanOrEqualTo(zoomGroup.right - .1));
-  expect(search.left, greaterThanOrEqualTo(nameMode.right));
+  expect(nameMode.left, greaterThanOrEqualTo(align.right - .1));
+  expect(zoomGroup.left, greaterThanOrEqualTo(nameMode.right - .1));
+  expect(search.left, greaterThanOrEqualTo(zoomGroup.right));
   expect(search.right, closeTo(toolbar.right - 4, .1));
   for (final control in [search, mode, nameMode, align, ...zoom]) {
     expect(control.center.dy, closeTo(toggle.center.dy, 1));
@@ -1039,6 +1040,15 @@ void main() {
 
           await remoteChange(
             fixture.document.addMarriage(rootTreePersonId, 'Супруг', id: 'own'),
+          );
+          _expectFullColorPhotoNode(tester, 'Супруг', const Color(0xFF28644B));
+          expect(
+            _renderedConnections(
+              tester,
+              _layoutOf(fixture),
+              portrait: portrait,
+            ),
+            curvesBefore,
           );
           await remoteChange(
             fixture.document.addMarriage(
@@ -8763,7 +8773,7 @@ void main() {
             expect(_filterOf(tester, id), _filterOf(tester, 'Кузен-0'));
             expect(
               _washOf(tester, fixture, id),
-              const Color(0xFF85884A).withValues(alpha: .14),
+              const Color(0xFF686C65).withValues(alpha: .24),
             );
           }
           final canvas = tester.getRect(find.byKey(const Key('tree-canvas')));

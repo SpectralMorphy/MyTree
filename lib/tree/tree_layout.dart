@@ -158,7 +158,6 @@ class TreeLayout {
       ],
     }..removeAll(parentIds);
     final cousins = <String>{
-      ...stepparents,
       for (final relative in auntsAndUncles) ...children[relative]!,
       // The same muted family context includes nieces/nephews of full or half
       // siblings. Normal ancestry/descendant emphasis below always wins.
@@ -173,9 +172,12 @@ class TreeLayout {
       ...descendants,
       ...siblings,
     };
-    TreeEmphasis emphasisOf(String id) => normalIds.contains(id)
+    TreeEmphasis emphasisOf(String id, {bool includeStepparents = true}) =>
+        normalIds.contains(id)
         ? TreeEmphasis.normal
-        : cousins.contains(id) || ancestralSiblings.contains(id)
+        : cousins.contains(id) ||
+              ancestralSiblings.contains(id) ||
+              (includeStepparents && stepparents.contains(id))
         ? TreeEmphasis.cousin
         : TreeEmphasis.distant;
 
@@ -185,8 +187,9 @@ class TreeLayout {
       block.people.sort(compareTreePeopleByBirth);
       block.level = ranks[block.people.first.id]!;
       block.trunk = block.people.any((p) => trunkIds.contains(p.id));
+      // Stepparent context changes the card, not an unrelated block's wash.
       block.emphasis = block.people
-          .map((p) => emphasisOf(p.id))
+          .map((p) => emphasisOf(p.id, includeStepparents: false))
           .reduce((a, b) => a.index < b.index ? a : b);
       block.mask = block.people.fold(
         0,
