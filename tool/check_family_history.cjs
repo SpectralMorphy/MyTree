@@ -1,4 +1,4 @@
-// Usage: node tool/check_family_history.cjs <playwright-module> <base-url> <new-artifacts-directory> [local|rtc] [all|toolbar-birth|marriage-ui]
+// Usage: node tool/check_family_history.cjs <playwright-module> <base-url> <new-artifacts-directory> [local|rtc] [all|toolbar-birth|marriage-ui|unknown-sex-ui]
 // Real headless production UI and immutable storage; rtc retains production transports.
 // marriage-ui: loopback/local only, desktop controls/cancellations + full 390px phone scenario, 300-second deadline.
 const assert = require('node:assert/strict');
@@ -8,11 +8,11 @@ const path = require('node:path');
 const [moduleName, base, directory, mode = 'local', scope = 'all'] = process.argv.slice(2);
 assert.ok(moduleName && base && directory);
 assert.ok(['local', 'rtc'].includes(mode));
-assert.ok(['all', 'toolbar-birth', 'marriage-ui'].includes(scope));
+assert.ok(['all', 'toolbar-birth', 'marriage-ui', 'unknown-sex-ui'].includes(scope));
 assert.ok(scope === 'all' || mode === 'local');
 const { chromium } = require(moduleName);
 const output = path.resolve(directory), origin = new URL(base).origin;
-if (scope === 'marriage-ui') assert.ok(['localhost', '127.0.0.1', '[::1]'].includes(new URL(base).hostname),
+if (['marriage-ui', 'unknown-sex-ui'].includes(scope)) assert.ok(['localhost', '127.0.0.1', '[::1]'].includes(new URL(base).hostname),
   'marriage-ui requires a loopback base URL; external requests and WebSockets are blocked.');
 const report = { mode, scope, headless: true, completed: false, steps: [], bundles: [], errors: [], providerErrors: [], handshakes: [], rtc: [] };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -48,8 +48,18 @@ for (const [id, name, last] of [['ivan', 'Иван', 'Иванов'], ['oleg', '
 }
 operation({ type: 'createPerson', personId: 'child', name: 'Алексей', sex: 'male' });
 value('child', 'fatherId', 'ivan');
-if (scope !== 'marriage-ui') value('child', 'motherId', 'root'); // No implied marriage in the narrow fixture.
+if (!['marriage-ui', 'unknown-sex-ui'].includes(scope)) value('child', 'motherId', 'root'); // No implied marriage in narrow fixtures.
 value('child', 'birthDate', '2000-01-01');
+if (scope === 'unknown-sex-ui') {
+  value('root', 'birthDate', '1980-05-06');
+  operation({ type: 'createPerson', personId: 'unknown-spouse', name: 'Сергей', sex: 'unknown' });
+  surname('unknown-spouse', 'Какой-то');
+  operation({ type: 'createPerson', personId: 'unknown-distant', name: 'Сосед', sex: 'unknown' });
+  operation({ type: 'addMarriage', personId: 'root', partnerId: 'unknown-spouse', itemId: 'unknown-marriage',
+    startDate: '2000-01-01', endDate: null, endMode: 'unknown', newPartner: null,
+    surnameChoices: { root: { changeSurname: true, surname: { text: 'Какой-то', decline: true } },
+      'unknown-spouse': { changeSurname: false, surname: null } } });
+}
 
 async function until(check, message, timeout = 30000) {
   const end = Date.now() + timeout;
@@ -322,7 +332,7 @@ async function marriageHistory(page, label, range, { belova = false } = {}) {
   // never try to reveal() the merged history label or assert its misleading bounding box.
   await capture(page, label);
 }
-async function marriageSpousePixels(page, label) {
+async function marriageSpousePixels(page, label, expected = [135, 88, 38]) {
   const root = page.getByRole('button', { name: 'Выбрать Анна', exact: true });
   const spouse = page.getByRole('button', { name: 'Выбрать Сергей', exact: true });
   await root.waitFor(); await spouse.waitFor(); await sleep(250);
@@ -341,8 +351,8 @@ async function marriageSpousePixels(page, label) {
     return [[25, 36], [82, 36], [54, 7], [54, 64]].map(([x, y]) =>
       [...context.getImageData(Math.round(box.x + x), Math.round(box.y + y), 1, 1).data].slice(0, 3));
   }, { png: png.toString('base64'), box: b });
-  assert.ok(pixels.every((sample) => sample.every((channel, index) => Math.abs(channel - [135, 88, 38][index]) <= 14)),
-    `Childless male spouse is desaturated instead of #875826: ${JSON.stringify(pixels)}`);
+  assert.ok(pixels.every((sample) => sample.every((channel, index) => Math.abs(channel - expected[index]) <= 14)),
+    `Childless spouse has the wrong ring color: ${JSON.stringify({ pixels, expected })}`);
   report.steps.push({ name: `${label}-childless-spouse`, root: a, spouse: b, sameRankAxis: rank, pixels });
   await capture(page, `${label}-childless-spouse-semantics`);
 }
@@ -504,6 +514,30 @@ async function marriageUi(page, label, full) {
       });
     }
     await Promise.all(pages.map(load)); await converge(pages);
+    if (scope === 'unknown-sex-ui') {
+      report.coverage = 'Local desktop/phone unknown-sex blue cards, dated birth surname and biography header hierarchy; unchanged journals and real reload, no network synchronization.';
+      const initial = await Promise.all(pages.map(history));
+      for (const [index, page] of pages.entries()) {
+        const label = index ? 'phone' : 'desktop';
+        await marriageSpousePixels(page, `${label}-unknown-sex`, [37, 99, 235]);
+        await openBiography(page);
+        await marriageReady(page, false);
+        await until(async () => /06\.05\.1980\s+Смирнова\s+при рождении/.test(await snapshot(page)), 'Birth surname has no birth-date prefix.', 5000);
+        await capture(page, `${label}-dated-birth-and-headers`);
+        await marriageClose(page);
+        assert.deepEqual(await history(page), initial[index]);
+      }
+      await Promise.all(pages.map(load));
+      for (const [index, page] of pages.entries()) {
+        await marriageSpousePixels(page, `${index ? 'phone' : 'desktop'}-unknown-sex-reload`, [37, 99, 235]);
+        assert.deepEqual(await history(page), initial[index]);
+        verifyJournal(await history(page));
+      }
+      await fs.writeFile(path.join(output, 'synthetic-journals.json'), JSON.stringify(initial, null, 2));
+      report.journals = initial.map((journal) => ({ records: journal.length, sha256: hash(journal) }));
+      report.completed = true;
+      return;
+    }
     if (scope === 'marriage-ui') {
       report.coverage = 'Independent local desktop controls/create/cancel and full 390px phone flow; no RTC/external network. Range line/right alignment and absence of a painted parent line are screenshot evidence, not pixel geometry assertions.';
       const final = [];

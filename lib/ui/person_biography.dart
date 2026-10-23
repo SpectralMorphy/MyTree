@@ -9,6 +9,7 @@ import 'package:flutter/material.dart';
 
 import '../room_session.dart';
 import '../tree/tree_document.dart';
+import 'biography_section.dart';
 import 'person_dates.dart';
 import 'person_family_history.dart';
 
@@ -470,27 +471,26 @@ class _PersonBiographyState extends State<PersonBiography> {
                           editing: editing,
                         ),
                         const SizedBox(height: 24),
-                        Row(
-                          children: [
-                            Expanded(child: _heading('Факты и воспоминания')),
-                            if (editing)
-                              IconButton(
-                                key: const Key('add-fact'),
-                                tooltip: 'Добавить факт',
-                                onPressed: () => _act(
-                                  () => session.applyTreeOperation(
-                                    session.tree.addFact(
-                                      person.id,
-                                      _newId('fact'),
+                        BiographySectionHeader(
+                          title: 'Факты и воспоминания',
+                          trailing: !editing
+                              ? null
+                              : IconButton(
+                                  key: const Key('add-fact'),
+                                  tooltip: 'Добавить факт',
+                                  onPressed: () => _act(
+                                    () => session.applyTreeOperation(
+                                      session.tree.addFact(
+                                        person.id,
+                                        _newId('fact'),
+                                      ),
                                     ),
                                   ),
+                                  icon: const Icon(
+                                    Icons.add_circle_outline,
+                                    color: _leaf,
+                                  ),
                                 ),
-                                icon: const Icon(
-                                  Icons.add_circle_outline,
-                                  color: _leaf,
-                                ),
-                              ),
-                          ],
                         ),
                         const SizedBox(height: 8),
                         if (person.facts.isEmpty)
@@ -555,8 +555,7 @@ class _PersonBiographyState extends State<PersonBiography> {
     return widget.fullScreen ? Scaffold(body: body) : body;
   }
 
-  Widget _heading(String text) =>
-      Text(text, style: Theme.of(context).textTheme.titleMedium);
+  Widget _heading(String text) => BiographySectionHeader(title: text);
 
   Widget _identity(TreePerson person, bool editing) {
     final avatar = person.photos

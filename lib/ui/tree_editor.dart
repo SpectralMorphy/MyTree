@@ -14,6 +14,7 @@ import 'tree_search.dart';
 
 const _maleColor = Color(0xFF875826);
 const _femaleColor = Color(0xFF28644B);
+const _unknownSexColor = Color(0xFF2563EB);
 const _neutralColor = Color(0xFF686C65);
 const _siblingColor = Color(0xFF85884A);
 const _levelPitch = 176.0;
@@ -1687,7 +1688,7 @@ IconData _modeIcon(TreeTrunkMode mode) => switch (mode) {
 Color _sexColor(TreeSex sex) => switch (sex) {
   TreeSex.male => _maleColor,
   TreeSex.female => _femaleColor,
-  TreeSex.unknown => _neutralColor,
+  TreeSex.unknown => _unknownSexColor,
 };
 
 IconData _sexIcon(TreeSex sex) => switch (sex) {
@@ -2186,6 +2187,7 @@ class _TreePersonNode extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final label = person.displayName;
+    final color = _sexColor(person.sex);
     Widget node = Material(
       color: selected
           ? theme.colorScheme.surfaceContainerLowest.withValues(alpha: .5)
@@ -2193,7 +2195,7 @@ class _TreePersonNode extends StatelessWidget {
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(12),
         side: BorderSide(
-          color: selected ? _sexColor(person.sex) : Colors.transparent,
+          color: selected ? color : Colors.transparent,
           width: 1.5,
         ),
       ),
@@ -2206,7 +2208,7 @@ class _TreePersonNode extends StatelessWidget {
           padding: const EdgeInsets.all(_nodeInset),
           child: Column(
             children: [
-              _PersonAvatar(person: person),
+              _PersonAvatar(person: person, color: color),
               const SizedBox(height: 4),
               Expanded(
                 child: Center(
@@ -2229,7 +2231,7 @@ class _TreePersonNode extends StatelessWidget {
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.labelMedium?.copyWith(
-                          color: _sexColor(person.sex),
+                          color: color,
                           height: 1.15,
                           fontWeight: selected
                               ? FontWeight.w700
@@ -2245,7 +2247,8 @@ class _TreePersonNode extends StatelessWidget {
         ),
       ),
     );
-    if (emphasis != TreeEmphasis.normal) {
+    if (emphasis != TreeEmphasis.normal && person.sex != TreeSex.unknown) {
+      // Unknown sex stays visibly blue as an incomplete-data cue.
       // Filter the whole card: photographs and text must fade with the branch,
       // not just its avatar ring. Names remain legible (no opacity reduction).
       node = ColorFiltered(
@@ -2268,9 +2271,10 @@ class _TreePersonNode extends StatelessWidget {
 }
 
 class _PersonAvatar extends StatefulWidget {
-  const _PersonAvatar({required this.person});
+  const _PersonAvatar({required this.person, required this.color});
 
   final TreePerson person;
+  final Color color;
 
   @override
   State<_PersonAvatar> createState() => _PersonAvatarState();
@@ -2322,7 +2326,7 @@ class _PersonAvatarState extends State<_PersonAvatar> {
   @override
   Widget build(BuildContext context) {
     final person = widget.person;
-    final color = _sexColor(person.sex);
+    final color = widget.color;
     final theme = Theme.of(context);
     final fallback = ColoredBox(
       color: Color.alphaBlend(

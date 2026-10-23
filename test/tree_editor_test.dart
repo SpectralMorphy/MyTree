@@ -987,6 +987,70 @@ void main() {
     );
   }
 
+  for (final sex in TreeSex.values) {
+    testWidgets(
+      'unknown-sex cards stay blue for selection $sex without changing identity',
+      (tester) async {
+        final fixture = _Fixture()
+          ..name(rootTreePersonId, 'Фокус')
+          ..add('Андрей')
+          ..add('Сосед')
+          ..apply(TreeDocument().setValue(rootTreePersonId, 'sex', sex.name));
+        fixture.apply(
+          fixture.document.addMarriage(
+            rootTreePersonId,
+            'Андрей',
+            id: 'marriage',
+          ),
+        );
+        final session = _Session(fixture.document);
+        final people = fixture.document.people;
+        await _mount(tester, session);
+        const color = Color(0xFF2563EB);
+        Color nameColor() => tester
+            .widget<Text>(
+              find.descendant(
+                of: _person('Андрей'),
+                matching: find.text('Андрей'),
+              ),
+            )
+            .style!
+            .color!;
+        expect(nameColor(), color);
+        expect(
+          tester
+              .widget<Text>(
+                find.descendant(
+                  of: _person('Андрей'),
+                  matching: find.text('А'),
+                ),
+              )
+              .style!
+              .color,
+          color,
+        );
+        expect(_filterFor('Андрей'), findsNothing);
+        expect(
+          find.descendant(of: _person('Андрей'), matching: find.byType(Icon)),
+          findsNothing,
+        );
+        expect(
+          _washOf(tester, fixture, 'Андрей'),
+          const Color(0xFF686C65).withValues(alpha: .24),
+        );
+        await _selectPerson(tester, 'Сосед');
+        expect(nameColor(), color);
+        expect(_filterFor('Андрей'), findsNothing);
+        await _selectPerson(tester, rootTreePersonId);
+        expect(nameColor(), color);
+        expect(fixture.document.person('Андрей')!.sex, TreeSex.unknown);
+        expect(identical(fixture.document.people, people), isTrue);
+        expect(session.operations, isEmpty);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
   for (final portrait in [false, true]) {
     for (final brightness in Brightness.values) {
       testWidgets(
@@ -1084,9 +1148,17 @@ void main() {
                   spouse,
                   selected == rootTreePersonId
                       ? const Color(0xFF28644B)
-                      : const Color(0xFF686C65),
+                      : const Color(0xFF2563EB),
                 );
-                expect(_filterOf(tester, other), distantFilter);
+                if (selected == rootTreePersonId) {
+                  _expectFullColorPhotoNode(
+                    tester,
+                    other,
+                    const Color(0xFF2563EB),
+                  );
+                } else {
+                  expect(_filterOf(tester, other), distantFilter);
+                }
                 expect(_filterOf(tester, 'Сестра супруга'), distantFilter);
                 expect(
                   layout.positions[spouse]!.emphasis,
@@ -8526,7 +8598,7 @@ void main() {
         final fixture = _family(siblings: 1, children: 1)
           ..add('Дядя', sex: TreeSex.male)
           ..parents('Дядя', father: 'Дед', mother: 'Бабушка')
-          ..add('Кузен')
+          ..add('Кузен', sex: TreeSex.male)
           ..parents('Кузен', father: 'Дядя')
           ..add('Дед матери', sex: TreeSex.male)
           ..add('Бабушка матери', sex: TreeSex.female)
@@ -8557,7 +8629,7 @@ void main() {
           )
           ..add('Полубрат прадеда', sex: TreeSex.male)
           ..parents('Полубрат прадеда', father: 'Прапрадед')
-          ..add('Дальний');
+          ..add('Дальний', sex: TreeSex.male);
         for (final id in ['Дядя', 'Полусестра деда', 'Полубрат прадеда']) {
           fixture.apply(
             fixture.document.addPhoto(id, 'portrait', dataUrl: _png),
@@ -8695,7 +8767,7 @@ void main() {
           ..parents('Племянник от деда', father: 'Дед', mother: 'Сестра-0');
         for (var i = 0; i < 2; i++) {
           fixture
-            ..add('Кузен-$i')
+            ..add('Кузен-$i', sex: TreeSex.male)
             ..parents('Кузен-$i', father: 'Дядя', mother: 'Жена дяди')
             ..add('Мамин кузен-$i')
             ..parents(
@@ -9176,14 +9248,14 @@ void main() {
   }
 
   testWidgets(
-    'distant cards and their photos/text are monochrome; cousins faded',
+    'known-sex distant cards and their photos/text are monochrome; cousins faded',
     (tester) async {
       final fixture = _family()
         ..add('Дядя', sex: TreeSex.male)
         ..parents('Дядя', father: 'Дед', mother: 'Бабушка')
-        ..add('Кузен')
+        ..add('Кузен', sex: TreeSex.male)
         ..parents('Кузен', father: 'Дядя')
-        ..add('Дальний');
+        ..add('Дальний', sex: TreeSex.male);
       fixture.apply(
         fixture.document.addPhoto('Дальний', 'portrait', dataUrl: _png),
       );
@@ -9239,18 +9311,18 @@ void main() {
           ..add('Дядя', sex: TreeSex.male)
           ..parents('Дядя', father: 'Дед', mother: 'Бабушка')
           ..add('Тётя', sex: TreeSex.female)
-          ..add('Кузен')
+          ..add('Кузен', sex: TreeSex.male)
           ..parents('Кузен', father: 'Дядя', mother: 'Тётя')
           ..add('Мачеха', sex: TreeSex.female)
           ..add('Полубрат', sex: TreeSex.male)
           ..parents('Полубрат', father: 'Отец', mother: 'Мачеха')
           ..add('Невестка', sex: TreeSex.female)
-          ..add('Племянница')
+          ..add('Племянница', sex: TreeSex.female)
           ..parents('Племянница', father: 'Полубрат', mother: 'Невестка')
           ..add('Зять', sex: TreeSex.male)
-          ..add('Племянник')
+          ..add('Племянник', sex: TreeSex.male)
           ..parents('Племянник', father: 'Зять', mother: 'Сестра-0')
-          ..add('Дальний')
+          ..add('Дальний', sex: TreeSex.male)
           // Also a sibling's child, but direct descent must stay normal.
           ..parents('Ребёнок-0', mother: 'Сестра-0');
         await _mount(
@@ -9934,7 +10006,7 @@ void main() {
     for (final entry in {
       'Отец': const Color(0xFF875826),
       'Мать': const Color(0xFF28644B),
-      rootTreePersonId: const Color(0xFF686C65),
+      rootTreePersonId: const Color(0xFF2563EB),
     }.entries) {
       final person = fixture.document.person(entry.key)!;
       final label = tester.widget<Text>(

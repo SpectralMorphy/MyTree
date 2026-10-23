@@ -3480,7 +3480,7 @@ async function unknownAvatarVisual(page, seeded) {
     }
     let centerGlyphPixels = 0;
     for (let y = 22; y < 50; y++) for (let x = 40; x < 68; x++) {
-      if (rgb(x, y).every((channel, index) => Math.abs(channel - [104, 108, 101][index]) < 18)) centerGlyphPixels++;
+      if (rgb(x, y).every((channel, index) => Math.abs(channel - [37, 99, 235][index]) < 18)) centerGlyphPixels++;
     }
     return { cornerMeanAsymmetry: errors.reduce((sum, value) => sum + value, 0) / errors.length, centerGlyphPixels };
   }, png.toString('base64'));
@@ -3974,7 +3974,9 @@ async function kinshipFollowup(page, seeded, label, portrait) {
   const partnerIds = ['partner-a', 'partner-b', 'partner-c'];
   const distantIds = ['partner-father', 'partner-mother', 'partner-sibling'];
   const styles = seeded.people.map((person) => ({ ...person,
-    saturation: cousinIds.includes(person.id) ? .35 : distantIds.includes(person.id) ? 0 : 1,
+    // Unknown-sex cards intentionally stay blue/full-color without promoting their block wash.
+    saturation: person.sex === 'unknown' ? 1 : cousinIds.includes(person.id) ? .35 : distantIds.includes(person.id) ? 0 : 1,
+    blockAlpha: cousinIds.includes(person.id) && !['uncle', 'grand-aunt', 'higher-aunt'].includes(person.id) ? .14 : .24,
     distantBlock: distantIds.includes(person.id) || partnerIds.includes(person.id),
   }));
   const connections = [
@@ -4031,7 +4033,7 @@ async function kinshipFollowup(page, seeded, label, portrait) {
       const nodes = styles.map((style) => {
         const { id, sex, saturation, distantBlock } = style, box = boxes[id];
         const photo = photos[id];
-        const ringColor = desaturate({ male: [135, 88, 38], female: [40, 100, 75], unknown: [104, 108, 101] }[sex], saturation);
+        const ringColor = desaturate({ male: [135, 88, 38], female: [40, 100, 75], unknown: [37, 99, 235] }[sex], saturation);
         const ring = [[25, 30], [25, 36], [26, 42], [81, 30], [82, 36]].map(([x, y]) => pixel(box.x + x, box.y + y));
         let nameInkPixels = 0;
         for (let y = 72; y < 101; y++) for (let x = 8; x < 100; x++) {
@@ -4051,8 +4053,7 @@ async function kinshipFollowup(page, seeded, label, portrait) {
           // Mixed full-sibling blocks retain the strongest member's wash:
           // uncle/grand-aunt/higher-aunt share normal ancestors' blocks, and
           // partner-a's node stays colored while its sibling block stays grey.
-          expectedBlock: blend(distantBlock ? [104, 108, 101] : [133, 136, 74],
-            saturation === .35 && !['uncle', 'grand-aunt', 'higher-aunt'].includes(id) ? .14 : .24),
+          expectedBlock: blend(distantBlock ? [104, 108, 101] : [133, 136, 74], style.blockAlpha),
           distantBlock };
       });
       const partner = boxes['partner-a'], sibling = boxes['partner-sibling'];

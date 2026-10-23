@@ -8,6 +8,7 @@ import 'package:mytree_webrtc_demo/room_session.dart';
 import 'package:mytree_webrtc_demo/storage/room_store.dart';
 import 'package:mytree_webrtc_demo/tree/tree_document.dart';
 import 'package:mytree_webrtc_demo/ui/person_family_history.dart';
+import 'package:mytree_webrtc_demo/ui/biography_section.dart';
 
 class _Session extends RoomSession {
   _Session()
@@ -116,6 +117,7 @@ Future<void> _mount(
   WidgetTester tester,
   _Session session, {
   bool editing = false,
+  Brightness brightness = Brightness.light,
   Size size = const Size(480, 1000),
   ValueNotifier<TreeNameMode>? nameMode,
   ValueChanged<String>? onSelect,
@@ -130,6 +132,7 @@ Future<void> _mount(
   if (nameMode == null) addTearDown(mode.dispose);
   await tester.pumpWidget(
     MaterialApp(
+      theme: ThemeData(brightness: brightness),
       home: Scaffold(
         body: SingleChildScrollView(
           padding: const EdgeInsets.all(20),
@@ -182,6 +185,41 @@ String _entryIdentity(TreeFamilyHistoryEntry entry) =>
     '${entry.marriage != null ? 'marriage' : 'surnameChange'}-${entry.id}';
 
 void main() {
+  for (final brightness in Brightness.values) {
+    testWidgets('section header is larger than surname rows in $brightness', (
+      tester,
+    ) async {
+      final session = _family(child: true);
+      session.seed(
+        session.tree.setValue(rootTreePersonId, 'birthDate', '1980-05-06'),
+      );
+      await _mount(
+        tester,
+        session,
+        brightness: brightness,
+        size: const Size(320, 844),
+      );
+      final header = find.byType(BiographySectionHeader);
+      final title = tester.widget<Text>(find.text('Фамилии и браки'));
+      final surname = tester.widget<Text>(find.text('Сидорова'));
+      expect(title.style!.fontSize, greaterThan(surname.style!.fontSize!));
+      expect(surname.style!.fontSize, 16);
+      final decoration = tester.widget<DecoratedBox>(
+        find.descendant(of: header, matching: find.byType(DecoratedBox)),
+      );
+      final color = (decoration.decoration as BoxDecoration).color!;
+      expect(
+        color,
+        Theme.of(
+          tester.element(header),
+        ).colorScheme.primaryContainer.withValues(alpha: .35),
+      );
+      expect(find.text('06.05.1980'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+      expect(session.operations, isEmpty);
+    });
+  }
+
   for (final editing in [false, true]) {
     testWidgets('unchanged birth surname is not repeated; editing=$editing', (
       tester,
@@ -226,6 +264,26 @@ void main() {
         findsOneWidget,
       );
       expect(find.text('при рождении'), findsOneWidget);
+      expect(
+        find.descendant(of: birth, matching: find.text('?')),
+        findsOneWidget,
+      );
+      session.seed(tree.setValue(rootTreePersonId, 'birthDate', '1980-05-06'));
+      session.refresh();
+      await tester.pumpAndSettle();
+      final birthDate = find.descendant(
+        of: birth,
+        matching: find.text('06.05.1980'),
+      );
+      expect(birthDate, findsOneWidget);
+      expect(
+        find.descendant(of: birth, matching: find.text('?')),
+        findsNothing,
+      );
+      expect(
+        tester.getRect(birthDate).right,
+        lessThan(tester.getRect(find.text('Петрова')).left),
+      );
       expect(
         tester.getRect(birth).bottom,
         lessThanOrEqualTo(tester.getRect(find.text('Седых')).top),

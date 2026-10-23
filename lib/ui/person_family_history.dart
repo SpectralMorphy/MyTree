@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import '../room_identity.dart';
 import '../room_session.dart';
 import '../tree/tree_document.dart';
+import 'biography_section.dart';
 import 'person_dates.dart';
 
 /// The biography supplies navigation; history forms do not depend on the canvas.
@@ -143,10 +144,7 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
         key: const Key('person-family-history'),
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text(
-            'Фамилии и браки',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
+          const BiographySectionHeader(title: 'Фамилии и браки'),
           if (editing) ...[
             const SizedBox(height: 8),
             Wrap(
@@ -187,9 +185,11 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Text(
-                    birthSurname.formForSex(person.sex),
-                    style: Theme.of(context).textTheme.titleLarge,
+                  _surnameHeading(
+                    person,
+                    birthSurname,
+                    person.birthDate,
+                    showUnknownDate: true,
                   ),
                   const Text('при рождении'),
                 ],
@@ -204,26 +204,13 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
                 children: [
                   if (entry.surnameChange case final change?
                       when change.changesSurname)
-                    Row(
+                    _surnameHeading(
+                      person,
+                      change.surname,
+                      change.date,
                       key: ValueKey(
                         'family-history-surname-${_entryIdentity(entry)}',
                       ),
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (change.date != null) ...[
-                          Padding(
-                            padding: const EdgeInsets.only(top: 4),
-                            child: Text(_dateLabel(change.date!)),
-                          ),
-                          const SizedBox(width: 12),
-                        ],
-                        Expanded(
-                          child: Text(
-                            change.surname.formForSex(person.sex),
-                            style: Theme.of(context).textTheme.titleLarge,
-                          ),
-                        ),
-                      ],
                     ),
                   if (entry.marriage case final marriage?)
                     _marriageCaption(marriage, person)
@@ -263,6 +250,32 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
         ],
       );
     },
+  );
+
+  Widget _surnameHeading(
+    TreePerson person,
+    TreeSurname surname,
+    DateTime? date, {
+    Key? key,
+    bool showUnknownDate = false,
+  }) => Row(
+    key: key,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      if (date != null || showUnknownDate) ...[
+        Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: Text(date == null ? '?' : _dateLabel(date)),
+        ),
+        const SizedBox(width: 12),
+      ],
+      Expanded(
+        child: Text(
+          surname.formForSex(person.sex),
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+      ),
+    ],
   );
 
   Widget _marriageCaption(TreeMarriage marriage, TreePerson person) {
