@@ -26,6 +26,24 @@ Stream<bool> watchNetworkOnlineHint() {
   return controller.stream;
 }
 
+Stream<void> watchApplicationSuspension() {
+  late StreamController<void> controller;
+  final listener = ((web.Event event) {
+    if (event.isTrusted) controller.add(null);
+  }).toJS;
+  controller = StreamController<void>(
+    onListen: () {
+      web.document.addEventListener('freeze', listener);
+      web.document.addEventListener('resume', listener);
+    },
+    onCancel: () {
+      web.document.removeEventListener('freeze', listener);
+      web.document.removeEventListener('resume', listener);
+    },
+  );
+  return controller.stream;
+}
+
 Stream<bool> watchApplicationForeground() {
   late StreamController<bool> controller;
   final listener = ((web.Event event) {

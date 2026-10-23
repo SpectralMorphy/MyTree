@@ -98,6 +98,7 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   OverlayEntry? _resumeOverlay;
   bool _resumeOverlayScheduled = false;
   bool _roomSurfaceOpened = false;
+  bool _wasPaused = false;
 
   bool get _roomActionsEnabled =>
       !_leaving && _session?.verifyingAfterResume != true;
@@ -114,6 +115,11 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive) return;
+    if (state == AppLifecycleState.paused) _wasPaused = true;
+    if (state == AppLifecycleState.resumed && _wasPaused) {
+      _wasPaused = false;
+      _session?.setSuspended();
+    }
     _session?.setForeground(state == AppLifecycleState.resumed);
   }
 
@@ -409,10 +415,8 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
     if (session == null || !session.joined || !_roomActionsEnabled) return;
     final invite = await showDialog<bool>(
       context: context,
-      builder: (_) => RoomParticipantsDialog(
-        session: session,
-        nameMode: _nameMode.value,
-      ),
+      builder: (_) =>
+          RoomParticipantsDialog(session: session, nameMode: _nameMode.value),
     );
     if (mounted &&
         identical(_session, session) &&
@@ -668,7 +672,8 @@ class _RoomPageState extends State<RoomPage> with WidgetsBindingObserver {
       absorbing: blocked,
       child: ExcludeFocus(
         excluding: blocked,
-        child: customEditor ?? TreeEditor(session: session, nameMode: _nameMode),
+        child:
+            customEditor ?? TreeEditor(session: session, nameMode: _nameMode),
       ),
     );
     if (customEditor != null) {

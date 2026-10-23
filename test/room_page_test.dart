@@ -1611,6 +1611,43 @@ void main() {
     },
   );
 
+  testWidgets(
+    'hidden focus keeps the room, but paused resume requires new proof',
+    (tester) async {
+      await store.saveMembership(roomId);
+      await mount(tester);
+      final session = tester
+          .widget<RoomDiskStatusButton>(find.byType(RoomDiskStatusButton))
+          .session;
+      expect(session.initialSyncComplete, isTrue);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      await tester.pump(const Duration(seconds: 2));
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      expect(session.initialSyncComplete, isTrue);
+      expect(find.byKey(const Key('room-text')), findsOneWidget);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump(const Duration(seconds: 5));
+      expect(
+        session.initialSyncComplete,
+        isTrue,
+        reason:
+            'do not finish the post-suspension proof before the OS actually sleeps',
+      );
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      expect(session.initialSyncComplete, isFalse);
+      await tester.pump();
+      expect(find.text('Сверяем изменения после возвращения…'), findsWidgets);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
   for (final dialogOpen in [false, true]) {
     testWidgets(
       'resume loading covers stale editor and open dialog=$dialogOpen',
@@ -1625,6 +1662,7 @@ void main() {
         final before = await store.loadHistory(roomId);
         session.setForeground(false);
         peers.last.disconnected = true;
+        session.setSuspended();
         session.setForeground(true);
         expect(session.initialSyncComplete, isFalse);
         await tester.pump();
@@ -1706,6 +1744,7 @@ void main() {
         expect(find.byKey(const Key('tree-biography-route')), findsOneWidget);
         session.setForeground(false);
         peers.last.disconnected = true;
+        session.setSuspended();
         session.setForeground(true);
         await tester.pump();
         await tester.pump();

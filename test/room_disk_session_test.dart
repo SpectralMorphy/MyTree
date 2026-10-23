@@ -929,30 +929,98 @@ void main() {
   }
 
   for (final role in RoomRole.values) {
-    diskTest('healthy Disk-only ${role.name} focus return keeps verified room', (tester) async {
-      network.autoRegister = false;
-      seedCloud();
-      var clock = DateTime.utc(2026, 10, 22);
-      final room = session(actor: 'reader', member: false, role: role,
-        access: _entryAccess(role), now: () => clock);
-      await room.start();
-      expect(room.initialSyncComplete, isTrue);
-      expect(room.networkAvailable, isFalse);
-      final ready = <bool>[];
-      room.addListener(() => ready.add(room.initialSyncComplete));
-      room.setForeground(false);
-      for (var tick = 0; tick < 6; tick++) {
-        clock = clock.add(const Duration(seconds: 5));
-        await tester.pump(const Duration(seconds: 5));
+    diskTest(
+      'healthy Disk-only ${role.name} focus return keeps verified room',
+      (tester) async {
+        network.autoRegister = false;
+        seedCloud();
+        var clock = DateTime.utc(2026, 10, 22);
+        final room = session(
+          actor: 'reader',
+          member: false,
+          role: role,
+          access: _entryAccess(role),
+          now: () => clock,
+        );
+        await room.start();
+        expect(room.initialSyncComplete, isTrue);
+        expect(room.networkAvailable, isFalse);
+        final ready = <bool>[];
+        room.addListener(() => ready.add(room.initialSyncComplete));
+        room.setForeground(false);
+        for (var tick = 0; tick < 6; tick++) {
+          clock = clock.add(const Duration(seconds: 5));
+          await tester.pump(const Duration(seconds: 5));
+          await _settle(tester);
+        }
+        room.setForeground(true);
+        await tester.pump(const Duration(milliseconds: 200));
         await _settle(tester);
-      }
-      room.setForeground(true);
-      await tester.pump(const Duration(milliseconds: 200));
-      await _settle(tester);
-      expect(room.initialSyncComplete, isTrue);
-      expect(room.verifyingAfterResume, isFalse);
-      expect(ready, everyElement(isTrue));
-    });
+        expect(room.initialSyncComplete, isTrue);
+        expect(room.verifyingAfterResume, isFalse);
+        expect(ready, everyElement(isTrue));
+      },
+    );
+  }
+
+  for (final role in RoomRole.values) {
+    for (final foregroundFirst in [true, false]) {
+      final order = foregroundFirst ? 'foreground-first' : 'tick-first';
+      diskTest(
+        'healthy Disk-only ${role.name} 25-second timer gap keeps verified room: $order',
+        (tester) async {
+          network.autoRegister = false;
+          seedCloud();
+          var clock = DateTime.utc(2026, 10, 23);
+          final room = session(
+            actor: 'reader',
+            member: false,
+            role: role,
+            access: _entryAccess(role),
+            now: () => clock,
+          );
+          await room.start();
+          // Finish initial background work, stopping just before the first
+          // execution tick so either callback order can observe the same gap.
+          await tester.pump(const Duration(milliseconds: 4999));
+          await _settle(tester);
+          expect(room.initialSyncComplete, isTrue);
+          expect(room.networkAvailable, isFalse);
+          final ready = <bool>[];
+          room.addListener(() => ready.add(room.initialSyncComplete));
+          var lists = 0;
+          var reads = 0;
+          cloud.beforeList = (_) async {
+            lists++;
+          };
+          cloud.beforeRead = (_) async {
+            reads++;
+          };
+          room.setForeground(false);
+          clock = clock.add(const Duration(seconds: 25));
+          if (foregroundFirst) room.setForeground(true);
+          await tester.pump(const Duration(milliseconds: 1));
+          await _settle(tester);
+          if (!foregroundFirst) room.setForeground(true);
+          await tester.pump(const Duration(milliseconds: 200));
+          await _settle(tester);
+          expect(room.initialSyncComplete, isTrue);
+          expect(room.verifyingAfterResume, isFalse);
+          expect(ready, isNotEmpty);
+          expect(ready, everyElement(isTrue));
+          // A strict entry would read immediately after the resume debounce.
+          // Ordinary background reads remain scheduled and are allowed below.
+          expect(lists, 0);
+          expect(reads, 0);
+          await tester.pump(const Duration(seconds: 1));
+          await _settle(tester);
+          expect(room.initialSyncComplete, isTrue);
+          expect(room.verifyingAfterResume, isFalse);
+          expect(ready, everyElement(isTrue));
+          expect(room.hasValidatedOnlinePeer, isFalse);
+        },
+      );
+    }
   }
 
   for (final role in RoomRole.values) {
@@ -992,6 +1060,8 @@ void main() {
       store.beforeAppend = (edits) async {
         if (edits.any((edit) => edit['id'] == later.id)) await saveGate.future;
       };
+      // A trusted lifecycle signal, not elapsed timer time, invalidates entry.
+      room.setSuspended();
       clock = clock.add(const Duration(seconds: 25));
       room.setForeground(true);
       expect(room.verifyingAfterResume, isTrue);

@@ -1,5 +1,6 @@
 # Completed Verification
 
+- [October 23 — Background timers and volume-matched Disk comparison](verification-background-timers-20261023.md)
 - [October 23 — Family-history and date-control refinements](verification-family-followups-20261023.md)
 - [October 23 — Toolbar order and birth-surname row](verification-toolbar-birth-surnames-20261023.md)
 - [October 23 — Re-entry beside a retained stalled RTC](verification-reentry-cohort-20261023.md)

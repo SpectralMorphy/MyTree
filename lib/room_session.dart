@@ -209,6 +209,7 @@ class RoomSession extends ChangeNotifier {
   final _tabSubscriptions = <StreamSubscription<dynamic>>[];
   StreamSubscription<bool>? _networkSubscription;
   StreamSubscription<bool>? _foregroundSubscription;
+  StreamSubscription<void>? _suspensionSubscription;
   bool _networkOnlineHint = networkOnlineHint;
   bool _tabsActive = false;
   bool _tabsStarting = false;
@@ -246,7 +247,7 @@ class RoomSession extends ChangeNotifier {
   Timer? _executionTimer;
   Timer? _resumeTimer;
   DateTime? _backgroundedAt;
-  bool _backgroundNetworkAvailable = false;
+  bool _backgroundNetworkOnline = true;
   bool _backgroundConnectionLost = false;
   final _resumeProbes = <_RoomConnection>{};
   DateTime? _lastExecutionAt;
@@ -319,6 +320,9 @@ class RoomSession extends ChangeNotifier {
   bool get localCopyOpened => _localCopyOpened;
   String get initialSyncStatus {
     if (_initialSyncComplete) {
+      if (_connections.values.any((state) => state.rechecking)) {
+        return 'Проверяем изменения в фоне…';
+      }
       return _initialSyncFromDisk
           ? 'История загружена с Диска · онлайн-сверка продолжается'
           : 'История комнаты проверена';
@@ -1632,6 +1636,10 @@ class RoomSession extends ChangeNotifier {
       return _error == null ? 'Вход в комнату…' : 'Не удалось войти в комнату';
     }
     if (!_history.loaded) return 'Не удалось прочитать сохранённую историю';
+    if (_initialSyncComplete &&
+        _connections.values.any((state) => state.rechecking)) {
+      return 'Проверяем изменения в фоне…';
+    }
     if (onlineCount > 1) return 'Онлайн · участников: $onlineCount';
     if (_isTabFollower) {
       final leader = _verifiedTabState;
@@ -1663,9 +1671,7 @@ class RoomSession extends ChangeNotifier {
           state.stalledDeadline?.cancel();
           state.stalledDeadline = null;
         }
-        if (_initialSyncComplete || _resumeVerification) {
-          _beginResumeVerification(afterSuspension: true);
-        }
+        _checkBackgroundHistory();
         resume();
       }
       for (final state in _connections.values) {
@@ -1674,7 +1680,7 @@ class RoomSession extends ChangeNotifier {
     });
     _networkSubscription = watchNetworkOnlineHint().listen((online) {
       if (_disposed || _networkOnlineHint == online) return;
-      if (!online && _backgroundedAt != null && networkAvailable) {
+      if (!online && _backgroundedAt != null && _initialSyncComplete) {
         _backgroundConnectionLost = true;
       }
       _networkOnlineHint = online;
@@ -1683,6 +1689,9 @@ class RoomSession extends ChangeNotifier {
     });
     _foregroundSubscription = watchApplicationForeground().listen(
       setForeground,
+    );
+    _suspensionSubscription = watchApplicationSuspension().listen(
+      (_) => setSuspended(),
     );
     _beginInitialWait();
     final attempt = _entryAttempt;
@@ -2113,10 +2122,10 @@ class RoomSession extends ChangeNotifier {
         state.onlineCount < 1) {
       return;
     }
-    if (_backgroundedAt != null &&
-        _verifiedTabState?.networkAvailable == true &&
-        !state.networkAvailable) {
-      _backgroundConnectionLost = true;
+    // A negative roster may only be soft heartbeat suspicion. A separately
+    // declared real owner invalidation propagates the strict gate to siblings.
+    if (state.verificationRequired && _initialSyncComplete) {
+      _beginResumeVerification();
     }
     _tabState = state;
     _changed();
@@ -2222,6 +2231,7 @@ class RoomSession extends ChangeNotifier {
         onlineCount: onlineCount,
         onlineActors: _onlineActors.toList()..sort(),
         networkAvailable: networkAvailable,
+        verificationRequired: verifyingAfterResume,
         // Existing UI readiness is latched, but a newly opened sibling must
         // not bypass a currently pending host cohort with that older latch.
         initialSyncComplete: _currentTabEntryReady,
@@ -2236,6 +2246,7 @@ class RoomSession extends ChangeNotifier {
       if (previous != null &&
           previous.onlineCount == state.onlineCount &&
           previous.networkAvailable == state.networkAvailable &&
+          previous.verificationRequired == state.verificationRequired &&
           listEquals(previous.onlineActors, state.onlineActors) &&
           previous.initialSyncComplete == state.initialSyncComplete &&
           previous.localCopyOpened == state.localCopyOpened &&
@@ -2318,7 +2329,7 @@ class RoomSession extends ChangeNotifier {
     _initialSyncFromDisk = fromDisk;
     _initialSyncComplete = true;
     _backgroundConnectionLost = false;
-    _backgroundNetworkAvailable = networkAvailable;
+    _backgroundNetworkOnline = _networkOnlineHint;
     _resumeVerification = false;
     _tabResyncId = null;
     for (final request in _pendingTabResyncs) {
@@ -2351,7 +2362,7 @@ class RoomSession extends ChangeNotifier {
     if (!foreground) {
       if (_backgroundedAt == null) {
         _backgroundedAt = now();
-        _backgroundNetworkAvailable = networkAvailable;
+        _backgroundNetworkOnline = _networkOnlineHint;
         _backgroundConnectionLost = false;
       }
       for (final state in _connections.values) {
@@ -2362,7 +2373,7 @@ class RoomSession extends ChangeNotifier {
     }
     final hiddenAt = _backgroundedAt;
     final lostNetwork =
-        hiddenAt != null && _backgroundNetworkAvailable && !networkAvailable;
+        hiddenAt != null && _backgroundNetworkOnline && !_networkOnlineHint;
     final lostConnection =
         hiddenAt != null && (_backgroundConnectionLost || _lostReadyConnection);
     _backgroundedAt = null;
@@ -2370,17 +2381,43 @@ class RoomSession extends ChangeNotifier {
     final execution = _lastExecutionAt;
     final suspended =
         execution != null && now().difference(execution) > _livenessDeadline;
-    if (suspended && (_initialSyncComplete || _resumeVerification)) {
-      _beginResumeVerification(afterSuspension: true);
-    } else if (_initialSyncComplete && (lostNetwork || lostConnection)) {
+    if (_initialSyncComplete && (lostNetwork || lostConnection)) {
       _beginResumeVerification();
+    } else if (suspended) {
+      _lastExecutionAt = now();
+      _checkBackgroundHistory();
+      resume();
     } else if (hiddenAt != null &&
         (now().difference(hiddenAt) >= const Duration(seconds: 3) ||
-            !networkAvailable)) {
+            !networkAvailable ||
+            _connections.values.any((state) => state.rechecking))) {
       // A normal focus switch keeps its verified copy. Check receive progress
       // without discarding healthy channels or requiring a new entry round.
       resume();
     }
+  }
+
+  /// Explicit platform suspension is stronger evidence than a delayed timer.
+  void setSuspended() {
+    if (_disposed || (!_initialSyncComplete && !_resumeVerification)) return;
+    _beginResumeVerification(afterSuspension: true);
+  }
+
+  void _checkBackgroundHistory() {
+    if (_disposed || !_initialSyncComplete || !_joined || !_history.loaded) {
+      return;
+    }
+    // Browsers throttle background timers without freezing RTC. Verify through
+    // the retained channels, but do not turn timer lateness into a new entry.
+    for (final state in _connections.values.toList()) {
+      if (_canRecheck(state)) {
+        state.backgroundRecheck = true;
+        _beginConnectionRecheck(state);
+      }
+    }
+    _diskSync.schedule();
+    _diskReadSync.schedule();
+    _changed();
   }
 
   bool get _lostReadyConnection {
@@ -2397,7 +2434,10 @@ class RoomSession extends ChangeNotifier {
         );
   }
 
-  void _beginResumeVerification({bool afterSuspension = false}) {
+  void _beginResumeVerification({
+    bool afterSuspension = false,
+    bool preserveRechecks = false,
+  }) {
     if (_disposed ||
         !_joined ||
         !_history.loaded ||
@@ -2428,7 +2468,9 @@ class RoomSession extends ChangeNotifier {
     for (final state in _connections.values.toList()) {
       if (!state.ready) continue;
       if (_canRecheck(state)) {
-        _beginConnectionRecheck(state, force: true);
+        if (!preserveRechecks || !state.rechecking) {
+          _beginConnectionRecheck(state, force: true);
+        }
       } else {
         _dropConnection(state, 'Требуется новое подтверждение истории');
       }
@@ -2591,8 +2633,8 @@ class RoomSession extends ChangeNotifier {
     if ((_initialSyncComplete || _resumeVerification) &&
         heartbeat != null &&
         now().difference(heartbeat) > _livenessDeadline) {
-      _beginResumeVerification(afterSuspension: true);
-      return;
+      _lastExecutionAt = now();
+      _checkBackgroundHistory();
     }
     if (!_networkOnlineHint) return;
     _diskSync.schedule();
@@ -2630,6 +2672,7 @@ class RoomSession extends ChangeNotifier {
           (state.opened && !state.connection.open)) {
         _dropConnection(state, 'Проверка связи после пробуждения');
       } else if (state.rechecking) {
+        state.backgroundRecheck = true;
         _sendRecheckRequest(state);
         _watchStalledChannel(state);
       } else if (state.ready &&
@@ -2672,25 +2715,10 @@ class RoomSession extends ChangeNotifier {
           )
           .map((entry) => entry.key)
           .toSet();
-      if (_initialSyncComplete &&
-          silent.isNotEmpty &&
-          !_connections.values.any(
-            (state) =>
-                _live(state) &&
-                (!state.ready ||
-                    _checkpointPending(state) ||
-                    state.decoder.assembling ||
-                    (state.connection.open && !silent.contains(state))),
-          )) {
-        // A silent last peer can have missed live edits. Retire its old proof
-        // before reconnecting, rather than leaving the stale copy marked ready.
-        _beginResumeVerification();
-        for (final state in silent) {
-          _channelTimedOut(state, 'Участник не ответил после пробуждения');
-        }
-        return;
-      }
+      // Absence of a scheduled heartbeat is not a native disconnection. A
+      // nonce-correlated recheck stays visible as pending without hiding the UI.
       for (final state in silent) {
+        state.backgroundRecheck = true;
         _channelTimedOut(state, 'Участник не ответил после пробуждения');
       }
       // A newly arriving peer may still be saving its welcome/hello. Its own
@@ -3411,6 +3439,15 @@ class RoomSession extends ChangeNotifier {
         'Список истории превышает предел синхронизации',
       );
     }
+    if (_initialSyncComplete &&
+        state.backgroundRecheck &&
+        state.rechecking &&
+        !_containsDurableInventory(inventory)) {
+      // A delay was only suspicion. A fresh reply announcing absent immutable
+      // records is actual evidence that this returning copy is incomplete.
+      // Keep that request's nonce: its in-flight reply still needs persistence.
+      _beginResumeVerification(preserveRechecks: true);
+    }
   }
 
   bool _freshRecheckImported(_RoomConnection state) =>
@@ -3591,6 +3628,7 @@ class RoomSession extends ChangeNotifier {
           (_hosting ? _settledHosting : state.remoteRoomReady)) {
         state.established = true;
         state.rechecking = false;
+        state.backgroundRecheck = false;
         state.verificationStalled = false;
         if (state.responsive) {
           state.stalledDeadline?.cancel();
@@ -4257,9 +4295,6 @@ class RoomSession extends ChangeNotifier {
     final wasResponsive = state.responsive;
     state.responsive = false;
     state.verificationStalled = true;
-    if (_backgroundedAt != null && !hasValidatedOnlinePeer) {
-      _backgroundConnectionLost = true;
-    }
     _networkIssue = reason;
     if (wasResponsive) _record(reason);
     // Silence revokes online evidence, but is not proof of a dead native link.
@@ -4508,7 +4543,9 @@ class RoomSession extends ChangeNotifier {
     if (outbound) _hostConnection = null;
     _cancelConnection(state);
     _disposeLater(connection: state.connection);
-    if (_resumeProbes.remove(state) &&
+    final lostCheckedChannel =
+        _resumeProbes.remove(state) || (state.established && state.rechecking);
+    if (lostCheckedChannel &&
         _initialSyncComplete &&
         !_connections.values.any(
           (other) => _live(other) && (!other.ready || other.connection.open),
@@ -4689,6 +4726,7 @@ class RoomSession extends ChangeNotifier {
     _cancelSubscriptions(_tabSubscriptions);
     unawaited(_networkSubscription?.cancel());
     unawaited(_foregroundSubscription?.cancel());
+    unawaited(_suspensionSubscription?.cancel());
     _diskCredentialExchange.dispose();
     _diskRetirements.dispose();
     _diskReadSync.dispose();
@@ -4726,6 +4764,7 @@ class _RoomConnection {
   int recheckRevision = 0;
   String? recheckId;
   bool rechecking = false;
+  bool backgroundRecheck = false;
   Map<String, String>? recheckCheckpoint;
   bool recheckImported = false;
   String? recheckRemoteSyncId;

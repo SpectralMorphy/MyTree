@@ -35,6 +35,7 @@ class RoomTabState {
     required Map<String, String> inventory,
     this.initialSyncError,
     this.networkAvailable = false,
+    this.verificationRequired = false,
     List<String>? onlineActors,
     List<String> completedResyncs = const [],
   }) : inventory = Map.unmodifiable(inventory),
@@ -47,6 +48,9 @@ class RoomTabState {
   final String actorId;
   final int onlineCount;
   final bool networkAvailable;
+
+  /// Actual owner invalidation, not a soft heartbeat or pending new cohort.
+  final bool verificationRequired;
   final List<String>? onlineActors;
   final bool initialSyncComplete;
   final bool localCopyOpened;
@@ -64,6 +68,7 @@ class RoomTabState {
     'actorId': actorId,
     'onlineCount': onlineCount,
     'networkAvailable': networkAvailable,
+    if (verificationRequired) 'verificationRequired': true,
     if (onlineActors != null) 'onlineActors': onlineActors,
     'initialSyncComplete': initialSyncComplete,
     'localCopyOpened': localCopyOpened,
@@ -100,6 +105,13 @@ class RoomTabState {
         ? value['networkAvailable']
         : false;
     if (network is! bool) return null;
+    final verificationRequired = value.containsKey('verificationRequired')
+        ? value['verificationRequired']
+        : false;
+    if (verificationRequired is! bool ||
+        (verificationRequired && value['initialSyncComplete'] == true)) {
+      return null;
+    }
     List<String>? onlineActors;
     if (value.containsKey('onlineActors')) {
       final actors = value['onlineActors'];
@@ -140,6 +152,7 @@ class RoomTabState {
       actorId: value['actorId'] as String,
       onlineCount: value['onlineCount'] as int,
       networkAvailable: network,
+      verificationRequired: verificationRequired,
       onlineActors: onlineActors,
       initialSyncComplete: value['initialSyncComplete'] as bool,
       localCopyOpened: value['localCopyOpened'] as bool,

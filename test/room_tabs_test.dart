@@ -213,6 +213,44 @@ void main() {
     },
   );
 
+  test(
+    'actual verification invalidation is optional and distinct from offline presence',
+    () {
+      final value = _state().toJson();
+      expect(RoomTabState.fromJson(value)!.verificationRequired, isFalse);
+      expect(value.containsKey('verificationRequired'), isFalse);
+      final invalidated = RoomTabState.fromJson({
+        ...value,
+        'initialSyncComplete': false,
+        'verificationRequired': true,
+      })!;
+      expect(invalidated.verificationRequired, isTrue);
+      expect(
+        RoomTabState.fromJson(invalidated.toJson())!.verificationRequired,
+        isTrue,
+      );
+      for (final invalid in <Object?>[null, 1, 'true', []]) {
+        expect(
+          RoomTabState.fromJson({...value, 'verificationRequired': invalid}),
+          isNull,
+        );
+      }
+      expect(
+        RoomTabState.fromJson({...value, 'verificationRequired': true}),
+        isNull,
+        reason:
+            'an owner cannot require verification while claiming current readiness',
+      );
+      expect(
+        RoomTabState.fromJson({
+          ...value,
+          'verificationRequired': false,
+        })!.verificationRequired,
+        isFalse,
+      );
+    },
+  );
+
   test('resync completions are optional for ordinary and legacy states', () {
     final state = _state();
     expect(state.completedResyncs, isEmpty);

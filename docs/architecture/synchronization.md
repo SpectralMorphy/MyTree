@@ -256,11 +256,16 @@ Browser visibility/resume/pageshow events, Flutter lifecycle events and an onlin
 connectivity check. Elapsed hidden time (including an ordinary long Alt+Tab) is not suspension evidence: it uses the
 nondestructive 200 ms / six-second receive-progress probe while retaining readiness and healthy channels. Flutter's
 transient `inactive` state is not backgrounding. A session-wide five-second execution tick, including for local followers
-and Disk-only copies, detects an actual wall-clock execution gap over 20 seconds independently of network heartbeats.
+and Disk-only copies, can detect a wall-clock timer delay over 20 seconds. That delay does **not** distinguish browser
+throttling from suspension and is not an entry-invalidation signal. It requests a nonce-correlated background recheck,
+keeping the current editor visible with an explicit pending status. Missing ordinary heartbeat traffic follows the same
+soft path; it does not trigger a new strict Disk entry read merely because focus returned.
 
-A real execution gap, observed loss of the last verified connection/network during backgrounding, or a failed last-peer
-receive probe qualifies for fresh verification. It immediately clears an already-confirmed accepted copy's readiness and
-shows loading, but keeps admitted usable RTC channels, their ordered sends, decoders and transport generation. With
+Observed loss of the last native connection/network during backgrounding, an explicit platform suspension, or a current
+background recheck announcing records absent from durable storage requires strict verification. Native `paused` is remembered
+and invalidation starts on its following `resumed`; trusted browser freeze/resume events are separate from visibility.
+A strict gate immediately clears an already-confirmed accepted copy's readiness and shows loading, but keeps admitted
+usable RTC channels, their ordered sends, decoders and transport generation. With
 negotiated `recheckSync` and `durableSync`, each channel gets a new local checkpoint token and independent `recheckId`:
 
 1. Invalidate the whole old cohort's proof before any queued flush; freeze and durably resolve each new finite contribution.
@@ -271,7 +276,7 @@ negotiated `recheckSync` and `durableSync`, each channel gets a new local checkp
    checkpoint. Old or unrelated echoes, ordinary presence, equal old roots and old ACK flags cannot release this barrier.
 
 Repeated requests reuse the same nonce and fixed response snapshot without rotating tokens or starting reciprocal rounds.
-A genuinely new execution suspension supersedes a pending attempt and its nonce; duplicate foreground/online hints do not
+An explicitly reported new suspension supersedes a pending attempt and its nonce; duplicate foreground/online hints do not
 reset the fixed 30-second readiness budget. A serial-queue revision guard rejects a flush result from a superseded round.
 Freshly admitted non-fast peers can recheck too. Peers without the optional capability retain reconnect-based verification.
 

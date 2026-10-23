@@ -189,11 +189,13 @@ Changing scheme/host/port changes browser storage origin, so a new temporary tun
 [Browser network hooks](../../lib/network_status_web.dart) watch online/offline and visibility/resume/pageshow;
 [RoomPage](../../lib/ui/room_page.dart) also forwards Flutter lifecycle. `navigator.onLine` is only a hint: offline revokes
 online display, while online/foreground is not proof of a reachable provider or peer. The [native stub](../../lib/network_status_stub.dart)
-does not infer connectivity from an OS hint. A qualifying wake of a confirmed copy invalidates readiness, not healthy native
-RTC: negotiated links run a fresh nonce-correlated durable recheck in place. Missing/broken links resume discovery after a
+does not infer connectivity from an OS hint. An explicitly suspended or disconnected confirmed copy invalidates readiness, not healthy native
+RTC: negotiated links run a fresh nonce-correlated durable recheck in place. Timer lateness and absent application heartbeat
+alone request the same proof in the background without resetting room entry or repeating strict cloud reads. Missing/broken links resume discovery after a
 200 ms debounce rather than displaying stale history until the old liveness timeout. Ordinary focus switches only request
-a six-second receive-progress probe; a failed last-peer probe starts the fresh barrier but does not immediately close a
-native-connected modern link. Connecting and first-admission checkpoint/assembly work retain their fixed bounds.
+a six-second receive-progress probe; a silent last peer requests a nonce recheck in the background, not a new entry barrier
+or native-channel closure. Confirmed loss and newly declared missing durable history remain strict. Connecting and
+first-admission checkpoint/assembly work retain their fixed bounds.
 See [synchronization](synchronization.md#recovery-and-truthful-ui) for guards, backoff, and the full deadline table.
 
 When diagnosing, distinguish registration (`signalingService`), an actually open channel, a validated welcome/online actor,
