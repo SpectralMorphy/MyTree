@@ -1,5 +1,6 @@
 # Completed Verification
 
+- [October 23 — Re-entry beside a retained stalled RTC](verification-reentry-cohort-20261023.md)
 - [October 23 — Reverify history without replacing healthy RTC](verification-keep-rtc-20261023.md)
 - [October 22 — Marriage and surname history](verification-family-history-20261022.md)
 - [October 22 — Stepparent emphasis and parental-family proximity](verification-stepparents-20261022.md)

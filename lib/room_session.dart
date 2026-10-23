@@ -2528,7 +2528,7 @@ class RoomSession extends ChangeNotifier {
         ),
       ),
     );
-    missingRoomEdits(_history.knownEdits, request.inventory!);
+    _rememberRemoteContribution(state, request.inventory!);
     final missing = missingRoomEdits(history, request.inventory!);
     if (missing.isNotEmpty) {
       unawaited(_send(state, _message(RoomMessageType.edits, missing)));
@@ -2551,6 +2551,7 @@ class RoomSession extends ChangeNotifier {
     // A peer returning from a long pause can have missed our own request.
     // Repeat its existing nonce once per new remote request, never a new round.
     if (newRequest) _sendRecheckRequest(state);
+    _updateEntryBarrier();
   }
 
   Future<void> _resumeVerifiedCopy() async {
@@ -3388,8 +3389,33 @@ class RoomSession extends ChangeNotifier {
   bool _hasDurableCheckpoint(_RoomConnection state) =>
       _containsDurableInventory(state.remoteCheckpoint);
 
+  void _rememberRemoteContribution(
+    _RoomConnection state,
+    Map<String, String> inventory,
+  ) {
+    missingRoomEdits(_history.knownEdits, inventory);
+    final durable = _durableTabInventory;
+    for (final entry in inventory.entries) {
+      final previous = state.pendingRemoteInventory[entry.key];
+      if (previous != null && previous != entry.value) {
+        throw const FormatException('Участник изменил объявленную историю');
+      }
+      if (durable[entry.key] != entry.value) {
+        state.pendingRemoteInventory[entry.key] = entry.value;
+      }
+    }
+    // Even accumulated announcements cannot retain unbounded unknown IDs.
+    // An actual full history reaches the existing 8 MiB bound sooner.
+    if (state.pendingRemoteInventory.length > maxTransferBytes ~/ 70) {
+      throw const FormatException(
+        'Список истории превышает предел синхронизации',
+      );
+    }
+  }
+
   bool _freshRecheckImported(_RoomConnection state) =>
-      state.recheckId == null || state.recheckImported;
+      state.pendingRemoteInventory.isEmpty &&
+      (state.recheckId == null || state.recheckImported);
 
   bool _checkpointPending(_RoomConnection state) =>
       state.ready &&
@@ -3496,8 +3522,16 @@ class RoomSession extends ChangeNotifier {
   Iterable<_RoomConnection> get _initialCohort {
     final admitted = _connections.values.where(
       (state) =>
-          state.admissionStarted || state.ready || state.decoder.assembling,
+          (state.admissionStarted || state.ready || state.decoder.assembling) &&
+          !(state.established &&
+              state.verificationStalled &&
+              state.rechecking &&
+              !state.decoder.assembling &&
+              state.pendingRemoteInventory.isEmpty),
     );
+    // Previously imported, now silent RTC can recover independently. It is not
+    // a new entry contribution unless it announced history still missing here.
+    // Keep the original fallback: only silent links must not imply solo.
     // Blank signaling hedges are not known participants. Once a real cohort
     // exists, their transport handshake cannot hold it for 12 seconds. A real
     // bounded assembly is still a pending contribution, even before hello.
@@ -3524,7 +3558,11 @@ class RoomSession extends ChangeNotifier {
   void _updateEntryBarrier() {
     if (_disposed || !_networkOwner) return;
     _shareDiskCredentials();
+    final durableInventory = _durableTabInventory;
     for (final state in _connections.values) {
+      state.pendingRemoteInventory.removeWhere(
+        (id, digest) => durableInventory[id] == digest,
+      );
       if (state.durableSync && _hasDurableCheckpoint(state)) {
         state.remoteImported = true;
       }
@@ -3553,6 +3591,7 @@ class RoomSession extends ChangeNotifier {
           (_hosting ? _settledHosting : state.remoteRoomReady)) {
         state.established = true;
         state.rechecking = false;
+        state.verificationStalled = false;
         if (state.responsive) {
           state.stalledDeadline?.cancel();
           state.stalledDeadline = null;
@@ -3904,7 +3943,7 @@ class RoomSession extends ChangeNotifier {
           if (message.recheckId != state.recheckId) return;
         }
         final inventory = _checkpointInventory(state, message);
-        missingRoomEdits(_history.knownEdits, inventory);
+        _rememberRemoteContribution(state, inventory);
         if (message.recheckId != null) {
           state.recheckCheckpoint = inventory;
           state.recheckRemoteSyncId = message.syncId;
@@ -3951,7 +3990,7 @@ class RoomSession extends ChangeNotifier {
       state.remoteInventory = inventory;
       // Failed and pending writes remain immutable too. Validate the whole
       // shared set before responding, but never send these nondurable records.
-      missingRoomEdits(_history.knownEdits, inventory);
+      _rememberRemoteContribution(state, inventory);
       final missing = missingRoomEdits(_history.durableHistory, inventory);
       // One side may initially see equal roots while the other gains a durable
       // edit during hello/welcome. Always reciprocate the first inventory.
@@ -3959,6 +3998,7 @@ class RoomSession extends ChangeNotifier {
       if (missing.isNotEmpty) {
         unawaited(_send(state, _message(RoomMessageType.edits, missing)));
       }
+      _updateEntryBarrier();
       return;
     }
     final added = await _history.merge(message.history);
@@ -4216,6 +4256,7 @@ class RoomSession extends ChangeNotifier {
     }
     final wasResponsive = state.responsive;
     state.responsive = false;
+    state.verificationStalled = true;
     if (_backgroundedAt != null && !hasValidatedOnlinePeer) {
       _backgroundConnectionLost = true;
     }
@@ -4680,6 +4721,7 @@ class _RoomConnection {
   int receivedPackets = 0;
   bool responsive = true;
   bool established = false;
+  bool verificationStalled = false;
   bool recheckSync = false;
   int recheckRevision = 0;
   String? recheckId;
@@ -4719,6 +4761,7 @@ class _RoomConnection {
   List<RoomEdit>? receivedHistory;
   List<RoomEdit>? initialHistory;
   Map<String, String>? remoteInventory;
+  final pendingRemoteInventory = <String, String>{};
   Map<String, String>? remoteCheckpoint;
   String? localSyncId;
   String? localSyncDigest;

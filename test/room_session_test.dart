@@ -2500,6 +2500,239 @@ void main() {
     },
   );
 
+  for (final returning in [false, true]) {
+    testRoomWidgets(
+      '${returning ? 'returning' : 'new'} member does not wait for an established silent channel',
+      (tester) async {
+        network.autoRegister = true;
+        final host = session(actor: 'host', newlyCreated: true);
+        await host.start();
+        await settle(tester);
+        await host.edit('history before suspension');
+        final oldStore = _Store();
+        final sleeping = session(
+          actor: 'sleeping',
+          store: oldStore,
+          preferExistingHost: true,
+        );
+        await sleeping.start();
+        await settle(tester);
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        expect(sleeping.initialSyncComplete, isTrue);
+        final oldOutgoing = network.peers.last.outbound.single;
+        final oldIncoming = oldOutgoing.other!;
+        sleeping.setForeground(false);
+        oldOutgoing.dropData = true;
+        oldIncoming.dropData = true;
+        await host.edit('new durable history while the old channel is silent');
+        for (var tick = 0; tick < 5; tick++) {
+          await tester.pump(const Duration(seconds: 5));
+          await settle(tester);
+        }
+        expect(oldIncoming.disposed, isFalse);
+        expect(host.onlineCount, 1);
+        // A heartbeat restores presence, not the overdue durable proof. It must
+        // not make this old recheck a prerequisite for a new member again.
+        oldIncoming.receive(_message('presence', const [], actor: 'sleeping'));
+        await settle(tester);
+        final joiningStore = returning ? oldStore : _Store();
+        final joining = session(
+          actor: returning ? 'sleeping' : 'new-member',
+          member: returning,
+          store: joiningStore,
+          preferExistingHost: true,
+        );
+        await joining.start();
+        await settle(tester);
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        expect(
+          joining.initialSyncComplete,
+          isTrue,
+          reason:
+              'an unavailable previously imported peer is not a new initial contribution',
+        );
+        expect(joining.initialSyncError, isNull);
+        expect(joining.text, host.text);
+        expect(
+          roomHistoryInventory(joining.changes),
+          roomHistoryInventory(host.changes),
+        );
+        expect(
+          oldIncoming.disposed,
+          isFalse,
+          reason: 'entry must not require destroying the recoverable old RTC',
+        );
+      },
+    );
+  }
+
+  for (final announcement in ['inventory', 'checkpoint', 'recheck']) {
+    testRoomWidgets(
+      'entry retains missing $announcement contribution across silent recheck',
+      (tester) async {
+        network.autoRegister = true;
+        final storage = _Store();
+        final host = session(actor: 'host', store: storage, newlyCreated: true);
+        await host.start();
+        await settle(tester);
+        final old = _FakeConnection('old-runtime');
+        network.connections.add(old);
+        network.peers.first.emit<DataConnection>('connection', old);
+        old.openChannel();
+        old.receive({
+          ..._message('hello', const [], actor: 'old'),
+          'durableSync': true,
+          'recheckSync': true,
+          'fastSync': true,
+          'historyDigest': roomHistoryDigest(const []),
+        });
+        await settle(tester);
+        old.receive(_checkpoint(const [], actor: 'old'));
+        old.receive(_ackLocal(old, actor: 'old'));
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        expect(host.onlineCount, 2);
+        final missing = _edit(
+          'announced-but-not-imported',
+          'required old contribution',
+          author: 'old',
+        );
+        final expected = roomHistoryInventory(decodeRoomHistory([missing]));
+        if (announcement == 'checkpoint') {
+          old.receive(_checkpoint([missing], actor: 'old', syncId: 'b' * 32));
+        } else {
+          old.receive({
+            ..._message('inventory', const [], actor: 'old'),
+            'inventory': expected,
+            if (announcement == 'recheck') 'recheckId': 'c' * 32,
+          });
+        }
+        await settle(tester);
+        for (var tick = 0; tick < 5; tick++) {
+          old.receive(_message('presence', const [], actor: 'old'));
+          await tester.pump(const Duration(seconds: 5));
+          await settle(tester);
+        }
+        expect(old.disposed, isFalse);
+        final joining = session(
+          member: false,
+          actor: 'joining',
+          preferExistingHost: true,
+        );
+        await joining.start();
+        await settle(tester);
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        expect(
+          joining.initialSyncComplete,
+          isFalse,
+          reason:
+              'a declared missing immutable record remains part of admission',
+        );
+        final request = _sentMessages(old).lastWhere(
+          (message) =>
+              message.type == RoomMessageType.inventory &&
+              message.recheckId != null,
+        );
+        // An empty subsequent cutoff cannot erase the earlier declared record.
+        old.receive(_checkpoint(const [], actor: 'old', syncId: 'd' * 32));
+        old.receive(_ackLocal(old, actor: 'old'));
+        old.receive({
+          ..._checkpoint(const [], actor: 'old', syncId: 'e' * 32),
+          'recheckId': request.recheckId,
+        });
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        expect(joining.initialSyncComplete, isFalse);
+        final gate = storage.appendGate = Completer<void>();
+        old.receive(_message('edits', [missing], actor: 'old'));
+        await settle(tester);
+        expect(joining.initialSyncComplete, isFalse);
+        expect(await storage.loadHistory(_roomId), isEmpty);
+        gate.complete();
+        await settle(tester);
+        await tester.pump(const Duration(seconds: 1));
+        await settle(tester);
+        old.receive(_ackLocal(old, actor: 'old'));
+        await settle(tester);
+        expect(joining.initialSyncComplete, isTrue);
+        expect(joining.text, 'required old contribution');
+        expect(roomHistoryInventory(joining.changes), expected);
+        expect(old.disposed, isFalse);
+      },
+    );
+  }
+
+  testRoomWidgets(
+    'entry still waits for a silent established peer assembling real history',
+    (tester) async {
+      network.autoRegister = true;
+      final host = session(actor: 'host', newlyCreated: true);
+      await host.start();
+      await settle(tester);
+      final old = _FakeConnection('assembling-runtime');
+      network.connections.add(old);
+      network.peers.first.emit<DataConnection>('connection', old);
+      old.openChannel();
+      old.receive({
+        ..._message('hello', const [], actor: 'old'),
+        'durableSync': true,
+        'recheckSync': true,
+      });
+      await settle(tester);
+      old.receive(_checkpoint(const [], actor: 'old'));
+      old.receive(_ackLocal(old, actor: 'old'));
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      final incoming = _edit('assembling-edit', 'Ж😀' * 6000, author: 'old');
+      final chunks = encodeRoomMessage(
+        decodeRoomMessage(
+          _message('edits', [incoming], actor: 'old'),
+          roomId: _roomId,
+        ),
+      ).toList();
+      old.receive(chunks.first);
+      for (var tick = 0; tick < 4; tick++) {
+        await tester.pump(const Duration(seconds: 5));
+        await settle(tester);
+      }
+      final joining = session(
+        member: false,
+        actor: 'joining',
+        preferExistingHost: true,
+      );
+      await joining.start();
+      await settle(tester);
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      expect(
+        joining.initialSyncComplete,
+        isFalse,
+        reason:
+            'native silence does not discard a real pending history transfer',
+      );
+      expect(old.disposed, isFalse);
+      for (final packet in chunks.skip(1)) {
+        old.receive(packet);
+      }
+      await settle(tester);
+      old.receive(_checkpoint([incoming], actor: 'old', syncId: 'b' * 32));
+      await tester.pump(const Duration(seconds: 1));
+      await settle(tester);
+      old.receive(_ackLocal(old, actor: 'old'));
+      await settle(tester);
+      expect(joining.initialSyncComplete, isTrue);
+      expect(joining.text, incoming['text']);
+      expect(
+        roomHistoryInventory(joining.changes),
+        roomHistoryInventory(host.changes),
+      );
+      expect(old.disposed, isFalse);
+    },
+  );
+
   testRoomWidgets(
     'failed initial round blocks absence only, not a clean live cohort',
     (tester) async {

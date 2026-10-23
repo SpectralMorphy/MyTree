@@ -197,6 +197,18 @@ transports still prevent claiming solo. A failed admitted round preserves eviden
 an actually opened outbound channel is also evidence even if it closes after hello but before welcome. A clean later
 live cohort can complete. Connections are not merged or discarded merely because their actors match.
 
+An already established channel with an overdue durable recheck may retain its native RTC while a fresh member enters.
+Its independent recheck is not a new initial contribution if no declared history is missing and no assembly is in flight.
+A presence heartbeat can restore online display but cannot turn that overdue proof into a prerequisite again. Another real
+admitted peer can therefore finish its own durable exchange without waiting for the old channel's 90-second recovery.
+If every candidate is silent, the original nonempty connection set still prevents unsupported solo inference. A pending
+first admission or actual transfer is never excluded by this rule.
+
+Each channel retains the union of still-missing immutable `(ID, digest)` claims from inventories, recheck requests and
+checkpoints across recheck resets. Claims disappear only after exact durable containment, not after a smaller subsequent
+checkpoint or a successful send; contradictory fingerprints are rejected. Such a declared missing contribution still
+holds the cohort until it is saved. The retained unknown-ID count is bounded by the existing transfer budget.
+
 With no live peer, a restored room needs validated alias registration and complete discovery coverage from every configured
 provider, durable local data, and the quiet interval. `onlineCount == 1`, a timeout, or a partially unavailable provider is
 **not** proof of absence. Custom peers without `SignalingDiscovery` use validated registration as their weaker coverage
