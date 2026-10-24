@@ -59,6 +59,8 @@ if (scope === 'unknown-sex-ui') {
     startDate: '2000-01-01', endDate: null, endMode: 'unknown', newPartner: null,
     surnameChoices: { root: { changeSurname: true, surname: { text: 'Какой-то', decline: true } },
       'unknown-spouse': { changeSurname: false, surname: null } } });
+  operation({ type: 'addSurnameChange', personId: 'root', itemId: 'undated-change',
+    surname: { text: 'Орлов', decline: true }, date: null, reason: 'Без даты' });
 }
 
 async function until(check, message, timeout = 30000) {
@@ -515,7 +517,7 @@ async function marriageUi(page, label, full) {
     }
     await Promise.all(pages.map(load)); await converge(pages);
     if (scope === 'unknown-sex-ui') {
-      report.coverage = 'Local desktop/phone unknown-sex blue cards, dated birth surname and biography header hierarchy; unchanged journals and real reload, no network synchronization.';
+      report.coverage = 'Local desktop/phone unknown-sex blue cards, dated birth surname, undated change with ? (alignment is screenshot evidence) and biography header hierarchy; unchanged journals and real reload, no network synchronization.';
       const initial = await Promise.all(pages.map(history));
       for (const [index, page] of pages.entries()) {
         const label = index ? 'phone' : 'desktop';
@@ -523,6 +525,7 @@ async function marriageUi(page, label, full) {
         await openBiography(page);
         await marriageReady(page, false);
         await until(async () => /06\.05\.1980\s+Смирнова\s+при рождении/.test(await snapshot(page)), 'Birth surname has no birth-date prefix.', 5000);
+        await until(async () => /\?\s+Орлова\s+Без даты/.test(await snapshot(page)), 'Undated surname change has no ? date column.', 5000);
         await capture(page, `${label}-dated-birth-and-headers`);
         await marriageClose(page);
         assert.deepEqual(await history(page), initial[index]);

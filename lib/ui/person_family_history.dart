@@ -185,12 +185,7 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  _surnameHeading(
-                    person,
-                    birthSurname,
-                    person.birthDate,
-                    showUnknownDate: true,
-                  ),
+                  _surnameHeading(person, birthSurname, person.birthDate),
                   const Text('при рождении'),
                 ],
               ),
@@ -257,26 +252,46 @@ class _PersonFamilyHistoryState extends State<PersonFamilyHistory> {
     TreeSurname surname,
     DateTime? date, {
     Key? key,
-    bool showUnknownDate = false,
-  }) => Row(
-    key: key,
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      if (date != null || showUnknownDate) ...[
+  }) {
+    // Every row reserves the width of the widest date so surnames share one
+    // left edge whether the date is known or shown as `?`.
+    final dateStyle = DefaultTextStyle.of(
+      context,
+    ).style.copyWith(fontFeatures: const [FontFeature.tabularFigures()]);
+    final datePainter = TextPainter(
+      text: TextSpan(text: '00.00.0000', style: dateStyle),
+      textDirection: Directionality.of(context),
+      textScaler: MediaQuery.textScalerOf(context),
+      maxLines: 1,
+    )..layout();
+    final dateWidth = datePainter.width.ceilToDouble();
+    datePainter.dispose();
+    return Row(
+      key: key,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
         Padding(
           padding: const EdgeInsets.only(top: 2),
-          child: Text(date == null ? '?' : _dateLabel(date)),
+          child: SizedBox(
+            width: dateWidth,
+            child: Text(
+              date == null ? '?' : _dateLabel(date),
+              style: dateStyle,
+              maxLines: 1,
+              softWrap: false,
+            ),
+          ),
         ),
         const SizedBox(width: 12),
-      ],
-      Expanded(
-        child: Text(
-          surname.formForSex(person.sex),
-          style: Theme.of(context).textTheme.titleMedium,
+        Expanded(
+          child: Text(
+            surname.formForSex(person.sex),
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
         ),
-      ),
-    ],
-  );
+      ],
+    );
+  }
 
   Widget _marriageCaption(TreeMarriage marriage, TreePerson person) {
     final partner = widget.session.tree.person(

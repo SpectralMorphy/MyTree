@@ -1036,6 +1036,59 @@ void main() {
     },
   );
 
+  for (final width in [480.0, 320.0]) {
+    testWidgets(
+      'surnames share one left edge with unknown dates; width=$width',
+      (tester) async {
+        final session = _family();
+        final tree = session.tree;
+        session.seed(
+          tree.addSurnameChange(
+            rootTreePersonId,
+            id: 'undated',
+            surname: const TreeSurname(text: 'Седых'),
+            reason: 'По желанию',
+          ),
+        );
+        session.seed(
+          tree.addSurnameChange(
+            rootTreePersonId,
+            id: 'dated',
+            surname: const TreeSurname(text: 'Орлова'),
+            date: DateTime.utc(2001, 11, 28),
+            reason: 'Позже',
+          ),
+        );
+        await _mount(tester, session, size: Size(width, 1000));
+        final birth = find.byKey(const Key('family-history-birth-surname'));
+        final undated = find.byKey(
+          const ValueKey('family-history-surname-surnameChange-undated'),
+        );
+        final dated = find.byKey(
+          const ValueKey('family-history-surname-surnameChange-dated'),
+        );
+        expect(
+          find.descendant(of: birth, matching: find.text('?')),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(of: undated, matching: find.text('?')),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(of: dated, matching: find.text('28.11.2001')),
+          findsOneWidget,
+        );
+        final left = tester.getTopLeft(find.text('Сидорова')).dx;
+        expect(tester.getTopLeft(find.text('Седых')).dx, left);
+        expect(tester.getTopLeft(find.text('Орлова')).dx, left);
+        expect(tester.getRect(find.text('28.11.2001')).right, lessThan(left));
+        expect(tester.takeException(), isNull);
+        expect(session.operations, isEmpty);
+      },
+    );
+  }
+
   testWidgets(
     'only-end date and domain row order are rendered without UI resorting',
     (tester) async {
